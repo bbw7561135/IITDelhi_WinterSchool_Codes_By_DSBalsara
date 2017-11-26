@@ -1,0 +1,80 @@
+set xrange[-1:1]
+set yrange[-0.5:0.5]
+set view map
+unset surface
+unset key
+set hidden3d
+set contour base
+set size 0.8
+set size ratio 0.5
+set xlab 'x'
+set ylab 'y'
+maxdata = 4.0E-03
+mindata = 0.0
+
+set term postscript eps monochrome solid enhanced
+
+d = 2.0E-4
+set cntrparam levels 50
+set cntrparam levels incremental mindata, d, maxdata
+
+set output '1d_20contour.eps'
+splot 'bfza0021_1DRoe_MC_rewrite' w l
+
+set output 'Multid_20contour.eps'
+splot 'bfza0021_MultidHLLD_modes2_MC_rewrite' w l
+
+
+d = 3.0E-4
+set cntrparam levels 50
+set cntrparam levels incremental mindata, d, maxdata
+
+set output '1d_16contour.eps'
+splot 'bfza0021_1DRoe_MC_rewrite' w l
+
+set output 'Multid_16contour.eps'
+splot 'bfza0021_MultidHLLD_modes2_MC_rewrite' w l
+
+d = 4.0E-4
+set cntrparam levels 50
+set cntrparam levels incremental mindata, d, maxdata
+
+set output '1d_10contour.eps'
+splot 'bfza0021_1DRoe_MC_rewrite' w l
+
+set output 'Multid_10contour.eps'
+splot 'bfza0021_MultidHLLD_modes2_MC_rewrite' w l
+
+
+d = 5.0E-4
+set cntrparam levels 50
+set cntrparam levels incremental mindata, d, maxdata
+
+set output '1d_8contour.eps'
+splot 'bfza0021_1DRoe_MC_rewrite' w l
+
+set output 'Multid_8contour.eps'
+splot 'bfza0021_MultidHLLD_modes2_MC_rewrite' w l
+
+
+d = 6.0E-4
+set cntrparam levels 50
+set cntrparam levels incremental mindata, d, maxdata
+
+set output '1d_6contour.eps'
+splot 'bfza0021_1DRoe_MC_rewrite' w l
+
+set output 'Multid_6contour.eps'
+splot 'bfza0021_MultidHLLD_modes2_MC_rewrite' w l
+
+d = 8.0E-4
+set cntrparam levels 50
+set cntrparam levels incremental mindata, d, maxdata
+
+set output '1d_5contour.eps'
+splot 'bfza0021_1DRoe_MC_rewrite' w l
+
+set output 'Multid_5contour.eps'
+splot 'bfza0021_MultidHLLD_modes2_MC_rewrite' w l
+
+

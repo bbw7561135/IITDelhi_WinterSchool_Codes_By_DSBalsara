@@ -1,0 +1,99 @@
+
+! Make these range over the problem size in any direction.
+! Code stops if they are given bad values.
+#define ONEDFLUIDEND 414
+#define ONEDFLUIDBEGIN -14
+
+! Set the maximum number of zones that can come together at a vertex.
+! For structured meshes, this is just a variable that we want to set
+! consistently all over.
+#define MAX_ZONES_PER_VRTX 10
+
+! "NFIELD = 7" keep it fixed for adiabatic MHD. "NFIELD = 6" for isothermal MHD.! "NFLUID" is the number of MHD fluid species. "NFLUID - NTRACERS" are active.
+! "NTRACERS" is the number of fluid species that are pure tracers of the gas.
+#define NFIELD 7
+#define NFLUID 000000
+#define NTRACERS 0
+
+! "N_EULER = 0 or 1" depending on whether an Euler component is included.
+! "NFIELD_EULER = 5" keep it fixed for Euler flows. "NFIELD_EULER = 4"
+! for isothermal. "NFLUID_EULER" is the number of Euler fluid species.
+! "NTRACERS_EULER" is the number of fluid species that are pure tracers of
+! the gas.
+#define N_EULER 0
+#define NFIELD_EULER 5
+#define NFLUID_EULER 000000
+#define NTRACERS_EULER 0
+
+! Choose between MC_beta limiter (1), and WENO limiter (2,default).
+! The MC_beta limiter can span MinMod to MC van Leer limiters.
+#define SLOPE_LIMITER 2
+
+! Decide whether to limit once on the primitive variables (0, default) or
+! whether to aditionally limit on the characteristic variables (1).
+#define LIMIT_TWICE 1
+
+! Choose between HLLD RS (1), HLLC/HLLEM RS (2), HLL RS (3,default).
+! In recent versions, the 1D HLLEM RS does everything for the 1D fluxes.
+! However, HLLD/HLLC/HLL RS are still available in the multid RP.
+#define USE_RIEMANN_SOLVER 2
+
+! For classical MHD we can use just the contact and Alfven waves with
+! "COMPLETE_EIGENSYSTEM = 0". In the hydro limit, we replace Alfven with shear.
+! To include slow magnetosonic waves, set "COMPLETE_EIGENSYSTEM = 1". Along
+! with Alfven waves, the slow magnetosonic waves carry shear in the flow.
+! To include fast magnetosonic waves, set "COMPLETE_EIGENSYSTEM = 2".
+! These carry the largest pressure jumps from shocks.
+#define COMPLETE_EIGENSYSTEM 2
+
+! Reconstruct B-field in divergence-free fashion (1). 
+! Simple averaging (2,default). Simple averaging is best for Chombo. It
+! is also very useful when full periodicity is to be enforced.
+#define DIV_FREE_RECONSTRUCT 2
+
+! If RESTART is 0 we initialize the problem & then run. Otherwise, we
+! assume a restart file has been specified in "multid_mhd.in".
+#define RESTART 0
+
+! If MULTID_LIMITING is 1 then invokes a multidimensional limiter. This
+! helps in restoring positivity in a multidimensional sense.
+! The better limiters can, on rare occasions, produce -ve densities at the
+! edges/vertices. This can become a problem if limiters are invoked at those
+! edges/vertices. Multidimensional limiting is designed to cure this.
+! It is switched on by setting "MULTID_LIMITING" to unity (0, default).
+#define MULTID_LIMITING 0
+
+! For problems with very strong shocks and large magnetic fields, one
+! may have a loss of pressure positivity. The entropy formulation cures
+! that and it is invoked by switching on the pressure positivity switch.
+! It does cause a local loss of conservation in the zone where it is invoked.
+! It is switched on by setting "PRESSURE_POSITIVITY" to unity (0, default).
+#define PRESSURE_POSITIVITY 1
+
+! If WRITE_DIAGNOSTICS is set to 1, the code writes out min and max of all
+! variables at each timestep. Can be used with OpenMP, but not with MPI
+! versions of code. Setting it to 0 turns off the writing of diagnostics. The
+! diagnostics are evaluated and written out in subroutine "LIMIT_ALL_SLOPES".
+#define WRITE_DIAGNOSTICS 1
+
+! If NUM_FLD_BINS is >= 1 then the multigroup FLD formulation is turned on.
+! The timestepping of the radiation is via an explicit super-timestepping
+! approach.
+#define NUM_FLD_BINS 0
+
+! Reduction in serial or OMP situations is never a problem. MPI reduction is.
+! For that reason we provide the facility for global MPI reduction of
+! "NVARS_REDUCTION_MPI" variables. If set to 0, there is no reduction.
+! If non-zero, it will produce global sum, min and max of that many variables
+! and write these three sets of data to a file called "reduce.out".
+! As it stands, such data is written to file every 100th timestep.
+#define NVARS_REDUCTION_MPI 0
+
+! Sets the number of variables that we want to build that will be used to
+! set flags for AMR refinement.
+#define NUM_AMR_FLAG 2
+
+
+
+
+

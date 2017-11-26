@@ -1,0 +1,19 @@
+# Set terminal and output
+set terminal jpeg enhanced
+set output 'outputfile'
+
+set title 'variablename'
+set xlab 'xcoordinate'
+
+xmin = xmin1
+xmax = xmax1
+
+datamin = datamin1
+datamax = datamax1
+
+se mxtics 5
+se mytics 5
+
+set yrange [datamin:datamax]
+
+plot 'datafile' u 1:2 w lp lw 2 lc -1 pt 7 notitle

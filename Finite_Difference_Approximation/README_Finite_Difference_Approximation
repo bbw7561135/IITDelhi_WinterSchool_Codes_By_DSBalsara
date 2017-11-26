@@ -1,0 +1,104 @@
+
+                  README_Finite_Difference_Approximation
+
+      The short codes in this suite of codes correspond to our study of 
+Finite Difference Approximations. We have seen the major message that:-
+
+Consistency + Stability ==> Convergence
+
+The examples reinforce that concept. 
+
+      The examples for hyperbolic systems also reinforce the issues 
+of positivity and the role of Godunov's theorem in restricting us
+from achieving positivity-preserving (i.e. oscillation-free), higher 
+order, linear schemes for linear hyperbolic equations.
+
+      The distribution already provides all the worked examples. We have also 
+provided the final images for all the worked examples, so you know what the 
+final answer looks like. If you wish, you may (optionally) go into the individual 
+folders and see how we have modified the codes for each of the examples. You may 
+use our modifications to guide you in making your own modifications.
+
+Suggested compile line:-
+gfortran -fdefault-integer-8 -fdefault-real-8 -O2 -o xheat parabolic_lin_1d.F
+
+Suggested plotting lines:-
+chmod 777 onedplot.sh
+./onedplot.sh
+
+      The folder "Parabolic_Finite_Difference_Approximation" contains
+four sub-directories. Let us do the exercises as follows.
+
+1) Go into "Explicit_HeatEqn_FDA". Copy "parabolic_lin_1d.src" to
+"parabolic_lin_1d.F". It is possible that the file is already present.
+Set "alpha = 1.0" to get a fully explicit scheme. Code is self-documenting.
+The explicit method is first order accurate in time and second
+order accurate in space.
+Play around with the parameter "mu" which controls the timestep.
+Verify that everything runs stably for "mu = 0.4", as expected.
+Verify that for "mu = 0.5008" you get instability. In other words,
+even a slight violation of the stability limit is fatal for 
+an explicit scheme! The code should produce an output called "rhoa0001"
+which can be visualized with "onedplot.sh". "onedplot.sh" is a GnuPlot script
+and you might have to modify it to run it.
+
+2) Go into "Implicit_HeatEqn_FDA". Again, work with "parabolic_lin_1d.src".
+Again, copy it to "parabolic_lin_1d.F", if it doesn't exist. 
+Set "alpha = 0.0" to get a fully implicit scheme. This implicit
+scheme is first order accurate in time and second order accurate
+in space. Because the scheme
+is implicit, we can take much larger timesteps by choosing much larger
+values of "mu". The code should produce an output called "rhoa0001"
+which can be visualized with "onedplot.sh".
+
+3) Go into "CrankNicholson_HeatEqn_FDA". Again, work with
+"parabolic_lin_1d.src". Again, copy it to "parabolic_lin_1d.F", 
+if it doesn't exist. Now set "alpha = 0.5" for a half-implicit code.
+This method is second order accurate in space and time.
+While the code is, in principle, unconditionally stable; one can see
+slight deficiencies for very large values of "mu" and discontinuous 
+initial conditions.
+
+4) Go into "TR-BDF2_HeatEqn_FDA". Find the file
+"parabolic_lin_1d_TR-BDF2.src". Again, copy to a file named
+"parabolic_lin_1d_TR-BDF2.F" if such a file does not exist. Note that
+"TR-BDF2" is a two-stage scheme, so it costs twice of a Crank-Nicholson
+scheme. It calls the implicit linear solver twice during each timestep.
+The first stage is a trapezoidal stage (TR) and the second stage is a
+backward difference formula (BDF). This makes the scheme truly second
+order accurate while making it much more stable compared to
+Crank-Nicholson. 
+
+      The folder "Hyperbolic_Finite_Difference_Approximation" contains
+Three subdirectories. The codes in here are not meant to be production-grade
+algorithms. Rather they are meant to illustrate the deficiency of our
+state of knowledge so far. Even so, once we fix the deficiencies up,
+the Lax-Wendroff method and Runge-Kutta method will eventually become
+strong performers that can be used as building-blocks for some very
+nice schemes. But that is a topic for a little later. The sub-directories
+are as follows:-
+
+1) Go into "Donor_Cell_FDA". Copy "hyperbolic_lin_1d.src" to
+"hyperbolic_lin_1d.F". Set "ischeme = 4" for donor cell scheme.
+"mu" sets the CFL number. "iproblem = 1" for Gaussian; "iproblem = 2"
+for square pulse. This is a first order in time and space scheme.
+Gaussian will diffuse a lot. Square pulse will also diffuse a lot, but 
+at least it will remain positive and without oscillations.
+
+2) Go into "Lax_Wendroff_FDA". Copy "hyperbolic_lin_1d.src" to
+"hyperbolic_lin_1d.F". Set "ischeme = 2" for Lax-Wendroff scheme.
+"mu" sets the CFL number. "iproblem = 1" for Gaussian; "iproblem = 2"
+for square pulse. This is a linear second order in space and time scheme.
+Gaussian will be near-perfect. Square pulse will generate lots of
+wiggles and be non-positive.
+
+3) Go into "Runge_Kutta_FDA". Copy "hyperbolic_lin_1d.src" to
+"hyperbolic_lin_1d.F". Set "ischeme = 3" for Runge-Kutta scheme.
+"mu" sets the CFL number. "iproblem = 1" for Gaussian; "iproblem = 2"
+for square pulse. This is a linear second order in space and time scheme.
+Gaussian will be near-perfect. Square pulse will generate lots of
+wiggles and be non-positive.
+
+
+
+

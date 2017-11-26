@@ -1,0 +1,70 @@
+
+      OPEN ( unit = 11, file = "rh010001")
+#if ( 0 == 1)
+      DO ix = 1, nzones
+      WRITE ( 11, *) v ( ix, 1)
+      END DO
+      DO ix = 1, nzones
+      WRITE ( 11, *) x ( ix)
+      END DO
+#else
+      WRITE ( 11, *) ( v ( ix, 1), ix = 1, nzones)
+#endif
+      CLOSE ( 11)
+
+      OPEN ( unit = 11, file = "vx010001")
+#if ( 0 == 1)
+      DO ix = 1, nzones
+      WRITE ( 11, *) v ( ix, 2)
+      END DO
+      DO ix = 1, nzones
+      WRITE ( 11, *) x ( ix)
+      END DO
+#else
+      WRITE ( 11, *) ( v ( ix, 2), ix = 1, nzones)
+#endif
+      CLOSE ( 11)
+
+      OPEN ( unit = 11, file = "vy010001")
+#if ( 0 == 1)
+      DO ix = 1, nzones
+      WRITE ( 11, *) v ( ix, 3)
+      END DO
+      DO ix = 1, nzones
+      WRITE ( 11, *) x ( ix)
+      END DO
+#else
+      WRITE ( 11, *) ( v ( ix, 3), ix = 1, nzones)
+#endif
+      CLOSE ( 11)
+
+      OPEN ( unit = 11, file = "vz010001")
+#if ( 0 == 1)
+      DO ix = 1, nzones
+      WRITE ( 11, *) v ( ix, 4)
+      END DO
+      DO ix = 1, nzones
+      WRITE ( 11, *) x ( ix)
+      END DO
+#else
+      WRITE ( 11, *) ( v ( ix, 4), ix = 1, nzones)
+#endif
+      CLOSE ( 11)
+
+      OPEN ( unit = 11, file = "pr010001")
+#if ( 0 == 1)
+      DO ix = 1, nzones
+      WRITE ( 11, *) v ( ix, 5)
+      END DO
+      DO ix = 1, nzones
+      WRITE ( 11, *) x ( ix)
+      END DO
+#else
+      WRITE ( 11, *) ( v ( ix, 5), ix = 1, nzones)
+#endif
+      CLOSE ( 11)
+
+      GO TO 100
+
+      END IF ! End of "IF ( t .GT. tstop)".
+

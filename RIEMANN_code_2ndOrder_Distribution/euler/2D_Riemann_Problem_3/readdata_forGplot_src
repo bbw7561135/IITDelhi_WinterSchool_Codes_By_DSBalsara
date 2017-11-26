@@ -1,0 +1,56 @@
+      program readdata
+
+      implicit none
+
+      integer nx, ny
+      parameter (nx = 128, ny = 64)
+
+      real*4 dataarr(nx,ny)
+      real*8 x(nx), y(ny)
+      real*4 r4_x, r4_y
+      real*8 xmin, xmax, ymin, ymax
+      real*8 xb(0:nx), xc(nx), yb(0:ny), yc(ny), dx, dy
+      integer i, j
+      real*4 maxdata,mindata
+
+      xmin = -1.d0
+      xmax = 1.d0
+      ymin = -0.5d0
+      ymax = 0.5d0
+
+      dx = ( xmax - xmin) / nx
+      xb ( 0) = xmin
+      dy = ( ymax - ymin) / ny
+      yb ( 0) = ymin
+
+
+      DO i = 1, nx
+        xb(i) = xb(i-1)+dx
+        xc(i) = 0.5*(xb(i)+xb(i-1))
+      END DO
+
+      DO i = 1, ny
+        yb(i) = yb(i-1)+dy
+        yc(i) = 0.5*(yb(i)+yb(i-1))
+      END DO
+
+      open (10, file='bfza0021_1DRoe_MC', status='old')
+
+      read (10, *) ((dataarr(i,j), i = 1, nx), j = 1, ny)
+
+
+      maxdata = dataarr (1,1)
+      mindata = dataarr (1,1)
+      do i = 1, nx
+        do j = 1, ny
+          r4_x = xc(i)
+          r4_y = yc(j)
+          write(*,*) r4_x,r4_y,dataarr(i,j)
+          if (dataarr(i,j).gt.maxdata) maxdata = dataarr(i,j)
+          if (dataarr(i,j).lt.mindata) mindata = dataarr(i,j)
+        enddo
+        write(*,*)
+      enddo
+      write(*,*) maxdata, mindata
+
+      end program readdata

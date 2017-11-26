@@ -1,0 +1,33 @@
+
+                      README_Nonlinear_Scalar_Hyperbolic_Eqn
+
+      The code out here deals with our study of the Burgers equation, which is our
+first exposure to a non-linear PDE. The Burgers equation and the Buckley-Leverett equation
+are included. The goal here is to understand how shocks steepen, how an isolated shock
+propagates and also how a rarefaction fan might form.
+
+      The provided code uses a two-stage Runge-Kutta scheme which is coupled to 
+an HLL Riemann solver.
+
+      The distribution already provides all the worked examples. We have also 
+provided the final images for all the worked examples, so you know what the 
+final answer looks like. If you wish, you may (optionally) go into the individual 
+folders and see how we have modified the codes for each of the examples. You may 
+use our modifications to guide you in making your own modifications.
+
+       Copy "nonlin_scalar_RK.src" to "nonlin_scalar_RK.F" and
+modify as needed and run. The code solves the Burgers and Buckley-Leverett equations.
+It is best to initially focus on Burgers equation, which is what we do here.
+Both give rise to non-linear, scalar, hyperbolic PDEs. However, the Burgers flux is convex
+while the Buckley-Leverett flux is non-convex. "mu" again controls the CFL number. "islope = 1, 2"
+for MinMod or MC limiters. "tstop" is again the stopping time. The timestep is a two-stage
+Runge-Kutta timestepping. 
+
+"iproblem = 1" shows how a Gaussian, which is initially smooth, self-steepens into
+a shock. Look for the folder "Burgers_Gaussian".
+
+"iproblem = 2" produces a shock solution for the Burgers equation. Look for the
+folder "Burgers_Shock".
+
+"iproblem = 3" produces a rarefaction fan solution for the Burgers equation.
+Look for the folder "Burgers_Rarefaction".

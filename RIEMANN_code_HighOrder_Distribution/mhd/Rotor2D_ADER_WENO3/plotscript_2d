@@ -1,0 +1,32 @@
+# Set terminal and output
+set terminal jpeg enhanced
+set output 'outputfile'
+
+set title 'variablename'
+
+set xlab 'xcoordinate'
+set ylab 'ycoordinate'
+
+xmin = xmin1
+xmax = xmax1
+ymin = ymin1
+ymax = ymax1
+
+bbratio = (ymax-ymin)/(xmax-xmin)
+
+datamin = datamin1
+datamax = datamax1
+
+set size ratio bbratio
+
+unset key
+set hidden3d
+set pm3d map
+set cbrange [datamin:datamax]
+set palette rgbformulae 33,13,10
+unset clabel
+set format cb "%g"
+set mxtics 5
+set mytics 5
+
+sp 'datafile' u 1:2:3  palette notitle

@@ -1,0 +1,154 @@
+
+! Make these range over the problem size in any direction.
+! Code stops if they are given bad values.
+#define ONEDFLUIDEND 414
+#define ONEDFLUIDBEGIN -14
+
+! Set the maximum number of zones that can come together at a vertex.
+! For structured meshes, this is just a variable that we want to set
+! consistently all over.
+#define MAX_ZONES_PER_VRTX 10
+
+! "NFIELD = 7" keep it fixed for adiabatic MHD. "NFIELD = 6" for isothermal MHD.
+! "NFLUID" is the number of MHD fluid species.
+! "NTRACERS" is the number of fluid species that are pure tracers of the gas.
+#define NFIELD 7
+#define NFLUID 000000
+#define NTRACERS 0
+
+! "N_EULER = 0 or 1" depending on whether an Euler component is included.
+! "NFIELD_EULER = 5" keep it fixed for Euler flows. "NFIELD_EULER = 4" 
+! for isothermal. "NFLUID_EULER" is the number of Euler fluid species.
+! "NVAR" is the total number of variables being evolved by ADER.
+#define N_EULER 0
+#define NFIELD_EULER 5
+#define NFLUID_EULER 000000
+
+! "NVAR" is the number of components that goes into the pointwise ADER
+! temporal reconstruction.
+#define NVAR 8
+
+! Choose an order of accuracy, from 2, 3 or 4. Causes several self-consistent
+! choices to be made automatically later in this directives file.
+#define NUMORDER 3
+
+! At 2nd order:Choose between MC_beta limiter (1), and WENO limiter (2,default)
+! The MC_beta limiter can span MinMod to MC van Leer limiters.
+! At 3rd order:Choose between PPM limiter (1), and WENO limiter (2,default)
+#define SLOPE_LIMITER 1
+
+! Decide whether to limit once on the conserved variables (0, default) or
+! whether to aditionally limit on the characteristic variables (1).
+#define LIMIT_TWICE 0
+
+! Choose between HLLD RS (1), HLLC RS (2), HLLEM RS (3,default).
+! In recent versions, the HLLEM RS does everything, so the other two are
+! not available.
+#define USE_RIEMANN_SOLVER 3
+
+! For classical MHD we can use just the contact and Alfven waves with
+! "COMPLETE_EIGENSYSTEM = 0". In the hydro limit, we replace Alfven with shear.
+! To include slow magnetosonic waves, set "COMPLETE_EIGENSYSTEM = 1". Along
+! with Alfven waves, the slow magnetosonic waves carry shear in the flow.
+! To include fast magnetosonic waves, set "COMPLETE_EIGENSYSTEM = 2".
+! These carry the largest pressure jumps from shocks.
+#define COMPLETE_EIGENSYSTEM 2
+
+! If RESTART is 0 we initialize the problem & then run. Otherwise, we
+! assume a restart file has been specified in "multid_mhd.in".
+#define RESTART 0
+
+! Default is to build source terms as needed. But in some ADER-CG updates
+! (on Cartesian meshes), we may not want any source terms at all.
+#define BUILD_SOURCE_TERMS 0
+
+! For problems with very strong shocks and large magnetic fields, one
+! may have a loss of pressure positivity. The entropy formulation cures
+! that and it is invoked by switching on the pressure positivity switch.
+! It does cause a local loss of conservation in the zone where it is invoked.
+! It is switched on by setting "PRESSURE_POSITIVITY" to unity (0, default).
+#define PRESSURE_POSITIVITY 1
+
+! If WRITE_DIAGNOSTICS is set to 1, the code writes out min and max of all
+! variables at each timestep. Can be used with OpenMP, but not with MPI
+! versions of code. Setting it to 0 turns off the writing of diagnostics. The
+! diagnostics are evaluated and written out in subroutine "LIMIT_ALL_MOMENTS".
+#define WRITE_DIAGNOSTICS 1
+
+! If NUM_FLD_BINS is >= 1 then the multigroup FLD formulation is turned on.
+! The timestepping of the radiation is via an explicit super-timestepping
+! approach.
+#define NUM_FLD_BINS 0
+
+! Reduction in serial or OMP situations is never a problem. MPI reduction is.
+! For that reason we provide the facility for global MPI reduction of
+! "NVARS_REDUCTION_MPI" variables. If set to 0, there is no reduction.
+! If non-zero, it will produce global sum, min and max of that many variables
+! and write these three sets of data to a file called "reduce.out".
+! As it stands, such data is written to file every 100th timestep.
+#define NVARS_REDUCTION_MPI 0
+
+! Sets the number of variables that we want to build that will be used to
+! set flags for AMR refinement.
+#define NUM_AMR_FLAG 2
+
+
+! ----------
+
+! Choose number of bases and quadrature points for each order.
+
+#if ( NUMORDER == 2)
+
+#define NUM_ZONECEN_BASES 4
+#define NUM_FACECEN_BASES 3
+
+#define NUM_ZONECEN_BFLD_BASES 7
+
+#define NUM_SPACETIME_BASES 5
+
+#define NUM_ZONECEN_QUADPTS 6
+#define NUM_SPACETIME_QUADPTS 7
+
+#define NUM_FACECEN_QUADPTS 4
+
+#endif
+
+! ----------
+
+#if ( NUMORDER == 3)
+
+#define NUM_ZONECEN_BASES 10
+#define NUM_FACECEN_BASES 6
+
+#define NUM_ZONECEN_BFLD_BASES 16
+
+#define NUM_SPACETIME_BASES 15
+
+#define NUM_ZONECEN_QUADPTS 13
+#define NUM_SPACETIME_QUADPTS 20
+
+#define NUM_FACECEN_QUADPTS 9
+
+#endif
+
+! ----------
+
+#if ( NUMORDER == 4)
+
+#define NUM_ZONECEN_BASES 20
+#define NUM_FACECEN_BASES 10
+
+#define NUM_ZONECEN_BFLD_BASES 30
+
+#define NUM_SPACETIME_BASES 35
+
+#define NUM_ZONECEN_QUADPTS 21
+#define NUM_SPACETIME_QUADPTS 42
+
+#define NUM_FACECEN_QUADPTS 13
+
+#endif
+
+! ----------
+
+

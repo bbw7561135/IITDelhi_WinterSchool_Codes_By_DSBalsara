@@ -1,0 +1,121 @@
+! ----------------------------------------------------------------------
+
+! Compilation lines (Best to run code in 64 bit mode, even on 32 bit PEs):
+
+cp Riemann_Multid_MHD_src Riemann_MHD.F
+cp MuSIC_MHD_2DRS_Fast_src MHD_MultidRS.F
+cp HLLEM_1D_MHD_src HLLEM.F
+cp Eigenvec_MHD_src Eigenvec.F
+cp Ader_1d_MHD_src Ader.F
+cp Eos_src Eos.F
+cp Rho_Prs_Positivity_src Ppos.F
+cp Applications_MHD_src Apps.F
+
+
+! Intel Fortran Compiler:
+! ( For large problems use "-mcmodel=large -i-dynamic" in compile line
+! to overcome the 32 bit pointers that are default with ifort.)
+
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -w -O2 -fpp -c Riemann_MHD.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -w -O2 -fpp -c MHD_MultidRS.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -w -O2 -fpp -c HLLEM.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -w -O2 -fpp -c Eigenvec.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -w -O2 -fpp -c Ader.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -w -O2 -fpp -c Eos.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -w -O2 -fpp -c Ppos.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -w -O2 -fpp -c Apps.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -w -O2 -o xmhd Riemann_MHD.o MHD_MultidRS.o HLLEM.o Eigenvec.o Ader.o Eos.o Ppos.o Apps.o
+
+
+! PGI Compiler:
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -Mr8intrinsics -silent -c Riemann_MHD.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -Mr8intrinsics -silent -c MHD_MultidRS.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -Mr8intrinsics -silent -c HLLEM.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -Mr8intrinsics -silent -c Eigenvec.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -Mr8intrinsics -silent -c Ader.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -Mr8intrinsics -silent -c Eos.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -Mr8intrinsics -silent -c Ppos.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -Mr8intrinsics -silent -c Apps.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -Mr8intrinsics -silent -o xmhd \
+   Riemann_MHD.o Ppos.o MHD_MultidRS.o HLLEM.o Eigenvec.o Ader.o Eos.o Apps.o
+
+
+! GNU fortran Compiler:
+gfortran -fdefault-integer-8 -fdefault-real-8 -O2 -c Riemann_MHD.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -O2 -c MHD_MultidRS.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -O2 -c HLLEM.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -O2 -c Eigenvec.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -O2 -c Ader.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -O2 -c Eos.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -O2 -c Ppos.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -O2 -c Apps.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -O2 -o xmhd Riemann_MHD.o \
+     Ppos.o MHD_MultidRS.o HLLEM.o Eigenvec.o Ader.o Eos.o Apps.o
+
+
+! ----------------------------------------------------------------------
+
+! Depending on your linux system, set environment variables suitably.
+
+setenv OMP_DYNAMIC FALSE
+setenv OMP_NUM_THREADS 8
+unlimit stacksize
+
+export OMP_DYNAMIC=FALSE
+export OMP_NUM_THREADS=8
+unlimit stacksize
+
+! Instead of "unlimit stacksize" it may be better to use the below line.
+! limit stacksize unlimited.
+
+
+! Intel Fortran Compiler with OpenMP:
+! Use "-openmp" to enable OpenMP parallelization.
+! (To do once-in-a-while OpenMP consistency checks use
+! "-openmp -openmp-report2 -par-report3" flags.)
+
+ifort -autodouble -heap-arrays -shared -intel -mcmodel=large -openmp -w -O2 -fpp -c Riemann_MHD.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -openmp -w -O2 -fpp -c MHD_MultidRS.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -openmp -w -O2 -fpp -c HLLEM.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -openmp -w -O2 -fpp -c Eigenvec.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -openmp -w -O2 -fpp -c Ader.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -openmp -w -O2 -fpp -c Eos.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -openmp -w -O2 -fpp -c Ppos.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -openmp -w -O2 -fpp -c Apps.F
+ifort -autodouble -heap-arrays -mcmodel=large -i-dynamic -openmp -w -O2 -o xmhd Riemann_MHD.o MHD_MultidRS.o HLLEM.o Eigenvec.o Ader.o Ppos.o Eos.o Apps.o
+
+
+! PGI Compiler with OpenMP:
+! Use "-mp" to enable OpenMP parallelization.
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -mp -Mr8intrinsics -silent -c Riemann_MHD.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -mp -Mr8intrinsics -silent -c MHD_MultidRS.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -mp -Mr8intrinsics -silent -c HLLEM.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -mp -Mr8intrinsics -silent -c Eigenvec.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -mp -Mr8intrinsics -silent -c Ader.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -mp -Mr8intrinsics -silent -c Eos.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -mp -Mr8intrinsics -silent -c Ppos.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -mp -Mr8intrinsics -silent -c Apps.F
+pgf90 -O3 -mcmodel=medium -i8 -Mr8 -mp -Mr8intrinsics -silent -o xmhd \
+   Riemann_MHD.o Ppos.o MHD_MultidRS.o HLLEM.o Eigenvec.o Ader.o Eos.o Apps.o
+
+
+! GNU fortran Compiler with OpenMP:
+! Use "-fopenmp" to enable OpenMP parallelization.
+gfortran -fdefault-integer-8 -fdefault-real-8 -fopenmp -O2 -c Riemann_MHD.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -fopenmp -O2 -c MHD_MultidRS.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -fopenmp -O2 -c HLLEM.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -fopenmp -O2 -c Eigenvec.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -fopenmp -O2 -c Ader.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -fopenmp -O2 -c Eos.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -fopenmp -O2 -c Ppos.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -fopenmp -O2 -c Apps.F
+gfortran -fdefault-integer-8 -fdefault-real-8 -fopenmp -O2 -o xmhd \
+  Ppos.o Riemann_MHD.o MHD_MultidRS.o HLLEM.o Eigenvec.o Ader.o Eos.o Apps.o
+
+
+! ----------------------------------------------------------------------
+
+
+
+
+

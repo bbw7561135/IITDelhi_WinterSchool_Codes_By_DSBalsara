@@ -1,0 +1,3078 @@
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+#include "directives"
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+      SUBROUTINE MHD_RIEM_HLL_PTWISE
+
+     1   ( gamma, smallnum, prsfloor, rhofloor, pi,
+     1     idirection, split_prsflux_re, debug_stop,
+     1     my_blend_HLL,
+
+     1     U_Remi, U_Repl, F_Remi, F_Repl,
+     1     entropy_Remi, entropy_Repl,
+
+     1     gamma_eos_Remi, gamma_eos_Repl,
+     1     gamma_soundspeed_Remi, gamma_soundspeed_Repl,
+     1     mean_mol_wt_Remi, mean_mol_wt_Repl,
+
+     1     conserved_re, flux_re, entropy_flux_re, prstot_re)
+
+! ----------------------------------------------------------------------
+
+! Builds an HLL Riemann solver for MHD. The input states are in
+! "U_Remi, U_Repl". Other "*_Remi" and "*_Repl" variables contain
+! other input values.
+
+! The output state and flux are contained in "conserved_re, flux_re". An 
+! HLL RS is used to build the entropy flux "entropy_flux_re". If
+! "split_prsflux_re = 1" then the gas + magnetic pressure is contained in
+! "prstot_re" and the appropriate momentum flux is decreased.
+
+! "idirection = 1, 2, 3" for x, y, z-directions. For "2 or 3", appropriate
+! cyclic rotations are applied on input and exit.
+
+! This version is for pointwise use. I.e. it just applied to one Riemann
+! problem at one zone boundary. The idea is to make it very lightweight
+! and cache-friendly for use on GPUs.
+
+! The use of fluxes from "F_Remi, F_Repl", instead of building them from
+! scratch, is only in the case of ADER schemes where such information can
+! be provided. Even then, it is indicated by setting "SAVE_FLUX_MODES" to 1.
+
+! ----------------------------------------------------------------------
+
+      IMPLICIT NONE
+
+      INTEGER idirection, split_prsflux_re, debug_stop
+
+      REAL gamma, smallnum, prsfloor, rhofloor, pi, my_blend_HLL
+
+      REAL :: mean_mol_wt_Remi, gamma_eos_Remi, gamma_soundspeed_Remi,
+     1        mean_mol_wt_Repl, gamma_eos_Repl, gamma_soundspeed_Repl,
+
+     1        entropy_Remi, entropy_Repl, entropy_flux_re, prstot_re
+
+      REAL, DIMENSION ( NFIELD + NFLUID + 1) :: U_Remi, U_Repl,
+     1        F_Remi, F_Repl, conserved_re, flux_re
+
+! ----------------------------------------------------------------------
+
+! Variables past this point are not used in the subroutine interface.
+
+      REAL temp_01, temp_02, temp_03, temp_04,
+
+     1     fourpi, ob_4pi, ob_8pi, ob_rho,
+
+     1     Rho_Remi, Prs_Remi, Etot_Remi, Vlx_Remi, Vly_Remi, Vlz_Remi,
+     1     Bfx_Remi, Bfy_Remi, Bfz_Remi,
+     1     V2_remi, B2_Remi, V_dot_B_Remi,
+     1     Total_Enthalpy_Remi, entropyflux_Remi,
+
+     1     Rho_Repl, Prs_Repl, Etot_Repl, Vlx_Repl, Vly_Repl, Vlz_Repl, 
+     1     Bfx_Repl, Bfy_Repl, Bfz_Repl,
+     1     V2_Repl, B2_Repl, V_dot_B_Repl,
+     1     Total_Enthalpy_Repl, entropyflux_Repl,
+
+     1     Rho_Use, Prs_Use, Vlx_Use, Vly_Use, Vlz_Use,
+     1     Bfx_Use, Bfy_Use, Bfz_Use, Total_Enthalpy_Use,
+     1     X_Use, V2_Use, B2_Use, V_dot_B_Use,
+     1     gamma_eos_Use, gamma_soundspeed_Use,
+
+     1     S_Min, S_Max
+
+! ----------------------------------------------------------------------
+
+      fourpi = 4.0 * pi
+      ob_4pi = 1.0 / fourpi
+      ob_8pi = 0.5 / fourpi
+
+! ----------------------------------------------------------------------
+! STEP I) Make cyclic rotations if they are called for by "idirection".
+! After making rotations, enforce continuity of the longitudinal magnetic
+! field across the two states. This is always the 6th component after
+! rotations.
+! ----------------------------------------------------------------------
+
+      IF ( idirection == 2) THEN
+
+! ----------
+
+      temp_01 = U_Remi ( 2)
+      temp_02 = U_Remi ( 3)
+      temp_03 = U_Remi ( 4)
+
+      U_Remi ( 2) = temp_02
+      U_Remi ( 3) = temp_03
+      U_Remi ( 4) = temp_01
+
+      temp_01 = U_Remi ( 6)
+      temp_02 = U_Remi ( 7)
+      temp_03 = U_Remi ( 8)
+
+      U_Remi ( 6) = temp_02
+      U_Remi ( 7) = temp_03
+      U_Remi ( 8) = temp_01
+
+! -----
+
+      temp_01 = U_Repl ( 2)
+      temp_02 = U_Repl ( 3)
+      temp_03 = U_Repl ( 4)
+
+      U_Repl ( 2) = temp_02
+      U_Repl ( 3) = temp_03
+      U_Repl ( 4) = temp_01
+
+      temp_01 = U_Repl ( 6)
+      temp_02 = U_Repl ( 7)
+      temp_03 = U_Repl ( 8)
+
+      U_Repl ( 6) = temp_02
+      U_Repl ( 7) = temp_03
+      U_Repl ( 8) = temp_01
+
+! -----
+
+      temp_01 = F_Remi ( 2)
+      temp_02 = F_Remi ( 3)
+      temp_03 = F_Remi ( 4)
+
+      F_Remi ( 2) = temp_02
+      F_Remi ( 3) = temp_03
+      F_Remi ( 4) = temp_01
+
+      temp_01 = F_Remi ( 6)
+      temp_02 = F_Remi ( 7)
+      temp_03 = F_Remi ( 8)
+
+      F_Remi ( 6) = temp_02
+      F_Remi ( 7) = temp_03
+      F_Remi ( 8) = temp_01
+
+! -----
+
+      temp_01 = F_Repl ( 2)
+      temp_02 = F_Repl ( 3)
+      temp_03 = F_Repl ( 4)
+
+      F_Repl ( 2) = temp_02
+      F_Repl ( 3) = temp_03
+      F_Repl ( 4) = temp_01
+
+      temp_01 = F_Repl ( 6)
+      temp_02 = F_Repl ( 7)
+      temp_03 = F_Repl ( 8)
+
+      F_Repl ( 6) = temp_02
+      F_Repl ( 7) = temp_03
+      F_Repl ( 8) = temp_01
+
+! ----------
+
+      ELSE IF ( idirection == 3) THEN
+
+! ----------
+
+      temp_01 = U_Remi ( 2)
+      temp_02 = U_Remi ( 3)
+      temp_03 = U_Remi ( 4)
+
+      U_Remi ( 2) = temp_03
+      U_Remi ( 3) = temp_01
+      U_Remi ( 4) = temp_02
+
+      temp_01 = U_Remi ( 6)
+      temp_02 = U_Remi ( 7)
+      temp_03 = U_Remi ( 8)
+
+      U_Remi ( 6) = temp_03
+      U_Remi ( 7) = temp_01
+      U_Remi ( 8) = temp_02
+
+! -----
+
+      temp_01 = U_Repl ( 2)
+      temp_02 = U_Repl ( 3)
+      temp_03 = U_Repl ( 4)
+
+      U_Repl ( 2) = temp_03
+      U_Repl ( 3) = temp_01
+      U_Repl ( 4) = temp_02
+
+      temp_01 = U_Repl ( 6)
+      temp_02 = U_Repl ( 7)
+      temp_03 = U_Repl ( 8)
+
+      U_Repl ( 6) = temp_03
+      U_Repl ( 7) = temp_01
+      U_Repl ( 8) = temp_02
+
+! -----
+
+      temp_01 = F_Remi ( 2)
+      temp_02 = F_Remi ( 3)
+      temp_03 = F_Remi ( 4)
+
+      F_Remi ( 2) = temp_03
+      F_Remi ( 3) = temp_01
+      F_Remi ( 4) = temp_02
+
+      temp_01 = F_Remi ( 6)
+      temp_02 = F_Remi ( 7)
+      temp_03 = F_Remi ( 8)
+
+      F_Remi ( 6) = temp_03
+      F_Remi ( 7) = temp_01
+      F_Remi ( 8) = temp_02
+
+! -----
+
+      temp_01 = F_Repl ( 2)
+      temp_02 = F_Repl ( 3)
+      temp_03 = F_Repl ( 4)
+
+      F_Repl ( 2) = temp_03
+      F_Repl ( 3) = temp_01
+      F_Repl ( 4) = temp_02
+
+      temp_01 = F_Repl ( 6)
+      temp_02 = F_Repl ( 7)
+      temp_03 = F_Repl ( 8)
+
+      F_Repl ( 6) = temp_03
+      F_Repl ( 7) = temp_01
+      F_Repl ( 8) = temp_02
+
+! ----------
+
+      END IF
+
+! --------------------
+! Enforce continuity of longitudinal magnetic field.
+
+      temp_01 = 0.5 * ( U_Remi ( 6) + U_Repl ( 6) )
+      U_Remi ( 6) = temp_01
+      U_Repl ( 6) = temp_01
+
+! ----------------------------------------------------------------------
+! STEP II) Build the primitive variables "Rho_Remi" and "Rho_Repl" etc.
+! Also build the fluxes "F_Remi ( :)" and "F_Repl ( :)".
+! ----------------------------------------------------------------------
+
+      Rho_Remi = AMAX1 ( U_Remi ( 1), rhofloor)
+      ob_rho = 1.0 / Rho_Remi
+
+      Vlx_Remi = U_Remi ( 2) * ob_rho
+      Vly_Remi = U_Remi ( 3) * ob_rho
+      Vlz_Remi = U_Remi ( 4) * ob_rho
+
+      Etot_Remi = U_Remi ( 5)
+
+      Bfx_Remi = U_Remi ( 6)
+      Bfy_Remi = U_Remi ( 7)
+      Bfz_Remi = U_Remi ( 8)
+
+      V2_Remi = Vlx_Remi**2 + Vly_Remi**2 + Vlz_Remi**2
+
+      B2_Remi = Bfx_Remi**2 + Bfy_Remi**2 + Bfz_Remi**2
+
+      V_dot_B_Remi = Vlx_Remi * Bfx_Remi + Vly_Remi * Bfy_Remi
+     1             + Vlz_Remi * Bfz_Remi
+
+      Prs_Remi = Etot_Remi - 0.5 * Rho_Remi * V2_Remi - ob_8pi * B2_Remi
+
+      Prs_Remi = Prs_Remi * ( gamma_eos_Remi - 1.0)
+
+#if ( ENFORCE_POSITIVITY == 1)
+      IF ( Prs_Remi <= prsfloor) Prs_Remi = entropy_Remi
+     1                          * Rho_Remi**( gamma_eos_Remi - 1.0)
+#endif
+      Prs_Remi = AMAX1 ( Prs_Remi, prsfloor)
+
+      Total_Enthalpy_Remi = ( gamma_eos_Remi * Prs_Remi
+     1     / ( gamma_eos_Remi - 1.0) + 0.5 * Rho_Remi * V2_Remi
+     1     + ob_4pi * B2_Remi ) / Rho_Remi
+
+! ----------
+#if ( SAVE_FLUX_MODES != 1)
+
+      F_Remi ( :) = Vlx_Remi * U_Remi ( :)
+
+
+      F_Remi ( 2) = F_Remi ( 2) + Prs_Remi + ob_8pi * B2_Remi
+     1            - ob_4pi * Bfx_Remi**2
+
+      F_Remi ( 3) = F_Remi ( 3) - ob_4pi * Bfx_Remi * Bfy_Remi
+
+      F_Remi ( 4) = F_Remi ( 4) - ob_4pi * Bfx_Remi * Bfz_Remi
+
+      F_Remi ( 5) = F_Remi ( 5)
+     1            + ( Prs_Remi + ob_8pi * B2_Remi ) * Vlx_Remi 
+     1            - Bfx_Remi * V_dot_B_Remi * ob_4pi
+
+      F_Remi ( 6) = 0.0
+
+      F_Remi ( 7) = F_Remi ( 7) - Vly_Remi * Bfx_Remi
+
+      F_Remi ( 8) = F_Remi ( 8) - Vlz_Remi * Bfx_Remi
+
+#endif
+! -----
+
+      entropyflux_Remi = entropy_Remi * Vlx_Remi
+
+! ------------------------------
+
+      Rho_Repl = AMAX1 ( U_Repl ( 1), rhofloor)
+      ob_rho = 1.0 / Rho_Repl
+
+      Vlx_Repl = U_Repl ( 2) * ob_rho
+      Vly_Repl = U_Repl ( 3) * ob_rho
+      Vlz_Repl = U_Repl ( 4) * ob_rho
+
+      Etot_Repl = U_Repl ( 5)
+
+      Bfx_Repl = U_Repl ( 6)
+      Bfy_Repl = U_Repl ( 7)
+      Bfz_Repl = U_Repl ( 8)
+
+      V2_Repl = Vlx_Repl**2 + Vly_Repl**2 + Vlz_Repl**2
+
+      B2_Repl = Bfx_Repl**2 + Bfy_Repl**2 + Bfz_Repl**2
+
+      V_dot_B_Repl = Vlx_Repl * Bfx_Repl + Vly_Repl * Bfy_Repl
+     1             + Vlz_Repl * Bfz_Repl
+
+      Prs_Repl = Etot_Repl - 0.5 * Rho_Repl * V2_Repl - ob_8pi * B2_Repl
+
+      Prs_Repl = Prs_Repl * ( gamma_eos_Repl - 1.0)
+
+#if ( ENFORCE_POSITIVITY == 1)
+      IF ( Prs_Repl <= prsfloor) Prs_Repl = entropy_Repl 
+     1                          * Rho_Repl**( gamma_eos_Repl - 1.0)
+#endif
+      Prs_Repl = AMAX1 ( Prs_Repl, prsfloor)
+
+      Total_Enthalpy_Repl = ( gamma_eos_Repl * Prs_Repl
+     1     / ( gamma_eos_Repl - 1.0) + 0.5 * Rho_Repl * V2_Repl
+     1     + ob_4pi * B2_Repl ) / Rho_Repl
+
+! ----------
+#if ( SAVE_FLUX_MODES != 1)
+
+      F_Repl ( :) = Vlx_Repl * U_Repl ( :)
+
+
+      F_Repl ( 2) = F_Repl ( 2) + Prs_Repl + ob_8pi * B2_Repl
+     1            - ob_4pi * Bfx_Repl**2
+
+      F_Repl ( 3) = F_Repl ( 3) - ob_4pi * Bfx_Repl * Bfy_Repl
+
+      F_Repl ( 4) = F_Repl ( 4) - ob_4pi * Bfx_Repl * Bfz_Repl
+
+      F_Repl ( 5) = F_Repl ( 5) 
+     1            + ( Prs_Repl + ob_8pi * B2_Repl ) * Vlx_Repl
+     1            - Bfx_Repl * V_dot_B_Repl * ob_4pi
+
+      F_Repl ( 6) = 0.0
+
+      F_Repl ( 7) = F_Repl ( 7) - Vly_Repl * Bfx_Repl
+
+      F_Repl ( 8) = F_Repl ( 8) - Vlz_Repl * Bfx_Repl
+
+#endif
+! -----
+
+      entropyflux_Repl = entropy_Repl * Vlx_Repl
+
+! ----------------------------------------------------------------------
+! STEP III) Build "S_Min, S_Max", the extremal speeds of the RS.
+! We evaluate speeds in each of the two states and also in the 
+! roe-averaged ( or arithmetic-averaged) state.
+! ----------------------------------------------------------------------
+
+      temp_01 = 1.0 / Rho_Remi
+
+      temp_02 = ( gamma_soundspeed_Remi * Prs_Remi
+     1          + ob_4pi * B2_Remi ) * temp_01
+
+      temp_03 = ob_4pi * gamma_soundspeed_Remi * Prs_Remi
+     1             * Bfx_Remi**2 * temp_01**2
+
+      temp_04 = AMAX1 ( temp_02**2 - 4.0 * temp_03, 0.0)
+
+      temp_04 = 0.5 * ( temp_02 + SQRT ( temp_04 ) )
+
+      temp_04 = SQRT ( temp_04 )
+
+      S_Min = Vlx_Remi - temp_04
+
+! Commented just to get an exact representation of the speeds for HLL/C RS.
+! Feel free to uncomment just to increase extremal speeds for the sake of
+! stability.
+!      S_Max = Vlx_Remi + temp_04
+
+! ------------------------------
+
+      temp_01 = 1.0 / Rho_Repl
+
+      temp_02 = ( gamma_soundspeed_Repl * Prs_Repl
+     1          + ob_4pi * B2_Repl ) * temp_01
+
+      temp_03 = ob_4pi * gamma_soundspeed_Repl * Prs_Repl
+     1             * Bfx_Repl**2 * temp_01**2
+
+      temp_04 = AMAX1 ( temp_02**2 - 4.0 * temp_03, 0.0)
+
+      temp_04 = 0.5 * ( temp_02 + SQRT ( temp_04 ) )
+
+      temp_04 = SQRT ( temp_04 )
+
+! Commented just to get an exact representation of the speeds for HLL/C RS.
+! Feel free to uncomment just to increase extremal speeds for the sake of
+! stability.
+!      S_Min = AMIN1 ( S_Min, Vlx_Repl - temp_04)
+
+! Commented just to get an exact representation of the speeds for HLL/C RS.
+! Feel free to uncomment just to increase extremal speeds for the sake of
+! stability.
+!      S_Max = AMAX1 ( S_Max, Vlx_Repl + temp_04)
+! If above line is uncommented, then comment out the below line.
+      S_Max = Vlx_Repl + temp_04
+
+! ------------------------------
+
+      temp_01 = SQRT ( Rho_Repl / Rho_Remi )
+      temp_02 = 1.0 / ( 1.0 + temp_01 )
+
+      gamma_soundspeed_Use = 0.5 * ( gamma_soundspeed_Remi
+     1                             + gamma_soundspeed_Repl )
+      gamma_eos_Use = 0.5 * ( gamma_eos_Remi + gamma_eos_Repl )
+
+      Rho_Use = SQRT ( Rho_Repl * Rho_Remi )
+
+      Total_Enthalpy_Use = ( Total_Enthalpy_Remi
+     1          + Total_Enthalpy_Repl * temp_01 ) * temp_02
+
+      Vlx_Use = ( Vlx_Remi + Vlx_Repl * temp_01 ) * temp_02
+      Vly_Use = ( Vly_Remi + Vly_Repl * temp_01 ) * temp_02
+      Vlz_Use = ( Vlz_Remi + Vlz_Repl * temp_01 ) * temp_02
+
+      Bfx_Use = ( Bfx_Remi * temp_01 + Bfx_Repl ) * temp_02
+      Bfy_Use = ( Bfy_Remi * temp_01 + Bfy_Repl ) * temp_02
+      Bfz_Use = ( Bfz_Remi * temp_01 + Bfz_Repl ) * temp_02
+
+      X_Use = ( Bfx_Repl - Bfx_Remi )**2 + ( Bfy_Repl - Bfy_Remi )**2
+     1      + ( Bfz_Repl - Bfz_Remi )**2
+      X_Use = 0.5 * X_Use / ( SQRT ( Rho_Remi) + SQRT ( Rho_Repl) )**2
+
+      V2_Use = Vlx_Use**2 + Vly_Use**2 + Vlz_Use**2
+
+      B2_Use = Bfx_Use**2 + Bfy_Use**2 + Bfz_Use**2
+
+      Prs_Use = Total_Enthalpy_Use - 0.5 * V2_Use
+     1        - ob_4pi * B2_Use / Rho_Use
+
+      Prs_Use = ( gamma_eos_Use - 1.0) * Rho_Use * Prs_Use
+     1        / gamma_eos_Use
+
+      Prs_Use = Prs_Use - ( gamma_eos_Use - 2.0) * Rho_Use * X_Use
+     1                  / ( fourpi * gamma_eos_Use )
+
+      Prs_Use = AMAX1 ( Prs_Use, prsfloor)
+
+! ----------
+
+      IF ( ( Rho_Use <= rhofloor) .OR. ( Prs_Use <= prsfloor) ) THEN
+
+      Rho_Use = 0.5 * ( Rho_Remi + Rho_Repl )
+      Prs_Use = 0.5 * ( Prs_Remi + Prs_Repl )
+
+      Vlx_Use = 0.5 * ( Vlx_Remi + Vlx_Repl )
+      Vly_Use = 0.5 * ( Vly_Remi + Vly_Repl )
+      Vlz_Use = 0.5 * ( Vlz_Remi + Vlz_Repl )
+
+      Bfx_Use = 0.5 * ( Bfx_Remi + Bfx_Repl )
+      Bfy_Use = 0.5 * ( Bfy_Remi + Bfy_Repl )
+      Bfz_Use = 0.5 * ( Bfz_Remi + Bfz_Repl )
+
+      X_Use = 0.0
+
+      V2_Use = Vlx_Use**2 + Vly_Use**2 + Vlz_Use**2
+
+      B2_Use = Bfx_Use**2 + Bfy_Use**2 + Bfz_Use**2
+
+      END IF
+
+! ----------
+
+      temp_01 = 1.0 / Rho_Use
+
+      temp_02 = ( gamma_soundspeed_Use * Prs_Use
+     1          + ob_4pi * B2_Use ) * temp_01
+
+      temp_03 = ob_4pi * gamma_soundspeed_Use * Prs_Use
+     1             * Bfx_Use**2 * temp_01**2
+
+      temp_04 = AMAX1 ( temp_02**2 - 4.0 * temp_03, 0.0)
+
+      temp_04 = 0.5 * ( temp_02 + SQRT ( temp_04 ) )
+
+      temp_04 = SQRT ( temp_04 )
+
+      S_Min = AMIN1 ( S_Min, Vlx_Use - temp_04)
+
+      S_Max = AMAX1 ( S_Max, Vlx_Use + temp_04)
+
+! ----------------------------------------------------------------------
+! STEP IV) Now build HLL variables "conserved_re, flux_re" and
+! "entropy_flux_re". Also build "prstot_re" if "split_prsflux_re == 1".
+! ----------------------------------------------------------------------
+
+      IF ( S_Min >= 0.0 ) THEN
+
+        conserved_re ( :) = U_Remi ( :)
+
+        flux_re ( :) = F_Remi ( :)
+
+        entropy_flux_re = entropyflux_Remi
+
+      ELSE IF ( S_Max <= 0.0 ) THEN
+
+        conserved_re ( :) = U_Repl ( :)
+
+        flux_re ( :) = F_Repl ( :)
+
+        entropy_flux_re = entropyflux_Repl
+
+      ELSE
+
+        temp_01 = 1.0 / ( S_Max - S_Min )
+        temp_02 = S_Max * temp_01
+        temp_03 = S_Min * temp_01
+        temp_04 = S_Max * S_Min * temp_01
+
+        conserved_re ( :) = temp_02 * U_Repl ( :)
+     1                    - temp_03 * U_Remi ( :)
+     1                    - temp_01 * ( F_Repl ( :) - F_Remi ( :) )
+
+        flux_re ( :) = temp_02 * F_Remi ( :) - temp_03 * F_Repl ( :)
+     1               + temp_04 * ( U_Repl ( :) - U_Remi ( :) )
+
+         entropy_flux_re = temp_02 * entropyflux_Remi
+     1                   - temp_03 * entropyflux_Repl
+     1                   + temp_04 * ( entropy_Repl - entropy_Remi )
+
+! Nominally, we provide for whatever would constitute a doubled dissipation.
+! It actually becomes irrelevant when the multidimensional Riemann solver
+! is used because this component of the flux is never used.
+!         flux_re ( 7) = 2.0 * flux_re ( 7)
+!     1               - 0.5 * ( F_Remi ( 7) + F_Repl ( 7) )
+!         flux_re ( 8) = 2.0 * flux_re ( 8)
+!     1               - 0.5 * ( F_Remi ( 8) + F_Repl ( 8) )
+
+! Alternative form of dissipation increase that is better keyed to HLL RS.
+         flux_re ( 7) = 2.0 * flux_re ( 7)
+     1           - ( temp_02 * F_Remi ( 7) - temp_03 * F_Repl ( 7) )
+         flux_re ( 8) = 2.0 * flux_re ( 8)
+     1           - ( temp_02 * F_Remi ( 8) - temp_03 * F_Repl ( 8) )
+
+      END IF
+
+! ------------------------------
+
+      IF ( split_prsflux_re /= 1) THEN
+
+      prstot_re = 0.0
+
+      ELSE
+
+      Rho_Use = AMAX1 ( conserved_re ( 1), rhofloor)
+      ob_rho = 1.0 / Rho_Use
+
+      Vlx_Use = conserved_re ( 2) * ob_rho
+      Vly_Use = conserved_re ( 3) * ob_rho
+      Vlz_Use = conserved_re ( 4) * ob_rho
+
+      Bfx_Use = conserved_re ( 6)
+      Bfy_Use = conserved_re ( 7)
+      Bfz_Use = conserved_re ( 8)
+
+      V2_Use = Vlx_Use**2 + Vly_Use**2 + Vlz_Use**2
+
+      B2_Use = Bfx_Use**2 + Bfy_Use**2 + Bfz_Use**2
+
+      V_dot_B_Use = Vlx_Use * Bfx_Use + Vly_Use * Bfy_Use
+     1            + Vlz_Use * Bfz_Use
+
+      Prs_Use = conserved_re ( 5)
+     1        - 0.5 * Rho_Use * V2_Use - ob_8pi * B2_Use
+
+      Prs_Use = Prs_Use * ( gamma_eos_Use - 1.0)
+
+      Prs_Use = AMAX1 ( Prs_Use, prsfloor)
+
+      prstot_re = Prs_Use + ob_8pi * B2_Use
+
+      flux_re ( 2) = flux_re ( 2) - prstot_re
+
+      END IF
+
+! ----------------------------------------------------------------------
+! STEP V) Undo the cyclic rotations in "conserved_re, flux_re" if they
+! are called for by "idirection".
+! ----------------------------------------------------------------------
+
+      IF ( idirection == 2) THEN
+
+! ----------
+
+      temp_01 = conserved_re ( 2)
+      temp_02 = conserved_re ( 3)
+      temp_03 = conserved_re ( 4)
+
+      conserved_re ( 2) = temp_03
+      conserved_re ( 3) = temp_01
+      conserved_re ( 4) = temp_02
+
+      temp_01 = conserved_re ( 6)
+      temp_02 = conserved_re ( 7)
+      temp_03 = conserved_re ( 8)
+
+      conserved_re ( 6) = temp_03
+      conserved_re ( 7) = temp_01
+      conserved_re ( 8) = temp_02
+
+! -----
+
+      temp_01 = flux_re ( 2)
+      temp_02 = flux_re ( 3)
+      temp_03 = flux_re ( 4)
+
+      flux_re ( 2) = temp_03
+      flux_re ( 3) = temp_01
+      flux_re ( 4) = temp_02
+
+      temp_01 = flux_re ( 6)
+      temp_02 = flux_re ( 7)
+      temp_03 = flux_re ( 8)
+
+      flux_re ( 6) = temp_03
+      flux_re ( 7) = temp_01
+      flux_re ( 8) = temp_02
+
+! ----------
+
+      ELSE IF ( idirection == 3) THEN
+
+! ----------
+
+      temp_01 = conserved_re ( 2)
+      temp_02 = conserved_re ( 3)
+      temp_03 = conserved_re ( 4)
+
+      conserved_re ( 2) = temp_02
+      conserved_re ( 3) = temp_03
+      conserved_re ( 4) = temp_01
+
+      temp_01 = conserved_re ( 6)
+      temp_02 = conserved_re ( 7)
+      temp_03 = conserved_re ( 8)
+
+      conserved_re ( 6) = temp_02
+      conserved_re ( 7) = temp_03
+      conserved_re ( 8) = temp_01
+
+! -----
+
+      temp_01 = flux_re ( 2)
+      temp_02 = flux_re ( 3)
+      temp_03 = flux_re ( 4)
+
+      flux_re ( 2) = temp_02
+      flux_re ( 3) = temp_03
+      flux_re ( 4) = temp_01
+
+      temp_01 = flux_re ( 6)
+      temp_02 = flux_re ( 7)
+      temp_03 = flux_re ( 8)
+
+      flux_re ( 6) = temp_02
+      flux_re ( 7) = temp_03
+      flux_re ( 8) = temp_01
+
+! ----------
+
+      END IF
+
+! ----------------------------------------------------------------------
+
+      END SUBROUTINE MHD_RIEM_HLL_PTWISE
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+      SUBROUTINE MHD_RIEM_HLLC_PTWISE
+
+     1   ( gamma, smallnum, prsfloor, rhofloor, pi,
+     1     idirection, split_prsflux_re, debug_stop,
+     1     my_blend_HLL,
+
+     1     U_Remi, U_Repl, F_Remi, F_Repl,
+     1     entropy_Remi, entropy_Repl,
+
+     1     gamma_eos_Remi, gamma_eos_Repl,
+     1     gamma_soundspeed_Remi, gamma_soundspeed_Repl,
+     1     mean_mol_wt_Remi, mean_mol_wt_Repl,
+
+     1     conserved_re, flux_re, entropy_flux_re, prstot_re)
+
+! ----------------------------------------------------------------------
+
+! Builds an HLLC Riemann solver for MHD. The input states are in
+! "U_Remi, U_Repl". Other "*_Remi" and "*_Repl" variables contain
+! other input values.
+
+! The output state and flux are contained in "conserved_re, flux_re". An 
+! HLL RS is used to build the entropy flux "entropy_flux_re". If
+! "split_prsflux_re = 1" then the gas + magnetic pressure is contained in
+! "prstot_re" and the appropriate momentum flux is decreased.
+
+! "idirection = 1, 2, 3" for x, y, z-directions. For "2 or 3", appropriate
+! cyclic rotations are applied on input and exit.
+
+! This version is for pointwise use. I.e. it just applied to one Riemann
+! problem at one zone boundary. The idea is to make it very lightweight
+! and cache-friendly for use on GPUs.
+
+! The use of fluxes from "F_Remi, F_Repl", instead of building them from
+! scratch, is only in the case of ADER schemes where such information can
+! be provided. Even then, it is indicated by setting "SAVE_FLUX_MODES" to 1.
+
+! ----------------------------------------------------------------------
+
+      IMPLICIT NONE
+
+      INTEGER idirection, split_prsflux_re, debug_stop
+
+      REAL gamma, smallnum, prsfloor, rhofloor, pi, my_blend_HLL
+
+      REAL :: mean_mol_wt_Remi, gamma_eos_Remi, gamma_soundspeed_Remi,
+     1        mean_mol_wt_Repl, gamma_eos_Repl, gamma_soundspeed_Repl,
+
+     1        entropy_Remi, entropy_Repl, entropy_flux_re, prstot_re
+
+      REAL, DIMENSION ( NFIELD + NFLUID + 1) :: U_Remi, U_Repl,
+     1        F_Remi, F_Repl, conserved_re, flux_re
+
+! ----------------------------------------------------------------------
+
+! Variables past this point are not used in the subroutine interface.
+
+      REAL temp_01, temp_02, temp_03, temp_04,
+
+     1     fourpi, ob_4pi, ob_8pi, ob_rho,
+
+     1     Rho_Remi, Prs_Remi, Etot_Remi, Vlx_Remi, Vly_Remi, Vlz_Remi,
+     1     Bfx_Remi, Bfy_Remi, Bfz_Remi, Prs_Tot_Remi,
+     1     V2_remi, B2_Remi, V_dot_B_Remi,
+     1     Total_Enthalpy_Remi, entropyflux_Remi,
+
+     1     Rho_Repl, Prs_Repl, Etot_Repl, Vlx_Repl, Vly_Repl, Vlz_Repl, 
+     1     Bfx_Repl, Bfy_Repl, Bfz_Repl, Prs_Tot_Repl,
+     1     V2_Repl, B2_Repl, V_dot_B_Repl,
+     1     Total_Enthalpy_Repl, entropyflux_Repl,
+
+     1     Rho_Use, Prs_Use, Vlx_Use, Vly_Use, Vlz_Use,
+     1     Bfx_Use, Bfy_Use, Bfz_Use, Total_Enthalpy_Use,
+     1     X_Use, V2_Use, B2_Use, V_dot_B_Use,
+     1     gamma_eos_Use, gamma_soundspeed_Use,
+
+! Primitives obtained from the resolved HLL state. Useful for building
+! "F_Add".
+! The total gas + magnetic pressure in the resolved state "Prs_Tot_Star".
+     1      Rho_Star, Prs_Tot_Star, Vlx_Star, Vly_Star, Vlz_Star,
+     1      Bfx_Star, Bfy_Star, Bfz_Star, V_dot_B_Star,
+     1      B2_Star, V2_Star, Prs_Star,
+
+! Extremal speeds and the speed of the contact.
+     1     S_Min, S_Max, S_Mid
+
+! HLL states and fluxes, as well as intermediate HLLC states and fluxes.
+      REAL, DIMENSION ( NFIELD + NFLUID + 1) :: U_HLL, F_HLL, F_Add,
+     1     U_Star_Minus, U_Star_Plus, F_Star_Minus, F_Star_Plus
+
+! ----------------------------------------------------------------------
+
+      fourpi = 4.0 * pi
+      ob_4pi = 1.0 / fourpi
+      ob_8pi = 0.5 / fourpi
+
+! ----------------------------------------------------------------------
+! STEP I) Make cyclic rotations if they are called for by "idirection".
+! After making rotations, enforce continuity of the longitudinal magnetic
+! field across the two states. This is always the 6th component after
+! rotations.
+! ----------------------------------------------------------------------
+
+      IF ( idirection == 2) THEN
+
+! ----------
+
+      temp_01 = U_Remi ( 2)
+      temp_02 = U_Remi ( 3)
+      temp_03 = U_Remi ( 4)
+
+      U_Remi ( 2) = temp_02
+      U_Remi ( 3) = temp_03
+      U_Remi ( 4) = temp_01
+
+      temp_01 = U_Remi ( 6)
+      temp_02 = U_Remi ( 7)
+      temp_03 = U_Remi ( 8)
+
+      U_Remi ( 6) = temp_02
+      U_Remi ( 7) = temp_03
+      U_Remi ( 8) = temp_01
+
+! -----
+
+      temp_01 = U_Repl ( 2)
+      temp_02 = U_Repl ( 3)
+      temp_03 = U_Repl ( 4)
+
+      U_Repl ( 2) = temp_02
+      U_Repl ( 3) = temp_03
+      U_Repl ( 4) = temp_01
+
+      temp_01 = U_Repl ( 6)
+      temp_02 = U_Repl ( 7)
+      temp_03 = U_Repl ( 8)
+
+      U_Repl ( 6) = temp_02
+      U_Repl ( 7) = temp_03
+      U_Repl ( 8) = temp_01
+
+! -----
+
+      temp_01 = F_Remi ( 2)
+      temp_02 = F_Remi ( 3)
+      temp_03 = F_Remi ( 4)
+
+      F_Remi ( 2) = temp_02
+      F_Remi ( 3) = temp_03
+      F_Remi ( 4) = temp_01
+
+      temp_01 = F_Remi ( 6)
+      temp_02 = F_Remi ( 7)
+      temp_03 = F_Remi ( 8)
+
+      F_Remi ( 6) = temp_02
+      F_Remi ( 7) = temp_03
+      F_Remi ( 8) = temp_01
+
+! -----
+
+      temp_01 = F_Repl ( 2)
+      temp_02 = F_Repl ( 3)
+      temp_03 = F_Repl ( 4)
+
+      F_Repl ( 2) = temp_02
+      F_Repl ( 3) = temp_03
+      F_Repl ( 4) = temp_01
+
+      temp_01 = F_Repl ( 6)
+      temp_02 = F_Repl ( 7)
+      temp_03 = F_Repl ( 8)
+
+      F_Repl ( 6) = temp_02
+      F_Repl ( 7) = temp_03
+      F_Repl ( 8) = temp_01
+
+! ----------
+
+      ELSE IF ( idirection == 3) THEN
+
+! ----------
+
+      temp_01 = U_Remi ( 2)
+      temp_02 = U_Remi ( 3)
+      temp_03 = U_Remi ( 4)
+
+      U_Remi ( 2) = temp_03
+      U_Remi ( 3) = temp_01
+      U_Remi ( 4) = temp_02
+
+      temp_01 = U_Remi ( 6)
+      temp_02 = U_Remi ( 7)
+      temp_03 = U_Remi ( 8)
+
+      U_Remi ( 6) = temp_03
+      U_Remi ( 7) = temp_01
+      U_Remi ( 8) = temp_02
+
+! -----
+
+      temp_01 = U_Repl ( 2)
+      temp_02 = U_Repl ( 3)
+      temp_03 = U_Repl ( 4)
+
+      U_Repl ( 2) = temp_03
+      U_Repl ( 3) = temp_01
+      U_Repl ( 4) = temp_02
+
+      temp_01 = U_Repl ( 6)
+      temp_02 = U_Repl ( 7)
+      temp_03 = U_Repl ( 8)
+
+      U_Repl ( 6) = temp_03
+      U_Repl ( 7) = temp_01
+      U_Repl ( 8) = temp_02
+
+! -----
+
+      temp_01 = F_Remi ( 2)
+      temp_02 = F_Remi ( 3)
+      temp_03 = F_Remi ( 4)
+
+      F_Remi ( 2) = temp_03
+      F_Remi ( 3) = temp_01
+      F_Remi ( 4) = temp_02
+
+      temp_01 = F_Remi ( 6)
+      temp_02 = F_Remi ( 7)
+      temp_03 = F_Remi ( 8)
+
+      F_Remi ( 6) = temp_03
+      F_Remi ( 7) = temp_01
+      F_Remi ( 8) = temp_02
+
+! -----
+
+      temp_01 = F_Repl ( 2)
+      temp_02 = F_Repl ( 3)
+      temp_03 = F_Repl ( 4)
+
+      F_Repl ( 2) = temp_03
+      F_Repl ( 3) = temp_01
+      F_Repl ( 4) = temp_02
+
+      temp_01 = F_Repl ( 6)
+      temp_02 = F_Repl ( 7)
+      temp_03 = F_Repl ( 8)
+
+      F_Repl ( 6) = temp_03
+      F_Repl ( 7) = temp_01
+      F_Repl ( 8) = temp_02
+
+! ----------
+
+      END IF
+
+! --------------------
+! Enforce continuity of longitudinal magnetic field.
+
+      temp_01 = 0.5 * ( U_Remi ( 6) + U_Repl ( 6) )
+      U_Remi ( 6) = temp_01
+      U_Repl ( 6) = temp_01
+
+! ----------------------------------------------------------------------
+! STEP II) Build the primitive variables "Rho_Remi" and "Rho_Repl" etc.
+! Also build the fluxes "F_Remi ( :)" and "F_Repl ( :)".
+! ----------------------------------------------------------------------
+
+      Rho_Remi = AMAX1 ( U_Remi ( 1), rhofloor)
+      ob_rho = 1.0 / Rho_Remi
+
+      Vlx_Remi = U_Remi ( 2) * ob_rho
+      Vly_Remi = U_Remi ( 3) * ob_rho
+      Vlz_Remi = U_Remi ( 4) * ob_rho
+
+      Etot_Remi = U_Remi ( 5)
+
+      Bfx_Remi = U_Remi ( 6)
+      Bfy_Remi = U_Remi ( 7)
+      Bfz_Remi = U_Remi ( 8)
+
+      V2_Remi = Vlx_Remi**2 + Vly_Remi**2 + Vlz_Remi**2
+
+      B2_Remi = Bfx_Remi**2 + Bfy_Remi**2 + Bfz_Remi**2
+
+      V_dot_B_Remi = Vlx_Remi * Bfx_Remi + Vly_Remi * Bfy_Remi
+     1             + Vlz_Remi * Bfz_Remi
+
+      Prs_Remi = Etot_Remi - 0.5 * Rho_Remi * V2_Remi - ob_8pi * B2_Remi
+
+      Prs_Remi = Prs_Remi * ( gamma_eos_Remi - 1.0)
+
+#if ( ENFORCE_POSITIVITY == 1)
+      IF ( Prs_Remi <= prsfloor) Prs_Remi = entropy_Remi
+     1                          * Rho_Remi**( gamma_eos_Remi - 1.0)
+#endif
+      Prs_Remi = AMAX1 ( Prs_Remi, prsfloor)
+
+      Prs_Tot_Remi = Prs_Remi + ob_8pi * B2_Remi
+
+      Total_Enthalpy_Remi = ( gamma_eos_Remi * Prs_Remi
+     1     / ( gamma_eos_Remi - 1.0) + 0.5 * Rho_Remi * V2_Remi
+     1     + ob_4pi * B2_Remi ) / Rho_Remi
+
+! ----------
+#if ( SAVE_FLUX_MODES != 1)
+
+      F_Remi ( :) = Vlx_Remi * U_Remi ( :)
+
+
+      F_Remi ( 2) = F_Remi ( 2) + Prs_Remi + ob_8pi * B2_Remi
+     1            - ob_4pi * Bfx_Remi**2
+
+      F_Remi ( 3) = F_Remi ( 3) - ob_4pi * Bfx_Remi * Bfy_Remi
+
+      F_Remi ( 4) = F_Remi ( 4) - ob_4pi * Bfx_Remi * Bfz_Remi
+
+      F_Remi ( 5) = F_Remi ( 5)
+     1            + ( Prs_Remi + ob_8pi * B2_Remi ) * Vlx_Remi 
+     1            - Bfx_Remi * V_dot_B_Remi * ob_4pi
+
+      F_Remi ( 6) = 0.0
+
+      F_Remi ( 7) = F_Remi ( 7) - Vly_Remi * Bfx_Remi
+
+      F_Remi ( 8) = F_Remi ( 8) - Vlz_Remi * Bfx_Remi
+
+#endif
+! -----
+
+      entropyflux_Remi = entropy_Remi * Vlx_Remi
+
+! ------------------------------
+
+      Rho_Repl = AMAX1 ( U_Repl ( 1), rhofloor)
+      ob_rho = 1.0 / Rho_Repl
+
+      Vlx_Repl = U_Repl ( 2) * ob_rho
+      Vly_Repl = U_Repl ( 3) * ob_rho
+      Vlz_Repl = U_Repl ( 4) * ob_rho
+
+      Etot_Repl = U_Repl ( 5)
+
+      Bfx_Repl = U_Repl ( 6)
+      Bfy_Repl = U_Repl ( 7)
+      Bfz_Repl = U_Repl ( 8)
+
+      V2_Repl = Vlx_Repl**2 + Vly_Repl**2 + Vlz_Repl**2
+
+      B2_Repl = Bfx_Repl**2 + Bfy_Repl**2 + Bfz_Repl**2
+
+      V_dot_B_Repl = Vlx_Repl * Bfx_Repl + Vly_Repl * Bfy_Repl
+     1             + Vlz_Repl * Bfz_Repl
+
+      Prs_Repl = Etot_Repl - 0.5 * Rho_Repl * V2_Repl - ob_8pi * B2_Repl
+
+      Prs_Repl = Prs_Repl * ( gamma_eos_Repl - 1.0)
+
+#if ( ENFORCE_POSITIVITY == 1)
+      IF ( Prs_Repl <= prsfloor) Prs_Repl = entropy_Repl 
+     1                          * Rho_Repl**( gamma_eos_Repl - 1.0)
+#endif
+      Prs_Repl = AMAX1 ( Prs_Repl, prsfloor)
+
+      Prs_Tot_Repl = Prs_Repl + ob_8pi * B2_Repl
+
+      Total_Enthalpy_Repl = ( gamma_eos_Repl * Prs_Repl
+     1     / ( gamma_eos_Repl - 1.0) + 0.5 * Rho_Repl * V2_Repl
+     1     + ob_4pi * B2_Repl ) / Rho_Repl
+
+! ----------
+#if ( SAVE_FLUX_MODES != 1)
+
+      F_Repl ( :) = Vlx_Repl * U_Repl ( :)
+
+
+      F_Repl ( 2) = F_Repl ( 2) + Prs_Repl + ob_8pi * B2_Repl
+     1            - ob_4pi * Bfx_Repl**2
+
+      F_Repl ( 3) = F_Repl ( 3) - ob_4pi * Bfx_Repl * Bfy_Repl
+
+      F_Repl ( 4) = F_Repl ( 4) - ob_4pi * Bfx_Repl * Bfz_Repl
+
+      F_Repl ( 5) = F_Repl ( 5) 
+     1            + ( Prs_Repl + ob_8pi * B2_Repl ) * Vlx_Repl
+     1            - Bfx_Repl * V_dot_B_Repl * ob_4pi
+
+      F_Repl ( 6) = 0.0
+
+      F_Repl ( 7) = F_Repl ( 7) - Vly_Repl * Bfx_Repl
+
+      F_Repl ( 8) = F_Repl ( 8) - Vlz_Repl * Bfx_Repl
+
+#endif
+! -----
+
+      entropyflux_Repl = entropy_Repl * Vlx_Repl
+
+! ----------------------------------------------------------------------
+! STEP III) Build "S_Min, S_Max", the extremal speeds of the RS.
+! We evaluate speeds in each of the two states and also in the 
+! roe-averaged ( or arithmetic-averaged) state.
+! ----------------------------------------------------------------------
+
+      temp_01 = 1.0 / Rho_Remi
+
+      temp_02 = ( gamma_soundspeed_Remi * Prs_Remi
+     1          + ob_4pi * B2_Remi ) * temp_01
+
+      temp_03 = ob_4pi * gamma_soundspeed_Remi * Prs_Remi
+     1             * Bfx_Remi**2 * temp_01**2
+
+      temp_04 = AMAX1 ( temp_02**2 - 4.0 * temp_03, 0.0)
+
+      temp_04 = 0.5 * ( temp_02 + SQRT ( temp_04 ) )
+
+      temp_04 = SQRT ( temp_04 )
+
+      S_Min = Vlx_Remi - temp_04
+
+! Commented just to get an exact representation of the speeds for HLL/C RS.
+! Feel free to uncomment just to increase extremal speeds for the sake of
+! stability.
+!      S_Max = Vlx_Remi + temp_04
+
+! ------------------------------
+
+      temp_01 = 1.0 / Rho_Repl
+
+      temp_02 = ( gamma_soundspeed_Repl * Prs_Repl
+     1          + ob_4pi * B2_Repl ) * temp_01
+
+      temp_03 = ob_4pi * gamma_soundspeed_Repl * Prs_Repl
+     1             * Bfx_Repl**2 * temp_01**2
+
+      temp_04 = AMAX1 ( temp_02**2 - 4.0 * temp_03, 0.0)
+
+      temp_04 = 0.5 * ( temp_02 + SQRT ( temp_04 ) )
+
+      temp_04 = SQRT ( temp_04 )
+
+! Commented just to get an exact representation of the speeds for HLL/C RS.
+! Feel free to uncomment just to increase extremal speeds for the sake of
+! stability.
+!      S_Min = AMIN1 ( S_Min, Vlx_Repl - temp_04)
+
+! Commented just to get an exact representation of the speeds for HLL/C RS.
+! Feel free to uncomment just to increase extremal speeds for the sake of
+! stability.
+!      S_Max = AMAX1 ( S_Max, Vlx_Repl + temp_04)
+! If above line is uncommented, then comment out the below line.
+      S_Max = Vlx_Repl + temp_04
+
+! ------------------------------
+
+      temp_01 = SQRT ( Rho_Repl / Rho_Remi )
+      temp_02 = 1.0 / ( 1.0 + temp_01 )
+
+      gamma_soundspeed_Use = 0.5 * ( gamma_soundspeed_Remi
+     1                             + gamma_soundspeed_Repl )
+      gamma_eos_Use = 0.5 * ( gamma_eos_Remi + gamma_eos_Repl )
+
+      Rho_Use = SQRT ( Rho_Repl * Rho_Remi )
+
+      Total_Enthalpy_Use = ( Total_Enthalpy_Remi
+     1          + Total_Enthalpy_Repl * temp_01 ) * temp_02
+
+      Vlx_Use = ( Vlx_Remi + Vlx_Repl * temp_01 ) * temp_02
+      Vly_Use = ( Vly_Remi + Vly_Repl * temp_01 ) * temp_02
+      Vlz_Use = ( Vlz_Remi + Vlz_Repl * temp_01 ) * temp_02
+
+      Bfx_Use = ( Bfx_Remi * temp_01 + Bfx_Repl ) * temp_02
+      Bfy_Use = ( Bfy_Remi * temp_01 + Bfy_Repl ) * temp_02
+      Bfz_Use = ( Bfz_Remi * temp_01 + Bfz_Repl ) * temp_02
+
+      X_Use = ( Bfx_Repl - Bfx_Remi )**2 + ( Bfy_Repl - Bfy_Remi )**2
+     1      + ( Bfz_Repl - Bfz_Remi )**2
+      X_Use = 0.5 * X_Use / ( SQRT ( Rho_Remi) + SQRT ( Rho_Repl) )**2
+
+      V2_Use = Vlx_Use**2 + Vly_Use**2 + Vlz_Use**2
+
+      B2_Use = Bfx_Use**2 + Bfy_Use**2 + Bfz_Use**2
+
+      Prs_Use = Total_Enthalpy_Use - 0.5 * V2_Use
+     1        - ob_4pi * B2_Use / Rho_Use
+
+      Prs_Use = ( gamma_eos_Use - 1.0) * Rho_Use * Prs_Use
+     1        / gamma_eos_Use
+
+      Prs_Use = Prs_Use - ( gamma_eos_Use - 2.0) * Rho_Use * X_Use
+     1                  / ( fourpi * gamma_eos_Use )
+
+      Prs_Use = AMAX1 ( Prs_Use, prsfloor)
+
+! ----------
+
+      IF ( ( Rho_Use <= rhofloor) .OR. ( Prs_Use <= prsfloor) ) THEN
+
+      Rho_Use = 0.5 * ( Rho_Remi + Rho_Repl )
+      Prs_Use = 0.5 * ( Prs_Remi + Prs_Repl )
+
+      Vlx_Use = 0.5 * ( Vlx_Remi + Vlx_Repl )
+      Vly_Use = 0.5 * ( Vly_Remi + Vly_Repl )
+      Vlz_Use = 0.5 * ( Vlz_Remi + Vlz_Repl )
+
+      Bfx_Use = 0.5 * ( Bfx_Remi + Bfx_Repl )
+      Bfy_Use = 0.5 * ( Bfy_Remi + Bfy_Repl )
+      Bfz_Use = 0.5 * ( Bfz_Remi + Bfz_Repl )
+
+      X_Use = 0.0
+
+      V2_Use = Vlx_Use**2 + Vly_Use**2 + Vlz_Use**2
+
+      B2_Use = Bfx_Use**2 + Bfy_Use**2 + Bfz_Use**2
+
+      END IF
+
+! ----------
+
+      temp_01 = 1.0 / Rho_Use
+
+      temp_02 = ( gamma_soundspeed_Use * Prs_Use
+     1          + ob_4pi * B2_Use ) * temp_01
+
+      temp_03 = ob_4pi * gamma_soundspeed_Use * Prs_Use
+     1             * Bfx_Use**2 * temp_01**2
+
+      temp_04 = AMAX1 ( temp_02**2 - 4.0 * temp_03, 0.0)
+
+      temp_04 = 0.5 * ( temp_02 + SQRT ( temp_04 ) )
+
+      temp_04 = SQRT ( temp_04 )
+
+      S_Min = AMIN1 ( S_Min, Vlx_Use - temp_04)
+
+      S_Max = AMAX1 ( S_Max, Vlx_Use + temp_04)
+
+! ----------------------------------------------------------------------
+! STEP IV) Now build HLL variables "conserved_re, flux_re" and
+! "entropy_flux_re". Also build "prstot_re" if "split_prsflux_re == 1".
+! ----------------------------------------------------------------------
+
+      IF ( S_Min >= 0.0 ) THEN
+
+        conserved_re ( :) = U_Remi ( :)
+
+        flux_re ( :) = F_Remi ( :)
+
+        entropy_flux_re = entropyflux_Remi
+
+        GO TO 1010  ! Prepare for exiting the subroutine.
+
+      ELSE IF ( S_Max <= 0.0 ) THEN
+
+        conserved_re ( :) = U_Repl ( :)
+
+        flux_re ( :) = F_Repl ( :)
+
+        entropy_flux_re = entropyflux_Repl
+
+        GO TO 1010  ! Prepare for exiting the subroutine.
+
+      ELSE
+
+        temp_01 = 1.0 / ( S_Max - S_Min )
+        temp_02 = S_Max * temp_01
+        temp_03 = S_Min * temp_01
+        temp_04 = S_Max * S_Min * temp_01
+
+        U_HLL ( :) = temp_02 * U_Repl ( :)
+     1             - temp_03 * U_Remi ( :)
+     1             - temp_01 * ( F_Repl ( :) - F_Remi ( :) )
+
+        F_HLL ( :) = temp_02 * F_Remi ( :) - temp_03 * F_Repl ( :)
+     1             + temp_04 * ( U_Repl ( :) - U_Remi ( :) )
+
+        entropy_flux_re = temp_02 * entropyflux_Remi
+     1                  - temp_03 * entropyflux_Repl
+     1                  + temp_04 * ( entropy_Repl - entropy_Remi )
+
+      END IF
+
+! ----------------------------------------------------------------------
+! STEP V) Build "Rho_Star, Prs_Tot_Star, Vlx_Star, ..., Bfx_Star, ...".
+! Use them to build "S_Mid", the intermediate speed for HLLC RS.
+! Use them to build "F_Add".
+! We get here only if the problem is not supersonic and we need to build
+! the intermediate states.
+! ----------------------------------------------------------------------
+
+      Rho_Star = AMAX1 ( U_HLL ( 1), rhofloor)
+      ob_rho = 1.0 / Rho_Star
+
+      Vlx_Star = U_HLL ( 2) * ob_rho
+      Vly_Star = U_HLL ( 3) * ob_rho
+      Vlz_Star = U_HLL ( 4) * ob_rho
+
+      Bfx_Star = U_HLL ( 6)
+      Bfy_Star = U_HLL ( 7)
+      Bfz_Star = U_HLL ( 8)
+
+      B2_Star = Bfx_Star**2 + Bfy_Star**2 + Bfz_Star**2
+
+      V_dot_B_Star = Vlx_Star * Bfx_Star + Vly_Star * Bfy_Star
+     1             + Vlz_Star * Bfz_Star
+
+! This important speed mediates the entire HLLC Riemann solver.
+
+      S_Mid = ( Prs_Tot_Repl - Prs_Tot_Remi
+     1        + Rho_Remi * Vlx_Remi * ( S_Min - Vlx_Remi)
+     1        - Rho_Repl * Vlx_Repl * ( S_Max - Vlx_Repl)
+     1        - ob_4pi * ( Bfx_Repl**2 - Bfx_Remi**2) )
+     1      / ( Rho_Remi * ( S_Min - Vlx_Remi)
+     1        - Rho_Repl * ( S_Max - Vlx_Repl) )
+
+      Vlx_Star = S_Mid  ! Restore consistency in the longitudinal velocity.
+
+! Total pressure from HLL resolved state.
+
+      Prs_Tot_Star = 0.5 * ( Prs_Tot_Remi + Prs_Tot_Repl
+     1        + Rho_Remi * ( S_Min - Vlx_Remi) * ( S_Mid - Vlx_Remi)
+     1        + Rho_Repl * ( S_Max - Vlx_Repl) * ( S_Mid - Vlx_Repl)
+     1        + ob_4pi * ( 2.0 * Bfx_Star**2
+     1                   - Bfx_Repl**2 - Bfx_Remi**2) )
+
+      Prs_Tot_Star = AMAX1 ( Prs_Tot_Star, prsfloor)
+
+      Prs_Star = Prs_Tot_Star - ob_8pi * B2_Star
+
+      Prs_Star = AMAX1 ( Prs_Star, prsfloor)
+
+! ------------------------------
+
+      F_Add ( :) = 0.0
+
+      F_Add ( 2) = Prs_Tot_Star - ob_4pi * Bfx_Star**2
+
+      F_Add ( 3) = - ob_4pi * Bfx_Star * Bfy_Star
+
+      F_Add ( 4) = - ob_4pi * Bfx_Star * Bfz_Star
+
+      F_Add ( 5) = Prs_Tot_Star * Vlx_Star
+     1           - ob_4pi * Bfx_Star * V_dot_B_Star
+
+! ----------------------------------------------------------------------
+! STEP VI) Now build "U_Star_Minus, F_Star_Minus, U_Star_Plus, F_Star_Plus"
+! corresponding to the internal states of the HLLC Riemann solver.
+! Then, depending on the sign of "S_Mid", we set "conserved_re, flux_re".
+! Since the supersonic cases have been dealt with, we are only dealing with
+! the subsonic cases here.
+! ----------------------------------------------------------------------
+
+      IF ( S_Mid >= 0.0) THEN
+
+! ------------------------------
+! Make the state and flux.
+
+      temp_01 = - 1.0 / AMAX1 ( S_Mid - S_Min, smallnum )
+
+      U_Star_Minus ( :) = temp_01 * ( S_Min * U_Remi ( :)
+     1                              - F_Remi ( :) + F_Add ( :) )
+
+      F_Star_Minus ( :) = Vlx_Star * U_Star_Minus ( :) + F_Add ( :)
+
+      F_Star_Minus ( 6: 8) = F_HLL ( 6: 8)
+
+! ----------
+! Check whether the density and pressure in the state are positive. If not,
+! revert to full HLL.
+
+      Rho_Star = AMAX1 ( U_Star_Minus ( 1), 0.5 * rhofloor)
+      ob_rho = 1.0 / Rho_Star
+
+      Vlx_Star = U_Star_Minus ( 2) * ob_rho
+      Vly_Star = U_Star_Minus ( 3) * ob_rho
+      Vlz_Star = U_Star_Minus ( 4) * ob_rho
+
+      Bfx_Star = U_Star_Minus ( 6)
+      Bfy_Star = U_Star_Minus ( 7)
+      Bfz_Star = U_Star_Minus ( 8)
+
+      V2_Star = Vlx_Star**2 + Vly_Star**2 + Vlz_Star**2
+
+      B2_Star = Bfx_Star**2 + Bfy_Star**2 + Bfz_Star**2
+
+      Prs_Star = U_Star_Minus ( 5) - 0.5 * Rho_Star * V2_Star
+     1         - ob_8pi * B2_Star
+
+      IF ( ( Rho_Star <= rhofloor) .OR. ( Prs_Star <= prsfloor) )
+     1                                             my_blend_HLL = 1
+
+! ----------
+! Now build "conserved_re, flux_re".
+
+      temp_01 = 1.0 - my_blend_HLL
+
+      conserved_re ( :) = temp_01 * U_Star_Minus ( :)
+     1                  + my_blend_HLL * U_HLL ( :)
+
+      flux_re ( :) = temp_01 * F_Star_Minus ( :)
+     1             + my_blend_HLL * F_HLL ( :)
+
+! ------------------------------
+
+      ELSE
+
+! ------------------------------
+! Make the state and flux.
+
+      temp_02 = 1.0 / AMAX1 ( S_Max - S_Mid, smallnum )
+
+      U_Star_Plus ( :) = temp_02 * ( S_Max * U_Repl ( :)
+     1                             - F_Repl ( :) + F_Add ( :) )
+
+      F_Star_Plus ( :) = Vlx_Star * U_Star_Plus ( :) + F_Add ( :)
+
+      F_Star_Plus ( 6: 8) = F_HLL ( 6: 8)
+
+! ----------
+! Check whether the density and pressure in the state are positive. If not,
+! revert to full HLL.
+
+      Rho_Star = AMAX1 ( U_Star_Plus ( 1), 0.5 * rhofloor)
+      ob_rho = 1.0 / Rho_Star
+
+      Vlx_Star = U_Star_Plus ( 2) * ob_rho
+      Vly_Star = U_Star_Plus ( 3) * ob_rho
+      Vlz_Star = U_Star_Plus ( 4) * ob_rho
+
+      Bfx_Star = U_Star_Plus ( 6)
+      Bfy_Star = U_Star_Plus ( 7)
+      Bfz_Star = U_Star_Plus ( 8)
+
+      V2_Star = Vlx_Star**2 + Vly_Star**2 + Vlz_Star**2
+
+      B2_Star = Bfx_Star**2 + Bfy_Star**2 + Bfz_Star**2
+
+      Prs_Star = U_Star_Plus ( 5) - 0.5 * Rho_Star * V2_Star
+     1         - ob_8pi * B2_Star
+
+      IF ( ( Rho_Star <= rhofloor) .OR. ( Prs_Star <= prsfloor) )
+     1                                             my_blend_HLL = 1
+
+! ----------
+! Now build "conserved_re, flux_re".
+
+      temp_01 = 1.0 - my_blend_HLL
+
+      conserved_re ( :) = temp_01 * U_Star_Plus ( :)
+     1                  + my_blend_HLL * U_HLL ( :)
+
+      flux_re ( :) = temp_01 * F_Star_Plus ( :)
+     1             + my_blend_HLL * F_HLL ( :)
+
+! ------------------------------
+
+      END IF
+
+! ----------------------------------------------------------------------
+! STEP VII) Also build "prstot_re" if "split_prsflux_re == 1".
+! ----------------------------------------------------------------------
+
+1010  CONTINUE
+
+      IF ( split_prsflux_re /= 1) THEN
+
+      prstot_re = 0.0
+
+      ELSE
+
+      Rho_Use = AMAX1 ( conserved_re ( 1), rhofloor)
+      ob_rho = 1.0 / Rho_Use
+
+      Vlx_Use = conserved_re ( 2) * ob_rho
+      Vly_Use = conserved_re ( 3) * ob_rho
+      Vlz_Use = conserved_re ( 4) * ob_rho
+
+      Bfx_Use = conserved_re ( 6)
+      Bfy_Use = conserved_re ( 7)
+      Bfz_Use = conserved_re ( 8)
+
+      V2_Use = Vlx_Use**2 + Vly_Use**2 + Vlz_Use**2
+
+      B2_Use = Bfx_Use**2 + Bfy_Use**2 + Bfz_Use**2
+
+      V_dot_B_Use = Vlx_Use * Bfx_Use + Vly_Use * Bfy_Use
+     1            + Vlz_Use * Bfz_Use
+
+      Prs_Use = conserved_re ( 5)
+     1        - 0.5 * Rho_Use * V2_Use - ob_8pi * B2_Use
+
+      Prs_Use = Prs_Use * ( gamma_eos_Use - 1.0)
+
+      Prs_Use = AMAX1 ( Prs_Use, prsfloor)
+
+      prstot_re = Prs_Use + ob_8pi * B2_Use
+
+      flux_re ( 2) = flux_re ( 2) - prstot_re
+
+      END IF
+
+! ----------------------------------------------------------------------
+! STEP VIII) Undo the cyclic rotations in "conserved_re, flux_re" if they
+! are called for by "idirection".
+! ----------------------------------------------------------------------
+
+      IF ( idirection == 2) THEN
+
+! ----------
+
+      temp_01 = conserved_re ( 2)
+      temp_02 = conserved_re ( 3)
+      temp_03 = conserved_re ( 4)
+
+      conserved_re ( 2) = temp_03
+      conserved_re ( 3) = temp_01
+      conserved_re ( 4) = temp_02
+
+      temp_01 = conserved_re ( 6)
+      temp_02 = conserved_re ( 7)
+      temp_03 = conserved_re ( 8)
+
+      conserved_re ( 6) = temp_03
+      conserved_re ( 7) = temp_01
+      conserved_re ( 8) = temp_02
+
+! -----
+
+      temp_01 = flux_re ( 2)
+      temp_02 = flux_re ( 3)
+      temp_03 = flux_re ( 4)
+
+      flux_re ( 2) = temp_03
+      flux_re ( 3) = temp_01
+      flux_re ( 4) = temp_02
+
+      temp_01 = flux_re ( 6)
+      temp_02 = flux_re ( 7)
+      temp_03 = flux_re ( 8)
+
+      flux_re ( 6) = temp_03
+      flux_re ( 7) = temp_01
+      flux_re ( 8) = temp_02
+
+! ----------
+
+      ELSE IF ( idirection == 3) THEN
+
+! ----------
+
+      temp_01 = conserved_re ( 2)
+      temp_02 = conserved_re ( 3)
+      temp_03 = conserved_re ( 4)
+
+      conserved_re ( 2) = temp_02
+      conserved_re ( 3) = temp_03
+      conserved_re ( 4) = temp_01
+
+      temp_01 = conserved_re ( 6)
+      temp_02 = conserved_re ( 7)
+      temp_03 = conserved_re ( 8)
+
+      conserved_re ( 6) = temp_02
+      conserved_re ( 7) = temp_03
+      conserved_re ( 8) = temp_01
+
+! -----
+
+      temp_01 = flux_re ( 2)
+      temp_02 = flux_re ( 3)
+      temp_03 = flux_re ( 4)
+
+      flux_re ( 2) = temp_02
+      flux_re ( 3) = temp_03
+      flux_re ( 4) = temp_01
+
+      temp_01 = flux_re ( 6)
+      temp_02 = flux_re ( 7)
+      temp_03 = flux_re ( 8)
+
+      flux_re ( 6) = temp_02
+      flux_re ( 7) = temp_03
+      flux_re ( 8) = temp_01
+
+! ----------
+
+      END IF
+
+! ----------------------------------------------------------------------
+
+      END SUBROUTINE MHD_RIEM_HLLC_PTWISE
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+      SUBROUTINE MHD_RIEM_HLLD_PTWISE
+
+     1   ( gamma, smallnum, prsfloor, rhofloor, pi,
+     1     idirection, split_prsflux_re, debug_stop,
+     1     my_blend_HLL,
+
+     1     U_Remi, U_Repl, F_Remi, F_Repl,
+     1     entropy_Remi, entropy_Repl,
+
+     1     gamma_eos_Remi, gamma_eos_Repl,
+     1     gamma_soundspeed_Remi, gamma_soundspeed_Repl,
+     1     mean_mol_wt_Remi, mean_mol_wt_Repl,
+
+     1     conserved_re, flux_re, entropy_flux_re, prstot_re)
+
+! ----------------------------------------------------------------------
+
+! Builds an HLLD Riemann solver for MHD. The input states are in
+! "U_Remi, U_Repl". Other "*_Remi" and "*_Repl" variables contain
+! other input values.
+
+! The output state and flux are contained in "conserved_re, flux_re". An 
+! HLL RS is used to build the entropy flux "entropy_flux_re". If
+! "split_prsflux_re = 1" then the gas + magnetic pressure is contained in
+! "prstot_re" and the appropriate momentum flux is decreased.
+
+! "idirection = 1, 2, 3" for x, y, z-directions. For "2 or 3", appropriate
+! cyclic rotations are applied on input and exit.
+
+! This version is for pointwise use. I.e. it just applied to one Riemann
+! problem at one zone boundary. The idea is to make it very lightweight
+! and cache-friendly for use on GPUs.
+
+! The use of fluxes from "F_Remi, F_Repl", instead of building them from
+! scratch, is only in the case of ADER schemes where such information can
+! be provided. Even then, it is indicated by setting "SAVE_FLUX_MODES" to 1.
+
+! ----------------------------------------------------------------------
+
+      IMPLICIT NONE
+
+      INTEGER idirection, split_prsflux_re, debug_stop
+
+      REAL gamma, smallnum, prsfloor, rhofloor, pi, my_blend_HLL
+
+      REAL :: mean_mol_wt_Remi, gamma_eos_Remi, gamma_soundspeed_Remi,
+     1        mean_mol_wt_Repl, gamma_eos_Repl, gamma_soundspeed_Repl,
+
+     1        entropy_Remi, entropy_Repl, entropy_flux_re, prstot_re
+
+      REAL, DIMENSION ( NFIELD + NFLUID + 1) :: U_Remi, U_Repl,
+     1        F_Remi, F_Repl, conserved_re, flux_re
+
+! ----------------------------------------------------------------------
+
+! Variables past this point are not used in the subroutine interface.
+
+      INTEGER HLLD_busted
+
+      REAL temp_01, temp_02, temp_03, temp_04,
+
+     1     fourpi, ob_4pi, ob_8pi, ob_rho,
+
+     1     a11, a12, a21, a22, r1, r2, ob_det,
+
+     1     Rho_Remi, Prs_Remi, Etot_Remi, Vlx_Remi, Vly_Remi, Vlz_Remi,
+     1     Bfx_Remi, Bfy_Remi, Bfz_Remi, Prs_Tot_Remi,
+     1     V2_remi, B2_Remi, V_dot_B_Remi,
+     1     Total_Enthalpy_Remi, entropyflux_Remi,
+
+     1     Rho_Repl, Prs_Repl, Etot_Repl, Vlx_Repl, Vly_Repl, Vlz_Repl, 
+     1     Bfx_Repl, Bfy_Repl, Bfz_Repl, Prs_Tot_Repl,
+     1     V2_Repl, B2_Repl, V_dot_B_Repl,
+     1     Total_Enthalpy_Repl, entropyflux_Repl,
+
+     1     Rho_Use, Prs_Use, Vlx_Use, Vly_Use, Vlz_Use,
+     1     Bfx_Use, Bfy_Use, Bfz_Use, Total_Enthalpy_Use,
+     1     X_Use, V2_Use, B2_Use, V_dot_B_Use,
+     1     gamma_eos_Use, gamma_soundspeed_Use,
+
+! Primitives obtained from the resolved HLL state.
+! The total gas + magnetic pressure in the resolved state "Prs_Tot_Star".
+     1      Rho_Star, Prs_Tot_Star, Vlx_Star, Vly_Star, Vlz_Star,
+     1      Bfx_Star, Bfy_Star, Bfz_Star, V_dot_B_Star,
+     1      B2_Star, V2_Star, Prs_Star,
+
+! Primitive variables in the "_Star_Plus" state.
+     1      Rho_Star_Plus, Vlx_Star_Plus, Vly_Star_Plus,
+     1      Vlz_Star_Plus, Bfy_Star_Plus, Bfz_Star_Plus,
+     1      VdotB_Star_Plus, B2_Star_Plus, Etot_Star_Plus,
+
+! Primitive variables in the "_Star_Minus" state.
+     1      Rho_Star_Minus, Vlx_Star_Minus, Vly_Star_Minus, 
+     1      Vlz_Star_Minus, Bfy_Star_Minus, Bfz_Star_Minus,
+     1      VdotB_Star_Minus, B2_Star_Minus, Etot_Star_Minus,
+
+! Primitive variables in the "_DblStar_Plus" state.
+     1      Vly_DblStar_Plus, Vlz_DblStar_Plus, Bfy_DblStar_Plus,
+     1      Bfz_DblStar_Plus, Etot_DblStar_Plus,
+     1      B2_DblStar_Plus, VdotB_DblStar_Plus,
+
+! Primitive variables in the "_DblStar_Minus" state.
+     1      Vly_DblStar_Minus, Vlz_DblStar_Minus, Bfy_DblStar_Minus,
+     1      Bfz_DblStar_Minus, Etot_DblStar_Minus,
+     1      B2_DblStar_Minus, VdotB_DblStar_Minus,
+
+! Extremal speeds and the speed of the contact, and Alfven speeds.
+     1     S_Min, S_Max, S_Mid, S_Alf_Minus, S_Alf_Plus, small_speed
+
+! HLL states and fluxes, as well as intermediate HLLC states and fluxes.
+      REAL, DIMENSION ( NFIELD + NFLUID + 1) :: U_HLL, F_HLL,
+     1     U_Star_Minus, U_Star_Plus, F_Star_Minus, F_Star_Plus,
+     1     U_DblStar_Minus, U_DblStar_Plus,
+     1     F_DblStar_Minus, F_DblStar_Plus
+
+! ----------------------------------------------------------------------
+
+      HLLD_busted = 0
+
+      small_speed = 1.0e-16
+
+      fourpi = 4.0 * pi
+      ob_4pi = 1.0 / fourpi
+      ob_8pi = 0.5 / fourpi
+
+! ----------------------------------------------------------------------
+! STEP I) Make cyclic rotations if they are called for by "idirection".
+! After making rotations, enforce continuity of the longitudinal magnetic
+! field across the two states. This is always the 6th component after
+! rotations.
+! ----------------------------------------------------------------------
+
+      IF ( idirection == 2) THEN
+
+! ----------
+
+      temp_01 = U_Remi ( 2)
+      temp_02 = U_Remi ( 3)
+      temp_03 = U_Remi ( 4)
+
+      U_Remi ( 2) = temp_02
+      U_Remi ( 3) = temp_03
+      U_Remi ( 4) = temp_01
+
+      temp_01 = U_Remi ( 6)
+      temp_02 = U_Remi ( 7)
+      temp_03 = U_Remi ( 8)
+
+      U_Remi ( 6) = temp_02
+      U_Remi ( 7) = temp_03
+      U_Remi ( 8) = temp_01
+
+! -----
+
+      temp_01 = U_Repl ( 2)
+      temp_02 = U_Repl ( 3)
+      temp_03 = U_Repl ( 4)
+
+      U_Repl ( 2) = temp_02
+      U_Repl ( 3) = temp_03
+      U_Repl ( 4) = temp_01
+
+      temp_01 = U_Repl ( 6)
+      temp_02 = U_Repl ( 7)
+      temp_03 = U_Repl ( 8)
+
+      U_Repl ( 6) = temp_02
+      U_Repl ( 7) = temp_03
+      U_Repl ( 8) = temp_01
+
+! -----
+
+      temp_01 = F_Remi ( 2)
+      temp_02 = F_Remi ( 3)
+      temp_03 = F_Remi ( 4)
+
+      F_Remi ( 2) = temp_02
+      F_Remi ( 3) = temp_03
+      F_Remi ( 4) = temp_01
+
+      temp_01 = F_Remi ( 6)
+      temp_02 = F_Remi ( 7)
+      temp_03 = F_Remi ( 8)
+
+      F_Remi ( 6) = temp_02
+      F_Remi ( 7) = temp_03
+      F_Remi ( 8) = temp_01
+
+! -----
+
+      temp_01 = F_Repl ( 2)
+      temp_02 = F_Repl ( 3)
+      temp_03 = F_Repl ( 4)
+
+      F_Repl ( 2) = temp_02
+      F_Repl ( 3) = temp_03
+      F_Repl ( 4) = temp_01
+
+      temp_01 = F_Repl ( 6)
+      temp_02 = F_Repl ( 7)
+      temp_03 = F_Repl ( 8)
+
+      F_Repl ( 6) = temp_02
+      F_Repl ( 7) = temp_03
+      F_Repl ( 8) = temp_01
+
+! ----------
+
+      ELSE IF ( idirection == 3) THEN
+
+! ----------
+
+      temp_01 = U_Remi ( 2)
+      temp_02 = U_Remi ( 3)
+      temp_03 = U_Remi ( 4)
+
+      U_Remi ( 2) = temp_03
+      U_Remi ( 3) = temp_01
+      U_Remi ( 4) = temp_02
+
+      temp_01 = U_Remi ( 6)
+      temp_02 = U_Remi ( 7)
+      temp_03 = U_Remi ( 8)
+
+      U_Remi ( 6) = temp_03
+      U_Remi ( 7) = temp_01
+      U_Remi ( 8) = temp_02
+
+! -----
+
+      temp_01 = U_Repl ( 2)
+      temp_02 = U_Repl ( 3)
+      temp_03 = U_Repl ( 4)
+
+      U_Repl ( 2) = temp_03
+      U_Repl ( 3) = temp_01
+      U_Repl ( 4) = temp_02
+
+      temp_01 = U_Repl ( 6)
+      temp_02 = U_Repl ( 7)
+      temp_03 = U_Repl ( 8)
+
+      U_Repl ( 6) = temp_03
+      U_Repl ( 7) = temp_01
+      U_Repl ( 8) = temp_02
+
+! -----
+
+      temp_01 = F_Remi ( 2)
+      temp_02 = F_Remi ( 3)
+      temp_03 = F_Remi ( 4)
+
+      F_Remi ( 2) = temp_03
+      F_Remi ( 3) = temp_01
+      F_Remi ( 4) = temp_02
+
+      temp_01 = F_Remi ( 6)
+      temp_02 = F_Remi ( 7)
+      temp_03 = F_Remi ( 8)
+
+      F_Remi ( 6) = temp_03
+      F_Remi ( 7) = temp_01
+      F_Remi ( 8) = temp_02
+
+! -----
+
+      temp_01 = F_Repl ( 2)
+      temp_02 = F_Repl ( 3)
+      temp_03 = F_Repl ( 4)
+
+      F_Repl ( 2) = temp_03
+      F_Repl ( 3) = temp_01
+      F_Repl ( 4) = temp_02
+
+      temp_01 = F_Repl ( 6)
+      temp_02 = F_Repl ( 7)
+      temp_03 = F_Repl ( 8)
+
+      F_Repl ( 6) = temp_03
+      F_Repl ( 7) = temp_01
+      F_Repl ( 8) = temp_02
+
+! ----------
+
+      END IF
+
+! --------------------
+! Enforce continuity of longitudinal magnetic field.
+
+      temp_01 = 0.5 * ( U_Remi ( 6) + U_Repl ( 6) )
+      U_Remi ( 6) = temp_01
+      U_Repl ( 6) = temp_01
+
+! ----------------------------------------------------------------------
+! STEP II) Build the primitive variables "Rho_Remi" and "Rho_Repl" etc.
+! Also build the fluxes "F_Remi ( :)" and "F_Repl ( :)".
+! ----------------------------------------------------------------------
+
+      Rho_Remi = AMAX1 ( U_Remi ( 1), rhofloor)
+      ob_rho = 1.0 / Rho_Remi
+
+      Vlx_Remi = U_Remi ( 2) * ob_rho
+      Vly_Remi = U_Remi ( 3) * ob_rho
+      Vlz_Remi = U_Remi ( 4) * ob_rho
+
+      Etot_Remi = U_Remi ( 5)
+
+      Bfx_Remi = U_Remi ( 6)
+      Bfy_Remi = U_Remi ( 7)
+      Bfz_Remi = U_Remi ( 8)
+
+      V2_Remi = Vlx_Remi**2 + Vly_Remi**2 + Vlz_Remi**2
+
+      B2_Remi = Bfx_Remi**2 + Bfy_Remi**2 + Bfz_Remi**2
+
+      V_dot_B_Remi = Vlx_Remi * Bfx_Remi + Vly_Remi * Bfy_Remi
+     1             + Vlz_Remi * Bfz_Remi
+
+      Prs_Remi = Etot_Remi - 0.5 * Rho_Remi * V2_Remi - ob_8pi * B2_Remi
+
+      Prs_Remi = Prs_Remi * ( gamma_eos_Remi - 1.0)
+
+#if ( ENFORCE_POSITIVITY == 1)
+      IF ( Prs_Remi <= prsfloor) Prs_Remi = entropy_Remi
+     1                          * Rho_Remi**( gamma_eos_Remi - 1.0)
+#endif
+      Prs_Remi = AMAX1 ( Prs_Remi, prsfloor)
+
+      Prs_Tot_Remi = Prs_Remi + ob_8pi * B2_Remi
+
+      Total_Enthalpy_Remi = ( gamma_eos_Remi * Prs_Remi
+     1     / ( gamma_eos_Remi - 1.0) + 0.5 * Rho_Remi * V2_Remi
+     1     + ob_4pi * B2_Remi ) / Rho_Remi
+
+! ----------
+#if ( SAVE_FLUX_MODES != 1)
+
+      F_Remi ( :) = Vlx_Remi * U_Remi ( :)
+
+
+      F_Remi ( 2) = F_Remi ( 2) + Prs_Remi + ob_8pi * B2_Remi
+     1            - ob_4pi * Bfx_Remi**2
+
+      F_Remi ( 3) = F_Remi ( 3) - ob_4pi * Bfx_Remi * Bfy_Remi
+
+      F_Remi ( 4) = F_Remi ( 4) - ob_4pi * Bfx_Remi * Bfz_Remi
+
+      F_Remi ( 5) = F_Remi ( 5)
+     1            + ( Prs_Remi + ob_8pi * B2_Remi ) * Vlx_Remi 
+     1            - Bfx_Remi * V_dot_B_Remi * ob_4pi
+
+      F_Remi ( 6) = 0.0
+
+      F_Remi ( 7) = F_Remi ( 7) - Vly_Remi * Bfx_Remi
+
+      F_Remi ( 8) = F_Remi ( 8) - Vlz_Remi * Bfx_Remi
+
+#endif
+! -----
+
+      entropyflux_Remi = entropy_Remi * Vlx_Remi
+
+! ------------------------------
+
+      Rho_Repl = AMAX1 ( U_Repl ( 1), rhofloor)
+      ob_rho = 1.0 / Rho_Repl
+
+      Vlx_Repl = U_Repl ( 2) * ob_rho
+      Vly_Repl = U_Repl ( 3) * ob_rho
+      Vlz_Repl = U_Repl ( 4) * ob_rho
+
+      Etot_Repl = U_Repl ( 5)
+
+      Bfx_Repl = U_Repl ( 6)
+      Bfy_Repl = U_Repl ( 7)
+      Bfz_Repl = U_Repl ( 8)
+
+      V2_Repl = Vlx_Repl**2 + Vly_Repl**2 + Vlz_Repl**2
+
+      B2_Repl = Bfx_Repl**2 + Bfy_Repl**2 + Bfz_Repl**2
+
+      V_dot_B_Repl = Vlx_Repl * Bfx_Repl + Vly_Repl * Bfy_Repl
+     1             + Vlz_Repl * Bfz_Repl
+
+      Prs_Repl = Etot_Repl - 0.5 * Rho_Repl * V2_Repl - ob_8pi * B2_Repl
+
+      Prs_Repl = Prs_Repl * ( gamma_eos_Repl - 1.0)
+
+#if ( ENFORCE_POSITIVITY == 1)
+      IF ( Prs_Repl <= prsfloor) Prs_Repl = entropy_Repl 
+     1                          * Rho_Repl**( gamma_eos_Repl - 1.0)
+#endif
+      Prs_Repl = AMAX1 ( Prs_Repl, prsfloor)
+
+      Prs_Tot_Repl = Prs_Repl + ob_8pi * B2_Repl
+
+      Total_Enthalpy_Repl = ( gamma_eos_Repl * Prs_Repl
+     1     / ( gamma_eos_Repl - 1.0) + 0.5 * Rho_Repl * V2_Repl
+     1     + ob_4pi * B2_Repl ) / Rho_Repl
+
+! ----------
+#if ( SAVE_FLUX_MODES != 1)
+
+      F_Repl ( :) = Vlx_Repl * U_Repl ( :)
+
+
+      F_Repl ( 2) = F_Repl ( 2) + Prs_Repl + ob_8pi * B2_Repl
+     1            - ob_4pi * Bfx_Repl**2
+
+      F_Repl ( 3) = F_Repl ( 3) - ob_4pi * Bfx_Repl * Bfy_Repl
+
+      F_Repl ( 4) = F_Repl ( 4) - ob_4pi * Bfx_Repl * Bfz_Repl
+
+      F_Repl ( 5) = F_Repl ( 5) 
+     1            + ( Prs_Repl + ob_8pi * B2_Repl ) * Vlx_Repl
+     1            - Bfx_Repl * V_dot_B_Repl * ob_4pi
+
+      F_Repl ( 6) = 0.0
+
+      F_Repl ( 7) = F_Repl ( 7) - Vly_Repl * Bfx_Repl
+
+      F_Repl ( 8) = F_Repl ( 8) - Vlz_Repl * Bfx_Repl
+
+#endif
+! -----
+
+      entropyflux_Repl = entropy_Repl * Vlx_Repl
+
+! ----------------------------------------------------------------------
+! STEP III) Build "S_Min, S_Max", the extremal speeds of the RS.
+! We evaluate speeds in each of the two states and also in the 
+! roe-averaged ( or arithmetic-averaged) state.
+! ----------------------------------------------------------------------
+
+      temp_01 = 1.0 / Rho_Remi
+
+      temp_02 = ( gamma_soundspeed_Remi * Prs_Remi
+     1          + ob_4pi * B2_Remi ) * temp_01
+
+      temp_03 = ob_4pi * gamma_soundspeed_Remi * Prs_Remi
+     1             * Bfx_Remi**2 * temp_01**2
+
+      temp_04 = AMAX1 ( temp_02**2 - 4.0 * temp_03, 0.0)
+
+      temp_04 = 0.5 * ( temp_02 + SQRT ( temp_04 ) )
+
+      temp_04 = SQRT ( temp_04 )
+
+      S_Min = Vlx_Remi - temp_04
+
+! Commented just to get an exact representation of the speeds for HLL/C RS.
+! Feel free to uncomment just to increase extremal speeds for the sake of
+! stability.
+!      S_Max = Vlx_Remi + temp_04
+
+! ------------------------------
+
+      temp_01 = 1.0 / Rho_Repl
+
+      temp_02 = ( gamma_soundspeed_Repl * Prs_Repl
+     1          + ob_4pi * B2_Repl ) * temp_01
+
+      temp_03 = ob_4pi * gamma_soundspeed_Repl * Prs_Repl
+     1             * Bfx_Repl**2 * temp_01**2
+
+      temp_04 = AMAX1 ( temp_02**2 - 4.0 * temp_03, 0.0)
+
+      temp_04 = 0.5 * ( temp_02 + SQRT ( temp_04 ) )
+
+      temp_04 = SQRT ( temp_04 )
+
+! Commented just to get an exact representation of the speeds for HLL/C RS.
+! Feel free to uncomment just to increase extremal speeds for the sake of
+! stability.
+!      S_Min = AMIN1 ( S_Min, Vlx_Repl - temp_04)
+
+! Commented just to get an exact representation of the speeds for HLL/C RS.
+! Feel free to uncomment just to increase extremal speeds for the sake of
+! stability.
+!      S_Max = AMAX1 ( S_Max, Vlx_Repl + temp_04)
+! If above line is uncommented, then comment out the below line.
+      S_Max = Vlx_Repl + temp_04
+
+! ------------------------------
+
+      temp_01 = SQRT ( Rho_Repl / Rho_Remi )
+      temp_02 = 1.0 / ( 1.0 + temp_01 )
+
+      gamma_soundspeed_Use = 0.5 * ( gamma_soundspeed_Remi
+     1                             + gamma_soundspeed_Repl )
+      gamma_eos_Use = 0.5 * ( gamma_eos_Remi + gamma_eos_Repl )
+
+      Rho_Use = SQRT ( Rho_Repl * Rho_Remi )
+
+      Total_Enthalpy_Use = ( Total_Enthalpy_Remi
+     1          + Total_Enthalpy_Repl * temp_01 ) * temp_02
+
+      Vlx_Use = ( Vlx_Remi + Vlx_Repl * temp_01 ) * temp_02
+      Vly_Use = ( Vly_Remi + Vly_Repl * temp_01 ) * temp_02
+      Vlz_Use = ( Vlz_Remi + Vlz_Repl * temp_01 ) * temp_02
+
+      Bfx_Use = ( Bfx_Remi * temp_01 + Bfx_Repl ) * temp_02
+      Bfy_Use = ( Bfy_Remi * temp_01 + Bfy_Repl ) * temp_02
+      Bfz_Use = ( Bfz_Remi * temp_01 + Bfz_Repl ) * temp_02
+
+      X_Use = ( Bfx_Repl - Bfx_Remi )**2 + ( Bfy_Repl - Bfy_Remi )**2
+     1      + ( Bfz_Repl - Bfz_Remi )**2
+      X_Use = 0.5 * X_Use / ( SQRT ( Rho_Remi) + SQRT ( Rho_Repl) )**2
+
+      V2_Use = Vlx_Use**2 + Vly_Use**2 + Vlz_Use**2
+
+      B2_Use = Bfx_Use**2 + Bfy_Use**2 + Bfz_Use**2
+
+      Prs_Use = Total_Enthalpy_Use - 0.5 * V2_Use
+     1        - ob_4pi * B2_Use / Rho_Use
+
+      Prs_Use = ( gamma_eos_Use - 1.0) * Rho_Use * Prs_Use
+     1        / gamma_eos_Use
+
+      Prs_Use = Prs_Use - ( gamma_eos_Use - 2.0) * Rho_Use * X_Use
+     1                  / ( fourpi * gamma_eos_Use )
+
+      Prs_Use = AMAX1 ( Prs_Use, prsfloor)
+
+! ----------
+
+      IF ( ( Rho_Use <= rhofloor) .OR. ( Prs_Use <= prsfloor) ) THEN
+
+      Rho_Use = 0.5 * ( Rho_Remi + Rho_Repl )
+      Prs_Use = 0.5 * ( Prs_Remi + Prs_Repl )
+
+      Vlx_Use = 0.5 * ( Vlx_Remi + Vlx_Repl )
+      Vly_Use = 0.5 * ( Vly_Remi + Vly_Repl )
+      Vlz_Use = 0.5 * ( Vlz_Remi + Vlz_Repl )
+
+      Bfx_Use = 0.5 * ( Bfx_Remi + Bfx_Repl )
+      Bfy_Use = 0.5 * ( Bfy_Remi + Bfy_Repl )
+      Bfz_Use = 0.5 * ( Bfz_Remi + Bfz_Repl )
+
+      X_Use = 0.0
+
+      V2_Use = Vlx_Use**2 + Vly_Use**2 + Vlz_Use**2
+
+      B2_Use = Bfx_Use**2 + Bfy_Use**2 + Bfz_Use**2
+
+      END IF
+
+! ----------
+
+      temp_01 = 1.0 / Rho_Use
+
+      temp_02 = ( gamma_soundspeed_Use * Prs_Use
+     1          + ob_4pi * B2_Use ) * temp_01
+
+      temp_03 = ob_4pi * gamma_soundspeed_Use * Prs_Use
+     1             * Bfx_Use**2 * temp_01**2
+
+      temp_04 = AMAX1 ( temp_02**2 - 4.0 * temp_03, 0.0)
+
+      temp_04 = 0.5 * ( temp_02 + SQRT ( temp_04 ) )
+
+      temp_04 = SQRT ( temp_04 )
+
+      S_Min = AMIN1 ( S_Min, Vlx_Use - temp_04)
+
+      S_Max = AMAX1 ( S_Max, Vlx_Use + temp_04)
+
+! ----------------------------------------------------------------------
+! STEP IV) Now build HLL variables "conserved_re, flux_re" and
+! "entropy_flux_re". Also build "prstot_re" if "split_prsflux_re == 1".
+! ----------------------------------------------------------------------
+
+      IF ( S_Min >= 0.0 ) THEN
+
+        conserved_re ( :) = U_Remi ( :)
+
+        flux_re ( :) = F_Remi ( :)
+
+        entropy_flux_re = entropyflux_Remi
+
+        GO TO 1010  ! Prepare for exiting the subroutine.
+
+      ELSE IF ( S_Max <= 0.0 ) THEN
+
+        conserved_re ( :) = U_Repl ( :)
+
+        flux_re ( :) = F_Repl ( :)
+
+        entropy_flux_re = entropyflux_Repl
+
+        GO TO 1010  ! Prepare for exiting the subroutine.
+
+      ELSE
+
+        temp_01 = 1.0 / ( S_Max - S_Min )
+        temp_02 = S_Max * temp_01
+        temp_03 = S_Min * temp_01
+        temp_04 = S_Max * S_Min * temp_01
+
+        U_HLL ( :) = temp_02 * U_Repl ( :)
+     1             - temp_03 * U_Remi ( :)
+     1             - temp_01 * ( F_Repl ( :) - F_Remi ( :) )
+
+        F_HLL ( :) = temp_02 * F_Remi ( :) - temp_03 * F_Repl ( :)
+     1             + temp_04 * ( U_Repl ( :) - U_Remi ( :) )
+
+        entropy_flux_re = temp_02 * entropyflux_Remi
+     1                  - temp_03 * entropyflux_Repl
+     1                  + temp_04 * ( entropy_Repl - entropy_Remi )
+
+      END IF
+
+! ----------------------------------------------------------------------
+! STEP V) Build "Rho_Star, Prs_Tot_Star, Vlx_Star, ..., Bfx_Star, ...".
+! Use them to build "S_Mid", the intermediate speed for HLLC RS.
+! We get here only if the problem is not supersonic and we need to build
+! the intermediate states.
+! ----------------------------------------------------------------------
+
+      Rho_Star = AMAX1 ( U_HLL ( 1), rhofloor)
+      ob_rho = 1.0 / Rho_Star
+
+      Vlx_Star = U_HLL ( 2) * ob_rho
+      Vly_Star = U_HLL ( 3) * ob_rho
+      Vlz_Star = U_HLL ( 4) * ob_rho
+
+      Bfx_Star = U_HLL ( 6)
+      Bfy_Star = U_HLL ( 7)
+      Bfz_Star = U_HLL ( 8)
+
+      B2_Star = Bfx_Star**2 + Bfy_Star**2 + Bfz_Star**2
+
+      V_dot_B_Star = Vlx_Star * Bfx_Star + Vly_Star * Bfy_Star
+     1             + Vlz_Star * Bfz_Star
+
+! This important speed mediates the entire HLLD Riemann solver.
+
+      S_Mid = ( Prs_Tot_Repl - Prs_Tot_Remi
+     1        + Rho_Remi * Vlx_Remi * ( S_Min - Vlx_Remi)
+     1        - Rho_Repl * Vlx_Repl * ( S_Max - Vlx_Repl)
+     1        - ob_4pi * ( Bfx_Repl**2 - Bfx_Remi**2) )
+     1      / ( Rho_Remi * ( S_Min - Vlx_Remi)
+     1        - Rho_Repl * ( S_Max - Vlx_Repl) )
+
+      Vlx_Star = S_Mid  ! Restore consistency in the longitudinal velocity.
+
+! Total pressure from HLL resolved state.
+
+      Prs_Tot_Star = 0.5 * ( Prs_Tot_Remi + Prs_Tot_Repl
+     1        + Rho_Remi * ( S_Min - Vlx_Remi) * ( S_Mid - Vlx_Remi)
+     1        + Rho_Repl * ( S_Max - Vlx_Repl) * ( S_Mid - Vlx_Repl)
+     1        + ob_4pi * ( 2.0 * Bfx_Star**2
+     1                   - Bfx_Repl**2 - Bfx_Remi**2) )
+
+      Prs_Tot_Star = AMAX1 ( Prs_Tot_Star, prsfloor)
+
+      Prs_Star = Prs_Tot_Star - ob_8pi * B2_Star
+
+      Prs_Star = AMAX1 ( Prs_Star, prsfloor)
+
+! ----------------------------------------------------------------------
+! STEP VI) Now build "U_Star_Minus, F_Star_Minus, U_Star_Plus, F_Star_Plus"
+! corresponding to the internal states of the HLLD Riemann solver.
+! Then, depending on the relative signs of "S_Mid, S_Alf_Minus, S_Alf_Plus",
+! we set "conserved_re, flux_re".
+! Since the supersonic cases have been dealt with, we are only dealing with
+! the subsonic cases here.
+! Obtain "U_Star_Minus, U_Star_Plus" by solving 1x1 or 2x2 systems.
+! ----------------------------------------------------------------------
+
+      IF (
+!     1     ( Prs_Star <= 10.0 * prsfloor) .OR.
+     1     ( ABS ( S_Mid - S_Max) <= small_speed) .OR.
+     1     ( ABS ( S_Mid - S_Min) <= small_speed) ) HLLD_busted = 1
+
+! ------------------------------
+
+      IF ( HLLD_busted == 0) THEN
+
+! ------------------------------
+! Build "U_Star_Plus, F_Star_Plus" from "U_Repl, F_Repl" and "S_Max".
+! ------------------------------
+! 1st, 2nd, 6th and species fraction rows of the matrix are being solved.
+
+      a11 = 1.0 / ( S_Mid - S_Max)
+
+      r1 = F_Repl ( 1) - S_Max * U_Repl ( 1)
+      Rho_Star_Plus = AMAX1 ( r1 * a11, rhofloor)
+      ob_rho = 1.0 / Rho_Star_Plus
+      U_Star_Plus ( 1) = Rho_Star_Plus
+
+      r1 = F_Repl ( 2) - S_Max * U_Repl ( 2)
+     1   - ( Prs_Tot_Star - ob_4pi * Bfx_Star**2)
+      U_Star_Plus ( 2) = r1 * a11
+      Vlx_Star_Plus = U_Star_Plus ( 2) * ob_rho
+
+      U_Star_Plus ( 6) = Bfx_Star
+
+! ----------
+
+#if ( NFLUID >= 1)
+      U_Star_Plus ( 9: 8 + NFLUID) = a11 * ( F_Repl ( 9: 8 + NFLUID)
+     1                             - S_Max * U_Repl ( 9: 8 + NFLUID) )
+#endif
+
+! ----------
+! 3rd, 7th, 4th & 8th rows of the matrix being solved as 2x2 systems.
+
+      a11 = S_Mid - S_Max
+      a12 = - ob_4pi * Bfx_Star
+      a21 = - ob_rho * Bfx_Star
+      a22 = a11
+
+      ob_det = a11 * a22 - a12 * a21
+
+      IF ( ABS ( ob_det) < small_speed**2 * rhofloor) THEN
+        HLLD_busted = 1
+        ob_det = smallnum
+      ELSE
+        ob_det = 1.0 / ob_det
+      END IF
+
+! ----------
+
+      r1 = F_Repl ( 3) - S_Max * U_Repl ( 3)
+      r2 = F_Repl ( 7) - S_Max * U_Repl ( 7)
+
+      U_Star_Plus ( 3) = ob_det * ( r1 * a22 - r2 * a12)
+      U_Star_Plus ( 7) = ob_det * ( a11 * r2 - a21 * r1)
+
+      Vly_Star_Plus = U_Star_Plus ( 3) * ob_rho
+      Bfy_Star_Plus = U_Star_Plus ( 7)
+
+! ----------
+
+      r1 = F_Repl ( 4) - S_Max * U_Repl ( 4)
+      r2 = F_Repl ( 8) - S_Max * U_Repl ( 8)
+
+      U_Star_Plus ( 4) = ob_det * ( r1 * a22 - r2 * a12)
+      U_Star_Plus ( 8) = ob_det * ( a11 * r2 - a21 * r1)
+
+      Vlz_Star_Plus = U_Star_Plus ( 4) * ob_rho
+      Bfz_Star_Plus = U_Star_Plus ( 8)
+
+! ----------
+! 5th row of the matrix being solved here.
+
+      VdotB_Star_Plus = Vlx_Star_Plus * Bfx_Star
+     1                + Vly_Star_Plus * Bfy_Star_Plus
+     1                + Vlz_Star_Plus * Bfz_Star_Plus
+
+      B2_Star_Plus = Bfx_Star**2 + Bfy_Star_Plus**2
+     1             + Bfz_Star_Plus**2
+
+      a11 = 1.0 / ( S_Mid - S_Max)
+
+      r1 = F_Repl ( 5) - S_Max * U_Repl ( 5)
+     1                 - ( Prs_Tot_Star * Vlx_Star
+     1                   - ob_4pi * Bfx_Star * VdotB_Star_Plus )
+
+      Etot_Star_Plus = r1 * a11
+      U_Star_Plus ( 5) = Etot_Star_Plus
+
+! ----------
+! Now that "U_Star_Plus" is built, use jump conditions to build "F_Star_Plus".
+
+      F_Star_Plus ( :) = F_Repl ( :)
+     1                 - S_Max * ( U_Repl ( :) - U_Star_Plus ( :) )
+
+! ----------
+! Build right-going Alfven speed.
+
+      S_Alf_Plus = S_Mid + ABS ( Bfx_Star)
+     1                   / SQRT ( fourpi * Rho_Star_Plus)
+
+! -----
+
+      IF ( ( S_Alf_Plus <= 0.0) .AND. ( S_Max >= 0.0) ) THEN
+
+! -----
+#if ( 0 == 1)
+! -----
+! This is a rather stringent criterion, especially for the HLLD RS.
+
+      Rho_Star = AMAX1 ( U_Star_Plus ( 1), 0.5 * rhofloor)
+      ob_rho = 1.0 / Rho_Star
+
+      Vlx_Star = U_Star_Plus ( 2) * ob_rho
+      Vly_Star = U_Star_Plus ( 3) * ob_rho
+      Vlz_Star = U_Star_Plus ( 4) * ob_rho
+
+      Bfx_Star = U_Star_Plus ( 6)
+      Bfy_Star = U_Star_Plus ( 7)
+      Bfz_Star = U_Star_Plus ( 8)
+
+      V2_Star = Vlx_Star**2 + Vly_Star**2 + Vlz_Star**2
+
+      B2_Star = Bfx_Star**2 + Bfy_Star**2 + Bfz_Star**2
+
+      Prs_Star = U_Star_Plus ( 5) - 0.5 * Rho_Star * V2_Star
+     1         - ob_8pi * B2_Star
+
+      IF ( ( HLLD_busted == 1) .OR. ( Rho_Star <= rhofloor) .OR.
+     1     ( Prs_Star <= prsfloor) ) my_blend_HLL = 1.0
+
+! -----
+#else
+! -----
+! This is a less stringent criterion.
+
+      IF ( ( HLLD_busted == 1) .OR.
+     1     ( U_Star_Plus ( 1) <= 10.0 * rhofloor) ) my_blend_HLL = 1.0
+
+! -----
+#endif
+! -----
+
+! -----
+! Now build "conserved_re, flux_re".
+
+      temp_01 = 1.0 - my_blend_HLL
+
+      conserved_re ( :) = temp_01 * U_Star_Plus ( :)
+     1                  + my_blend_HLL * U_HLL ( :)
+
+      flux_re ( :) = temp_01 * F_Star_Plus ( :)
+     1             + my_blend_HLL * F_HLL ( :)
+
+      GO TO 1010
+
+! -----
+
+      END IF
+
+! ------------------------------
+! Build "U_Star_Minus, F_Star_Minus" from "U_Remi, F_Remi" and "S_Min".
+! ------------------------------
+! 1st, 2nd, 6th and species fraction rows of the matrix are being solved.
+
+      a11 = 1.0 / ( S_Mid - S_Min)
+
+      r1 = F_Remi ( 1) - S_Min * U_Remi ( 1)
+      Rho_Star_Minus = AMAX1 ( r1 * a11, rhofloor)
+      ob_rho = 1.0 / Rho_Star_Minus
+      U_Star_Minus ( 1) = Rho_Star_Minus
+
+      r1 = F_Remi ( 2) - S_Min * U_Remi ( 2)
+     1   - ( Prs_Tot_Star - ob_4pi * Bfx_Star**2)
+      U_Star_Minus ( 2) = r1 * a11
+      Vlx_Star_Minus = U_Star_Minus ( 2) * ob_rho
+
+      U_Star_Minus ( 6) = Bfx_Star
+
+! ----------
+
+#if ( NFLUID >= 1)
+      U_Star_Minus ( 9: 8 + NFLUID) = a11 * ( F_Remi ( 9: 8 + NFLUID)
+     1                              - S_Min * U_Remi ( 9: 8 + NFLUID) )
+#endif
+
+! ----------
+! 3rd, 7th, 4th & 8th rows of the matrix being solved as 2x2 systems.
+
+      a11 = S_Mid - S_Min
+      a12 = - ob_4pi * Bfx_Star
+      a21 = - ob_rho * Bfx_Star
+      a22 = a11
+
+      ob_det = a11 * a22 - a12 * a21
+
+      IF ( ABS ( ob_det) < small_speed**2 * rhofloor) THEN
+        HLLD_busted = 1
+        ob_det = smallnum
+      ELSE
+        ob_det = 1.0 / ob_det
+      END IF
+
+! ----------
+
+      r1 = F_Remi ( 3) - S_Min * U_Remi ( 3)
+      r2 = F_Remi ( 7) - S_Min * U_Remi ( 7)
+
+      U_Star_Minus ( 3) = ob_det * ( r1 * a22 - r2 * a12)
+      U_Star_Minus ( 7) = ob_det * ( a11 * r2 - a21 * r1)
+
+      Vly_Star_Minus = U_Star_Minus ( 3) * ob_rho
+      Bfy_Star_Minus = U_Star_Minus ( 7)
+
+! ----------
+
+      r1 = F_Remi ( 4) - S_Min * U_Remi ( 4)
+      r2 = F_Remi ( 8) - S_Min * U_Remi ( 8)
+
+      U_Star_Minus ( 4) = ob_det * ( r1 * a22 - r2 * a12)
+      U_Star_Minus ( 8) = ob_det * ( a11 * r2 - a21 * r1)
+
+      Vlz_Star_Minus = U_Star_Minus ( 4) * ob_rho
+      Bfz_Star_Minus = U_Star_Minus ( 8)
+
+! ----------
+! 5th row of the matrix being solved here.
+
+      VdotB_Star_Minus = Vlx_Star_Minus * Bfx_Star
+     1                 + Vly_Star_Minus * Bfy_Star_Minus
+     1                 + Vlz_Star_Minus * Bfz_Star_Minus
+
+      B2_Star_Minus = Bfx_Star**2 + Bfy_Star_Minus**2
+     1              + Bfz_Star_Minus**2
+
+      a11 = 1.0 / ( S_Mid - S_Min)
+
+      r1 = F_Remi ( 5) - S_Min * U_Remi ( 5)
+     1                 - ( Prs_Tot_Star * Vlx_Star
+     1                   - ob_4pi * Bfx_Star * VdotB_Star_Minus )
+
+      Etot_Star_Minus = r1 * a11
+      U_Star_Minus ( 5) = Etot_Star_Minus
+
+! ----------
+! Now that "U_Star_Minus" is built, use jump conditions to build "F_Star_Minus".
+
+      F_Star_Minus ( :) = F_Remi ( :)
+     1                  - S_Min * ( U_Remi ( :) - U_Star_Minus ( :) )
+
+! ----------
+! Build left-going Alfven speed.
+
+      S_Alf_Minus = S_Mid - ABS ( Bfx_Star)
+     1                   / SQRT ( fourpi * Rho_Star_Minus)
+
+! -----
+
+      IF ( ( S_Min <= 0.0) .AND. ( S_Alf_Minus >= 0.0) ) THEN
+
+! -----
+#if ( 0 == 1)
+! -----
+! This is a rather stringent criterion, especially for the HLLD RS.
+
+      Rho_Star = AMAX1 ( U_Star_Minus ( 1), 0.5 * rhofloor)
+      ob_rho = 1.0 / Rho_Star
+
+      Vlx_Star = U_Star_Minus ( 2) * ob_rho
+      Vly_Star = U_Star_Minus ( 3) * ob_rho
+      Vlz_Star = U_Star_Minus ( 4) * ob_rho
+
+      Bfx_Star = U_Star_Minus ( 6)
+      Bfy_Star = U_Star_Minus ( 7)
+      Bfz_Star = U_Star_Minus ( 8)
+
+      V2_Star = Vlx_Star**2 + Vly_Star**2 + Vlz_Star**2
+
+      B2_Star = Bfx_Star**2 + Bfy_Star**2 + Bfz_Star**2
+
+      Prs_Star = U_Star_Minus ( 5) - 0.5 * Rho_Star * V2_Star
+     1         - ob_8pi * B2_Star
+
+      IF ( ( HLLD_busted == 1) .OR. ( Rho_Star <= rhofloor) .OR.
+     1     ( Prs_Star <= prsfloor) ) my_blend_HLL = 1.0
+
+! -----
+#else
+! -----
+! This is a less stringent criterion.
+
+      IF ( ( HLLD_busted == 1) .OR.
+     1     ( U_Star_Minus ( 1) <= 10.0 * rhofloor) ) my_blend_HLL = 1.0
+
+! -----
+#endif
+! -----
+
+! -----
+! Now build "conserved_re, flux_re".
+
+      temp_01 = 1.0 - my_blend_HLL
+
+      conserved_re ( :) = temp_01 * U_Star_Minus ( :)
+     1                  + my_blend_HLL * U_HLL ( :)
+
+      flux_re ( :) = temp_01 * F_Star_Minus ( :)
+     1             + my_blend_HLL * F_HLL ( :)
+
+      GO TO 1010
+
+! -----
+
+      END IF
+
+! ------------------------------
+
+      END IF  ! End of "IF ( HLLD_busted == 0)"
+
+! ----------------------------------------------------------------------
+! STEP VII) If we get here, we have built both "U_Star_Minus, U_Star_Plus".
+! This is all that we need for building
+! "U_DblStar_Minus, F_DblStar_Minus, U_DblStar_Plus, F_DblStar_Plus"
+! corresponding to the internal states of the HLLD Riemann solver. Then,
+! depending on the relative signs of "S_Mid, S_Alf_Minus, S_Alf_Plus",
+! we set "conserved_re, flux_re".
+! Since the supersonic cases have been dealt with, we are only dealing with
+! the subsonic cases here.
+! ----------------------------------------------------------------------
+
+      IF ( HLLD_busted == 0) THEN
+
+! ------------------------------------------------------------
+
+      IF ( ABS ( Bfx_Star) >= small_speed * SQRT ( rhofloor) ) THEN
+
+! ------------------------------------------------------------
+! 3rd, 4th, 7th & 8th rows of the consistency condition.
+
+      a11 = ( S_Alf_Plus - S_Mid) * Rho_Star_Plus
+     1    + ( S_Mid - S_Alf_Minus) * Rho_Star_Minus
+
+      IF ( ABS ( a11) <= small_speed * rhofloor) THEN
+        a11 = smallnum
+        HLLD_busted = 1
+      ELSE
+        a11 = 1.0 / a11
+      END IF
+
+! ----------
+
+      r1 = ( S_Max - S_Alf_Plus) * U_Star_Plus ( 3)
+     1   + ( S_Alf_Minus - S_Min) * U_Star_Minus ( 3)
+     1   - S_Max * U_Repl ( 3) + S_Min * U_Remi ( 3)
+     1   + F_Repl ( 3) - F_Remi ( 3)
+
+      Vly_DblStar_Plus = - r1 * a11
+      Vly_DblStar_Minus = Vly_DblStar_Plus
+
+      U_DblStar_Plus ( 3) = Rho_Star_Plus * Vly_DblStar_Plus
+      U_DblStar_Minus ( 3) = Rho_Star_Minus * Vly_DblStar_Minus
+
+! ----------
+
+      r1 = ( S_Max - S_Alf_Plus) * U_Star_Plus ( 4)
+     1   + ( S_Alf_Minus - S_Min) * U_Star_Minus ( 4)
+     1   - S_Max * U_Repl ( 4) + S_Min * U_Remi ( 4)
+     1   + F_Repl ( 4) - F_Remi ( 4)
+
+      Vlz_DblStar_Plus = - r1 * a11
+      Vlz_DblStar_Minus = Vlz_DblStar_Plus
+
+      U_DblStar_Plus ( 4) = Rho_Star_Plus * Vlz_DblStar_Plus
+      U_DblStar_Minus ( 4) = Rho_Star_Minus * Vlz_DblStar_Minus
+
+! ------------------------------
+! If "S_Alf_Plus == S_Alf_Minus == S_Mid" then we don't have a longitudinal
+! magnetic field. In that case, the HLLC RS is all we have. That situation
+! should have been picked up in the previous step.
+     
+      a11 = S_Alf_Plus - S_Alf_Minus
+
+      IF ( ABS ( a11) <= small_speed) THEN
+        a11 = smallnum
+        HLLD_busted = 1
+      ELSE
+        a11 = 1.0 / a11
+      END IF
+
+! ----------
+
+      r1 = ( S_Max - S_Alf_Plus) * U_Star_Plus ( 7)
+     1   + ( S_Alf_Minus - S_Min) * U_Star_Minus ( 7)
+     1   - S_Max * U_Repl ( 7) + S_Min * U_Remi ( 7)
+     1   + F_Repl ( 7) - F_Remi ( 7)
+
+      Bfy_DblStar_Plus = - r1 * a11
+      Bfy_DblStar_Minus = Bfy_DblStar_Plus
+
+      U_DblStar_Plus ( 7) = Bfy_DblStar_Plus
+      U_DblStar_Minus ( 7) = Bfy_DblStar_Minus
+
+! ----------
+
+      r1 = ( S_Max - S_Alf_Plus) * U_Star_Plus ( 8)
+     1   + ( S_Alf_Minus - S_Min) * U_Star_Minus ( 8)
+     1   - S_Max * U_Repl ( 8) + S_Min * U_Remi ( 8)
+     1   + F_Repl ( 8) - F_Remi ( 8)
+
+      Bfz_DblStar_Plus = - r1 * a11
+      Bfz_DblStar_Minus = Bfz_DblStar_Plus
+
+      U_DblStar_Plus ( 8) = Bfz_DblStar_Plus
+      U_DblStar_Minus ( 8) = Bfz_DblStar_Minus
+
+! ------------------------------
+! Fifth row is obtained via jumps at the Alfven waves.
+
+      VdotB_DblStar_Plus = Vlx_Star_Plus * Bfx_Star
+     1                + Vly_DblStar_Plus * Bfy_DblStar_Plus
+     1                + Vlz_DblStar_Plus * Bfz_DblStar_Plus
+
+      B2_DblStar_Plus = Bfx_Star**2 + Bfy_DblStar_Plus**2
+     1                + Bfz_DblStar_Plus**2
+
+      Etot_DblStar_Plus = Etot_Star_Plus
+     1                  + SQRT ( ob_4pi * Rho_Star_Plus)
+     1                  * ( VdotB_Star_Plus - VdotB_DblStar_Plus)
+     1                  * SIGN ( 1.0, Bfx_Star)
+
+      U_DblStar_Plus ( 5) = Etot_DblStar_Plus
+
+! ----------
+
+      VdotB_DblStar_Minus = Vlx_Star_Minus * Bfx_Star
+     1                 + Vly_DblStar_Minus * Bfy_DblStar_Minus
+     1                 + Vlz_DblStar_Minus * Bfz_DblStar_Minus
+
+      B2_DblStar_Minus = Bfx_Star**2 + Bfy_DblStar_Minus**2
+     1                 + Bfz_DblStar_Minus**2
+
+      Etot_DblStar_Minus = Etot_Star_Minus 
+     1                   - SQRT ( ob_4pi * Rho_Star_Minus)
+     1                   * ( VdotB_Star_Minus - VdotB_DblStar_Minus)
+     1                   * SIGN ( 1.0, Bfx_Star) 
+
+      U_DblStar_Minus ( 5) = Etot_DblStar_Minus
+
+! ------------------------------
+! For 1st, 2nd, 6th & species rows, the "U_DblStar_" state is identical to the
+! "U_Star_" state.
+
+      U_DblStar_Plus ( 1: 2) = U_Star_Plus ( 1: 2)
+      U_DblStar_Minus ( 1: 2) = U_Star_Minus ( 1: 2)
+
+      U_DblStar_Plus ( 6) = U_Star_Plus ( 6)
+      U_DblStar_Minus ( 6) = U_Star_Minus ( 6)
+
+#if ( NFLUID >= 1)
+      U_DblStar_Plus ( 9: 8 + NFLUID) = U_Star_Plus ( 9: 8 + NFLUID)
+      U_DblStar_Minus ( 9: 8 + NFLUID) = U_Star_Minus ( 9: 8 + NFLUID)
+#endif
+
+! ------------------------------
+! Now that "U_DblStar_Plus, U_DblStar_Minus" are built, build the
+! corresponding longitudinal fluxes. Do this by using jump conditions across
+! Alfven waves.
+
+      F_DblStar_Plus ( :) = F_Star_Plus ( :)
+     1     - S_Alf_Plus * ( U_Star_Plus ( :) - U_DblStar_Plus ( :) )
+
+      F_DblStar_Minus ( :) = F_Star_Minus ( :)
+     1     - S_Alf_Minus * ( U_Star_Minus ( :) - U_DblStar_Minus ( :) )
+
+! ------------------------------
+! Now build "conserved_re, flux_re".
+
+      IF ( S_Mid >= 0.0) THEN
+
+! ----------
+#if ( 0 == 1)
+! -----
+! This is a rather stringent criterion, especially for the HLLD RS.
+
+        Rho_Star = AMAX1 ( U_DblStar_Minus ( 1), 0.5 * rhofloor)
+        ob_rho = 1.0 / Rho_Star
+
+        Vlx_Star = U_DblStar_Minus ( 2) * ob_rho
+        Vly_Star = U_DblStar_Minus ( 3) * ob_rho
+        Vlz_Star = U_DblStar_Minus ( 4) * ob_rho
+
+        Bfx_Star = U_DblStar_Minus ( 6)
+        Bfy_Star = U_DblStar_Minus ( 7)
+        Bfz_Star = U_DblStar_Minus ( 8)
+
+        V2_Star = Vlx_Star**2 + Vly_Star**2 + Vlz_Star**2
+
+        B2_Star = Bfx_Star**2 + Bfy_Star**2 + Bfz_Star**2
+
+        Prs_Star = U_DblStar_Minus ( 5) - 0.5 * Rho_Star * V2_Star
+     1           - ob_8pi * B2_Star
+
+        IF ( ( HLLD_busted == 1) .OR. ( Rho_Star <= rhofloor) .OR.
+     1       ( Prs_Star <= prsfloor) ) my_blend_HLL = 1.0
+
+! -----
+#else
+! -----
+! This is a less stringent criterion.
+
+        IF ( ( HLLD_busted == 1) .OR.
+     1       ( U_DblStar_Minus ( 1) <= 10.0 * rhofloor) )
+     1       my_blend_HLL = 1.0
+
+! -----
+#endif
+! -----
+
+        temp_01 = 1.0 - my_blend_HLL
+
+        conserved_re ( :) = temp_01 * U_DblStar_Minus ( :)
+     1                    + my_blend_HLL * U_HLL ( :)
+
+        flux_re ( :) = temp_01 * F_DblStar_Minus ( :)
+     1               + my_blend_HLL * F_HLL ( :)
+
+        GO TO 1010
+
+! ----------
+
+      ELSE
+
+! ----------
+#if ( 0 == 1)
+! -----
+! This is a rather stringent criterion, especially for the HLLD RS.
+
+        Rho_Star = AMAX1 ( U_DblStar_Plus ( 1), 0.5 * rhofloor)
+        ob_rho = 1.0 / Rho_Star
+
+        Vlx_Star = U_DblStar_Plus ( 2) * ob_rho
+        Vly_Star = U_DblStar_Plus ( 3) * ob_rho
+        Vlz_Star = U_DblStar_Plus ( 4) * ob_rho
+
+        Bfx_Star = U_DblStar_Plus ( 6)
+        Bfy_Star = U_DblStar_Plus ( 7)
+        Bfz_Star = U_DblStar_Plus ( 8)
+
+        V2_Star = Vlx_Star**2 + Vly_Star**2 + Vlz_Star**2
+
+        B2_Star = Bfx_Star**2 + Bfy_Star**2 + Bfz_Star**2
+
+        Prs_Star = U_DblStar_Plus ( 5) - 0.5 * Rho_Star * V2_Star
+     1           - ob_8pi * B2_Star
+
+        IF ( ( HLLD_busted == 1) .OR. ( Rho_Star <= rhofloor) .OR.
+     1       ( Prs_Star <= prsfloor) ) my_blend_HLL = 1.0
+
+! -----
+#else
+! -----
+! This is a less stringent criterion.
+
+        IF ( ( HLLD_busted == 1) .OR.
+     1       ( U_DblStar_Plus ( 1) <= 10.0 * rhofloor) )
+     1     my_blend_HLL = 1.0
+
+! -----
+#endif
+! -----
+
+        temp_01 = 1.0 - my_blend_HLL
+
+        conserved_re ( :) = temp_01 * U_DblStar_Plus ( :)
+     1                    + my_blend_HLL * U_HLL ( :)
+
+        flux_re ( :) = temp_01 * F_DblStar_Plus ( :)
+     1               + my_blend_HLL * F_HLL ( :)
+
+        GO TO 1010
+
+! ----------
+
+      END IF  ! End of "IF ( S_Mid >= 0.0)"
+
+! ------------------------------------------------------------
+
+      ELSE
+
+! ------------------------------------------------------------
+! If "Bfx_Star" is almost zero if we get here. The contact does not have a
+! normal component of magnetic field through it. This is a hydro-like
+! state which permits a jump in the transverse velocity and magnetic field
+! at the contact.
+
+        S_Alf_Minus = S_Mid - small_speed
+        S_Alf_Plus = S_Mid + small_speed
+
+      IF ( S_Mid >= 0.0) THEN
+
+        temp_01 = 1.0 - my_blend_HLL
+
+        conserved_re ( :) = temp_01 * U_Star_Minus ( :)
+     1                    + my_blend_HLL * U_HLL ( :)
+
+        flux_re ( :) = temp_01 * F_Star_Minus ( :)
+     1               + my_blend_HLL * F_HLL ( :)
+
+        GO TO 1010
+
+      ELSE
+
+        temp_01 = 1.0 - my_blend_HLL
+
+        conserved_re ( :) = temp_01 * U_Star_Plus ( :)
+     1                    + my_blend_HLL * U_HLL ( :)
+
+        flux_re ( :) = temp_01 * F_Star_Plus ( :)
+     1               + my_blend_HLL * F_HLL ( :)
+
+        GO TO 1010
+
+      END IF
+
+! ------------------------------------------------------------
+
+      END IF
+! End of "IF ( ABS ( Bfx_Star) >= small_speed * SQRT ( rhofloor) )".
+
+! ------------------------------------------------------------
+
+      END IF  ! End of "IF ( HLLD_busted == 0)"
+
+! ----------------------------------------------------------------------
+! STEP VIII) Also build "prstot_re" if "split_prsflux_re == 1".
+! ----------------------------------------------------------------------
+
+1010  CONTINUE
+
+! ------------------------------
+! If the HLLD RS is busted for any reason at all, replace it with the HLL RS.
+
+      IF ( HLLD_busted == 1) THEN
+
+      conserved_re ( :) = U_HLL ( :)
+      flux_re ( :) = F_HLL ( :)
+
+      END IF
+
+! ------------------------------
+
+      IF ( split_prsflux_re /= 1) THEN
+
+      prstot_re = 0.0
+
+      ELSE
+
+      Rho_Use = AMAX1 ( conserved_re ( 1), rhofloor)
+      ob_rho = 1.0 / Rho_Use
+
+      Vlx_Use = conserved_re ( 2) * ob_rho
+      Vly_Use = conserved_re ( 3) * ob_rho
+      Vlz_Use = conserved_re ( 4) * ob_rho
+
+      Bfx_Use = conserved_re ( 6)
+      Bfy_Use = conserved_re ( 7)
+      Bfz_Use = conserved_re ( 8)
+
+      V2_Use = Vlx_Use**2 + Vly_Use**2 + Vlz_Use**2
+
+      B2_Use = Bfx_Use**2 + Bfy_Use**2 + Bfz_Use**2
+
+      V_dot_B_Use = Vlx_Use * Bfx_Use + Vly_Use * Bfy_Use
+     1            + Vlz_Use * Bfz_Use
+
+      Prs_Use = conserved_re ( 5)
+     1        - 0.5 * Rho_Use * V2_Use - ob_8pi * B2_Use
+
+      Prs_Use = Prs_Use * ( gamma_eos_Use - 1.0)
+
+      Prs_Use = AMAX1 ( Prs_Use, prsfloor)
+
+      prstot_re = Prs_Use + ob_8pi * B2_Use
+
+      flux_re ( 2) = flux_re ( 2) - prstot_re
+
+      END IF
+
+! ----------------------------------------------------------------------
+! STEP IX) Undo the cyclic rotations in "conserved_re, flux_re" if they
+! are called for by "idirection".
+! ----------------------------------------------------------------------
+
+      IF ( idirection == 2) THEN
+
+! ----------
+
+      temp_01 = conserved_re ( 2)
+      temp_02 = conserved_re ( 3)
+      temp_03 = conserved_re ( 4)
+
+      conserved_re ( 2) = temp_03
+      conserved_re ( 3) = temp_01
+      conserved_re ( 4) = temp_02
+
+      temp_01 = conserved_re ( 6)
+      temp_02 = conserved_re ( 7)
+      temp_03 = conserved_re ( 8)
+
+      conserved_re ( 6) = temp_03
+      conserved_re ( 7) = temp_01
+      conserved_re ( 8) = temp_02
+
+! -----
+
+      temp_01 = flux_re ( 2)
+      temp_02 = flux_re ( 3)
+      temp_03 = flux_re ( 4)
+
+      flux_re ( 2) = temp_03
+      flux_re ( 3) = temp_01
+      flux_re ( 4) = temp_02
+
+      temp_01 = flux_re ( 6)
+      temp_02 = flux_re ( 7)
+      temp_03 = flux_re ( 8)
+
+      flux_re ( 6) = temp_03
+      flux_re ( 7) = temp_01
+      flux_re ( 8) = temp_02
+
+! ----------
+
+      ELSE IF ( idirection == 3) THEN
+
+! ----------
+
+      temp_01 = conserved_re ( 2)
+      temp_02 = conserved_re ( 3)
+      temp_03 = conserved_re ( 4)
+
+      conserved_re ( 2) = temp_02
+      conserved_re ( 3) = temp_03
+      conserved_re ( 4) = temp_01
+
+      temp_01 = conserved_re ( 6)
+      temp_02 = conserved_re ( 7)
+      temp_03 = conserved_re ( 8)
+
+      conserved_re ( 6) = temp_02
+      conserved_re ( 7) = temp_03
+      conserved_re ( 8) = temp_01
+
+! -----
+
+      temp_01 = flux_re ( 2)
+      temp_02 = flux_re ( 3)
+      temp_03 = flux_re ( 4)
+
+      flux_re ( 2) = temp_02
+      flux_re ( 3) = temp_03
+      flux_re ( 4) = temp_01
+
+      temp_01 = flux_re ( 6)
+      temp_02 = flux_re ( 7)
+      temp_03 = flux_re ( 8)
+
+      flux_re ( 6) = temp_02
+      flux_re ( 7) = temp_03
+      flux_re ( 8) = temp_01
+
+! ----------
+
+      END IF
+
+! ----------------------------------------------------------------------
+
+      END SUBROUTINE MHD_RIEM_HLLD_PTWISE
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+
+
+
+
+
+
+
+

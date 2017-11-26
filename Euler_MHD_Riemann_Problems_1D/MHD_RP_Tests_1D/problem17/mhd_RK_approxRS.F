@@ -1,0 +1,14697 @@
+! ----------------------------------------------------------------------
+
+#define ONEDFLUIDEND 414
+#define ONEDFLUIDBEGIN -14
+#define NFIELD 7
+#define NFLUID 000000
+#define COMPLETE_EIGENSYSTEM 1
+
+! ----------------------------------------------------------------------
+
+      PROGRAM MHD_RK_APPROX_RS
+
+! Two-stage Runge-Kutta scheme for updating MHD equations with various
+! approximate Riemann solvers incorporated in the same package. This enables
+! one to intercompare Riemann solvers. Linearized, HLL and HLLD and HLLEM Riemann
+! solvers for the MHD equations included here. The linearized Riemann
+! solver includes an HLL fixup.
+
+! GNU Fortran compilation lines:-
+! cp mhd_RK_approxRS.src mhd_RK_approxRS.F
+! gfortran -fdefault-integer-8 -fdefault-real-8 -O2 -o xmhd_1d mhd_RK_approxRS.F
+
+! ----------------------------------------------------------------------
+
+      IMPLICIT NONE
+
+      INTEGER ix, ifield, j, k, islope, icharlim, iriem_solvr,
+     1        nzones, ntstep, nsys, nriembegin, nriemend,
+     1        istep, iproblem, ifracstep, iprimitive, rieiter,
+     1        ientropyfix, use_approx_eos, split_prsflux_re, debug_stop,
+     1        double_dissipate_efz, double_dissipate_efy
+
+      REAL mu, t, dtcur, dtprev, dx, tstop, tempa, div_v_coef, lap_visc,
+     1     prsfac, rhofloor, prsfloor, smallnum, gamma, gasconst,
+     1     fracdiff, divratio_einfeldt_rs, pi,
+     1     rhomin, prsmin, vlxmin, vlymin, vlzmin, bfymin, bfzmin,
+     1     rhomax, prsmax, vlxmax, vlymax, vlzmax, bfymax, bfzmax
+
+      PARAMETER ( nzones = 400, nsys = NFIELD + NFLUID)
+
+      REAL, DIMENSION ( 0 : NFLUID) :: cv_specie, cp_specie,
+     1      molewt_specie, heat_of_formation
+
+! Big data variables  used for RK timestep.
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND ) :: divflag
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND ) :: x,
+     1      msonic_spd, visc_coef
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND, nsys) ::
+     1      u, u0, dudt, v, del_v, del_eigwt
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND, nsys, -2: 2) ::
+     1      eigwt
+
+! ----------------------------------------------------------------------
+
+! Big data variables passed through eigenvector subroutine interface.
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     rhobar, prsbar, vlxbar, vlybar, vlzbar,
+     1     bfxbar, bfybar, bfzbar, xbar
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1      speciebar
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND, nsys) ::
+     1     eigenval
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND, nsys, nsys) ::
+     1     lf_eigenvec, rt_eigenvec
+
+! ----------------------------------------------------------------------
+
+! Big data variables passed through Riemann Solver interface.
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1      rhoremi, prsremi, vlxremi, vlyremi, vlzremi,
+     1      bfyremi, bfzremi,
+     1      rhorepl, prsrepl, vlxrepl, vlyrepl, vlzrepl,
+     1      bfyrepl, bfzrepl,
+
+     1     mean_mol_wt_remi, gamma_eos_remi, gamma_soundspeed_remi,
+     1     mean_mol_wt_repl, gamma_eos_repl, gamma_soundspeed_repl,
+
+     1     msonic_arr, divvel_arr,
+
+     1     rhoflux, engflux, prsflux, vlxflux, vlyflux, vlzflux,
+     1     bfyflux, bfzflux
+
+      REAL, DIMENSION ( 0 : NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1      specieremi, specierepl
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1    NFIELD + NFLUID, NFIELD + NFLUID) ::
+     1    lf_eigenvec_re, rt_eigenvec_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1      NFIELD + NFLUID) ::
+     1     eigenval_re, eigenwt_re, conserved_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                 NFIELD + NFLUID + 1) ::
+     1     flux_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  0 : 1, NFIELD + NFLUID) ::
+     1      zonebdy_flux, zonebdy_conserved
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     rho0, prs0, vlx0, vly0, vlz0, bfy0, bfz0,
+     1     entropy_flux_re
+
+      REAL, DIMENSION
+     1    ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1      specie0
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) :: do_ein
+
+! ----------------------------------------------------------------------
+
+! Declare some info. for TVD limiters.
+
+      REAL MC_BETA_LIMITER, MIN_MOD, a, b, mcb
+
+      MIN_MOD ( a, b) = AMIN1 ( ABS (a), ABS (b))
+     1                  * ( SIGN ( 0.5, a) + SIGN ( 0.5, b))
+
+      MC_BETA_LIMITER ( a, b, mcb) =
+     1              ( SIGN ( 0.5, a) + SIGN ( 0.5, b))
+     1            * AMIN1 ( 0.5 * ( ABS ( a + b)),
+     1                      mcb * ABS ( a), mcb * ABS ( b) )
+
+! ----------------------------------------------------------------------
+
+      OPEN ( unit = 6, file = "mhd_RK_approxRS.out")
+
+      pi = 4.0 * ATAN ( 1.0)
+
+      debug_stop = 0
+
+! iproblem = 1, ... , 17 for MHD Riemann problems.
+! We also set up "tstop", the stopping time and "gamma" the polytropic index
+! based on "iproblem"
+      iproblem = 17
+
+! islope controls how the slopes are built. islope = 1,2 for min-mod & MC-beta.
+      islope = 2
+
+! Decide on whether we want to reconstruct characteristically or componentwise;
+! i.e. set to 1 or 0 respectively.
+      icharlim = 1
+
+! Choose Riemann solver; iriem_solvr == 1, 2, 3, 4 for linearized, HLLD, HLL,
+! HLLEM.
+      iriem_solvr = 4
+
+      mu = 0.8            ! CFL number
+
+      dx = 1.0 / REAL ( nzones)   ! Zone size
+
+      t = 0.0             ! Set initial time to zero.
+
+! gas constant can be scaled to any number as long as temperature is not used.
+      gasconst = 1.0
+
+      ntstep = 35000 ! max. # of timesteps.
+
+      mcb = 1.5    ! ranges between 1 and 2.
+
+! If the divergence of the velocity at a zone boundary is negative and exceeds
+! this coef times the sound speed then we have to apply more stringent limiter
+! to that zone.
+      div_v_coef = 0.4
+
+! If a strong shock is indeed detected then put in a small amount of
+! artificial viscosity at that zone boundary.
+      lap_visc = 0.1
+
+      rhofloor = 1.0e-8   ! Set density floor
+
+      prsfloor = 1.0e-12 ! Set pressure floor
+
+      smallnum = 1.0e-12  ! Set a small number for the code.
+
+! Riemann Solver variables.
+
+      fracdiff = 0.1  !Set fractional change needed for entropy fix.(deprecated)
+
+      ientropyfix = 1 ! Set choice of entropy fix 1,2 or 3.
+
+      use_approx_eos = 1 ! Use an approximate EOS.
+
+      split_prsflux_re = 0 ! Don't split momentum flux into pressure + other.
+
+! Variables that have no relevance for one-d problems.
+      double_dissipate_efz = 0
+      double_dissipate_efy = 0
+
+! If the divergence of the velocity at a zone boundary exceeds this coef times ! the sound speed then we have to blend in some fraction of HLL RS.
+      divratio_einfeldt_rs = 0.4
+
+      debug_stop = 0
+
+! ----------------------------------------------------------------------
+
+! Set up coordinate value at zone centers.
+
+      DO ix = - 3, nzones + 4
+      x ( ix) = - 0.5 + ( ix - 0.5) * dx
+      END DO
+
+! Set up primitive variables : v(ix, 1) = density; v(ix, 2) = x-velocity;
+! v(ix, 3) = y-velocity; v(ix, 4) = y-velocity; v(ix, 5) = pressure.
+! v(ix, 6) = y-field; v(ix, 7) = z-field;
+! bfxbar(ix) = x-field (constant).
+! The below subroutine also sets "gamma and tstop".
+
+      CALL SET_RP ( iproblem, nzones, gamma, tstop, v, bfxbar)
+
+! ------------------------------
+
+! Any values for specific heats will do for polytropic gas as long as the
+! ratio is preserved.
+      cv_specie ( :) = 1.0
+      cp_specie ( :) = gamma * cv_specie ( :)
+
+      molewt_specie ( :) = 1.0
+      heat_of_formation ( :) = 0.0
+
+      mean_mol_wt_remi ( :) = 1.0
+      gamma_eos_remi ( :) = gamma
+      gamma_soundspeed_remi ( :) = gamma
+
+      mean_mol_wt_repl ( :) = 1.0
+      gamma_eos_repl ( :) = gamma
+      gamma_soundspeed_repl ( :) = gamma
+
+! ------------------------------
+
+      WRITE ( 6, *)"iproblem = ", iproblem
+      WRITE ( 6, *)" "
+      WRITE ( 6, *)"islope, icharlim, mcb = ", islope, icharlim, mcb
+      WRITE ( 6, *)" "
+      WRITE ( 6, *)"div_v_coef, lap_visc = ", div_v_coef, lap_visc
+      WRITE ( 6, *)" "
+      WRITE ( 6, *)"mu, dx, tstop, ntstep = ", mu, dx, tstop, ntstep
+      WRITE ( 6, *)" "
+      WRITE ( 6, *)"gamma, rhofloor, prsfloor, smallnum = ",
+     1              gamma, rhofloor, prsfloor, smallnum
+      WRITE ( 6, *)" "
+      WRITE ( 6, *)"prsfac, rieiter = ", prsfac, rieiter
+      WRITE ( 6, *)" "
+
+! ------------------------------
+
+! Obtain conserved variables from primitive variables: u(ix, 1) = density;
+! u(ix, 2) = x-momentum density; u(ix, 3) = y-momentum density;
+! u(ix, 4) = z-momentum density; u(ix, 5) = total energy density.
+! Also set up timestep "dtcur".
+
+      dtcur = 1.0e30
+
+      DO ix = - 3, nzones + 4
+
+      u ( ix, 1) =  v ( ix, 1)
+
+      u ( ix, 2) = v ( ix, 1) * v ( ix, 2)
+      u ( ix, 3) = v ( ix, 1) * v ( ix, 3)
+      u ( ix, 4) = v ( ix, 1) * v ( ix, 4)
+
+      u ( ix, 5) = 0.5 * v ( ix, 1)
+     1           * ( v ( ix, 2)**2 + v ( ix, 3)**2 + v ( ix, 4)**2)
+     1           + ( bfxbar ( ix)**2
+     1             + v ( ix, 6)**2 + v ( ix, 7)**2) / ( 8.0 * pi)
+     1           + v ( ix, 5) / ( gamma - 1.0)
+
+      u ( ix, 6) = v ( ix, 6)
+      u ( ix, 7) = v ( ix, 7)
+
+
+      msonic_spd ( ix) = gamma * v ( ix, 5)
+     1      + ( bfxbar ( ix)**2
+     1        + v ( ix, 6)**2 + v ( ix, 7)**2) / ( 4.0 * pi)
+      msonic_spd ( ix) = SQRT ( msonic_spd ( ix) / v ( ix, 1))
+
+      tempa = ABS ( v ( ix, 2)) + msonic_spd ( ix)
+
+      dtcur = AMIN1 ( dtcur, mu * dx / tempa)
+
+      END DO ! End of "DO ix ="
+
+
+      dtprev = dtcur
+      WRITE ( 6, *)"dtcur = ", dtcur
+      WRITE ( 6, *)" "
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+! Take "ntstep" timesteps. Main time-integration loop begins here.
+
+      DO istep = 1, ntstep
+
+      DO ifracstep = 1, 2
+
+      WRITE ( 6, *)"istep, ifracstep, t, dtcur = ",
+     1              istep, ifracstep, t, dtcur
+      WRITE ( 6, *)" "
+
+! ----------------------------------------------------------------------
+
+! Obtain primitive variables from current conserved variables for this
+! fractional timestep.
+
+      DO ix = - 3, nzones + 4
+
+      v ( ix, 1) = AMAX1 ( u ( ix, 1), rhofloor)
+
+      v ( ix, 2) = u ( ix, 2) / v ( ix, 1)
+      v ( ix, 3) = u ( ix, 3) / v ( ix, 1)
+      v ( ix, 4) = u ( ix, 4) / v ( ix, 1)
+
+      v ( ix, 6) = u ( ix, 6)
+      v ( ix, 7) = u ( ix, 7)
+
+      tempa = 0.5 * v ( ix, 1)
+     1      * ( v ( ix, 2)**2 + v ( ix, 3)**2 + v ( ix, 4)**2)
+     1      + ( bfxbar ( ix)**2
+     1        + v ( ix, 6)**2 + v ( ix, 7)**2) / ( 8.0 * pi)
+
+      v ( ix, 5) = ( u ( ix, 5) - tempa) * ( gamma - 1.0)
+      v ( ix, 5) = AMAX1 ( v ( ix, 5), prsfloor)
+
+      msonic_spd ( ix) = gamma * v ( ix, 5)
+     1      + ( bfxbar ( ix)**2
+     1        + v ( ix, 6)**2 + v ( ix, 7)**2) / ( 4.0 * pi)
+      msonic_spd ( ix) = SQRT ( msonic_spd ( ix) / v ( ix, 1))
+
+      IF ( v ( ix, 5) .LE. prsfloor) u ( ix, 5) = tempa
+     1                             + prsfloor / ( gamma - 1.0)
+
+      END DO ! End of "DO ix ="
+
+! ------------------------------
+
+! Set a face-centered flag that tracks regions of strong shock.
+! Also make the artificial viscosity coefficient.
+! Also save divergence of velocity at zone boundaries.
+
+      DO ix = - 2, nzones + 3
+
+      tempa = v ( ix + 1, 2) - v ( ix, 2)
+
+      divvel_arr ( ix) = ABS ( tempa)
+      msonic_arr ( ix) = AMIN1 ( msonic_spd ( ix), msonic_spd ( ix + 1))
+
+      IF ( tempa .LT. - div_v_coef
+     1          * AMIN1 ( msonic_spd ( ix), msonic_spd ( ix + 1)) ) THEN
+
+        divflag ( ix) = 1
+        visc_coef ( ix) = lap_visc * ABS ( tempa)
+
+      ELSE
+
+        divflag ( ix) = 0
+        visc_coef ( ix) = 0.0
+
+      END IF
+
+      END DO ! End of "DO ix ="
+
+
+        divflag ( ONEDFLUIDBEGIN: - 2) = 0
+        divflag ( nzones + 3: ONEDFLUIDEND) = 0
+
+! ----------------------------------------------------------------------
+
+! Apply limiters to obtain "del_v". Do this in the space of primitive
+! variables or in the space of characteristic variables depending on
+! "icharlim". Choice of limiters according to "islope".
+
+      IF ( icharlim .EQ. 0) THEN
+
+! Limit the variables in physical space.
+
+! ------------------------------
+
+        IF ( islope .EQ. 1) THEN
+
+! MinMod limiter in physical space.
+
+        DO k = 1, nsys
+
+          DO ix = - 1, nzones + 2
+
+          del_v ( ix, k) = MIN_MOD ( v ( ix + 1, k) - v ( ix, k),
+     1                               v ( ix, k) - v ( ix - 1, k) )
+
+          END DO ! End of "DO ix ="
+
+        END DO ! End of "DO k ="
+
+        ELSE
+
+! MC-beta limiter in physical space.
+
+        DO k = 1, nsys
+
+          DO ix = - 1, nzones + 2
+
+          IF ( ( divflag ( ix) .EQ. 1) .OR.
+     1         ( divflag ( ix - 1) .EQ. 1) ) THEN
+
+          del_v ( ix, k) = MIN_MOD ( v ( ix + 1, k) - v ( ix, k),
+     1                               v ( ix, k) - v ( ix - 1, k) )
+
+          ELSE
+
+          del_v ( ix, k)=MC_BETA_LIMITER ( v ( ix + 1, k) - v ( ix, k),
+     1                               v ( ix, k) - v ( ix - 1, k), mcb )
+
+          END IF
+
+          END DO ! End of "DO ix ="
+
+        END DO ! End of "DO k ="
+
+        END IF ! End of "IF ( islope .EQ. 1)".
+
+! ------------------------------
+
+      ELSE
+
+! Limit the variables in characteristic space.
+
+! ------------------------------
+
+! Load up variables that are needed for eigenvector evaluation. Then call the
+! eigenvector routine.
+
+      nriembegin = - 2
+      nriemend = nzones + 3
+      iprimitive = 1
+
+      rhobar ( :) = v ( :, 1)
+      vlxbar ( :) = v ( :, 2)
+      vlybar ( :) = v ( :, 3)
+      vlzbar ( :) = v ( :, 4)
+      prsbar ( :) = v ( :, 5)
+      bfybar ( :) = v ( :, 6)
+      bfzbar ( :) = v ( :, 7)
+      xbar ( :) = 0.0
+
+      CALL EIGENVECMHD
+
+     1             ( nriembegin, nriemend, iprimitive,
+
+     1               gamma, smallnum, prsfloor, rhofloor, pi,
+     1               debug_stop,
+
+     1               gasconst,
+     1               cp_specie, molewt_specie, heat_of_formation,
+
+     1               rhobar, prsbar,
+     1               vlxbar, vlybar, vlzbar,
+     1               bfxbar, bfybar, bfzbar, xbar,
+     1               speciebar,
+
+     1               eigenval,
+     1               lf_eigenvec, rt_eigenvec )
+
+
+! ------------------------------
+
+! Now project into the space of eigenweights.
+
+      eigwt ( :, :, :) = 0.0
+
+      DO j = - 2, 2
+
+      DO k = 1, nsys
+
+        DO ifield = 1, nsys
+
+          DO ix = - 1, nzones + 2
+
+          eigwt ( ix, ifield, j) = eigwt ( ix, ifield, j)
+     1  + lf_eigenvec ( ix, ifield, k) * v ( ix + j, k)
+
+          END DO ! End of "DO ix ="
+
+        END DO ! End of "DO ifield ="
+
+      END DO ! End of "DO k ="
+
+      END DO ! End of "DO j ="
+
+! ------------------------------
+
+
+        IF ( islope .EQ. 1) THEN
+
+! MinMod limiter in characteristic space.
+
+        DO k = 1, nsys
+
+          DO ix = - 1, nzones + 2
+
+          del_eigwt ( ix, k) =
+     1    MIN_MOD ( eigwt ( ix, k, 1) - eigwt ( ix, k, 0),
+     1              eigwt ( ix, k, 0) - eigwt ( ix, k, -1) )
+
+          END DO ! End of "DO ix ="
+
+        END DO ! End of "DO k ="
+
+        ELSE
+
+! MC-beta limiter in characteristic space.
+
+        DO k = 1, nsys
+
+          DO ix = - 1, nzones + 2
+
+          IF ( ( divflag ( ix) .EQ. 1) .OR.
+     1         ( divflag ( ix - 1) .EQ. 1) ) THEN
+
+          del_eigwt ( ix, k) =
+     1    MIN_MOD ( eigwt ( ix, k, 1) - eigwt ( ix, k, 0),
+     1              eigwt ( ix, k, 0) - eigwt ( ix, k, -1) )
+
+          ELSE
+
+          del_eigwt ( ix, k) =
+     1    MC_BETA_LIMITER ( eigwt ( ix, k, 1) - eigwt ( ix, k, 0),
+     1              eigwt ( ix, k, 0) - eigwt ( ix, k, -1), mcb )
+
+          END IF
+
+          END DO ! End of "DO ix ="
+
+        END DO ! End of "DO k ="
+
+        END IF ! End of "IF ( islope .EQ. 1)".
+
+! ------------------------------
+
+! Now project back into physical space.
+
+      del_v ( :, :) = 0.0
+
+      DO j = 1, nsys
+
+        DO ifield = 1, nsys
+
+          DO ix = - 1, nzones + 2
+
+          del_v ( ix, j) = del_v ( ix, j) + del_eigwt ( ix, ifield)
+     1                               * rt_eigenvec ( ix, j, ifield)
+
+          END DO ! End of "DO ix ="
+
+        END DO ! End of "DO ifield ="
+
+      END DO ! End of "DO j ="
+
+! ------------------------------
+
+      END IF ! End of "IF ( icharlim .EQ. 0)".
+
+! ----------------------------------------------------------------------
+
+! Use "v" and "del_v" to obtain left and right states at the zone boundaries.
+
+      DO ix = 0, nzones + 1
+
+      rhoremi ( ix) = v ( ix, 1) + 0.5 * del_v ( ix, 1)
+      vlxremi ( ix) = v ( ix, 2) + 0.5 * del_v ( ix, 2)
+      vlyremi ( ix) = v ( ix, 3) + 0.5 * del_v ( ix, 3)
+      vlzremi ( ix) = v ( ix, 4) + 0.5 * del_v ( ix, 4)
+      prsremi ( ix) = v ( ix, 5) + 0.5 * del_v ( ix, 5)
+      bfyremi ( ix) = v ( ix, 6) + 0.5 * del_v ( ix, 6)
+      bfzremi ( ix) = v ( ix, 7) + 0.5 * del_v ( ix, 7)
+
+      rhorepl ( ix - 1) = v ( ix, 1) - 0.5 * del_v ( ix, 1)
+      vlxrepl ( ix - 1) = v ( ix, 2) - 0.5 * del_v ( ix, 2)
+      vlyrepl ( ix - 1) = v ( ix, 3) - 0.5 * del_v ( ix, 3)
+      vlzrepl ( ix - 1) = v ( ix, 4) - 0.5 * del_v ( ix, 4)
+      prsrepl ( ix - 1) = v ( ix, 5) - 0.5 * del_v ( ix, 5)
+      bfyrepl ( ix - 1) = v ( ix, 6) - 0.5 * del_v ( ix, 6)
+      bfzrepl ( ix - 1) = v ( ix, 7) - 0.5 * del_v ( ix, 7)
+
+      END DO ! End of "DO ix =".
+
+! ----------------------------------------------------------------------
+
+! Invoke the Riemann solver. Uncomment one of the three choices, as desired.
+! There are no multispecies eqns here.
+! Choose Riemann solver; iriem_solvr == 1, 2, 3, 4 for linearized, HLLD, HLL,
+! HLLEM.
+
+      nriembegin = 0
+      nriemend = nzones
+      iprimitive = 0
+
+      IF ( iriem_solvr == 1) THEN
+
+      CALL MHD_RIEM_ROE
+
+     1   ( nriembegin, nriemend,
+
+     1     double_dissipate_efz, double_dissipate_efy,
+
+     1     gamma, smallnum, prsfloor, rhofloor, pi, fracdiff,
+     1     ientropyfix, iprimitive, use_approx_eos,
+     1     split_prsflux_re, divratio_einfeldt_rs, debug_stop,
+
+     1     gasconst,
+     1     cp_specie, molewt_specie, heat_of_formation,
+
+     1        rhoremi, rhorepl,
+     1        prsremi, prsrepl,
+     1        vlxremi, vlxrepl,
+     1        vlyremi, vlyrepl,
+     1        vlzremi, vlzrepl,
+     1        bfxbar,
+     1        bfyremi, bfyrepl,
+     1        bfzremi, bfzrepl,
+     1        specieremi, specierepl,
+
+     1        gamma_eos_remi, gamma_eos_repl,
+     1        gamma_soundspeed_remi, gamma_soundspeed_repl,
+     1        mean_mol_wt_remi, mean_mol_wt_repl,
+
+     1        msonic_arr, divvel_arr,
+
+     1        zonebdy_conserved, zonebdy_flux,
+
+     1     eigenval_re, lf_eigenvec_re, rt_eigenvec_re, eigenwt_re,
+     1     conserved_re, flux_re, entropy_flux_re,
+
+     1     rho0, prs0, vlx0, vly0, vlz0, bfy0, bfz0, specie0,
+     1     do_ein )
+
+      ELSE IF ( iriem_solvr == 2) THEN
+
+      CALL MHD_RIEM_HLLD
+
+     1   ( nriembegin, nriemend,
+
+     1     double_dissipate_efz, double_dissipate_efy,
+
+     1     gamma, smallnum, prsfloor, rhofloor, pi, fracdiff,
+     1     ientropyfix, iprimitive, use_approx_eos,
+     1     split_prsflux_re, divratio_einfeldt_rs, debug_stop,
+
+     1     gasconst,
+     1     cp_specie, molewt_specie, heat_of_formation,
+
+     1        rhoremi, rhorepl,
+     1        prsremi, prsrepl,
+     1        vlxremi, vlxrepl,
+     1        vlyremi, vlyrepl,
+     1        vlzremi, vlzrepl,
+     1        bfxbar,
+     1        bfyremi, bfyrepl,
+     1        bfzremi, bfzrepl,
+     1        specieremi, specierepl,
+
+     1        gamma_eos_remi, gamma_eos_repl,
+     1        gamma_soundspeed_remi, gamma_soundspeed_repl,
+     1        mean_mol_wt_remi, mean_mol_wt_repl,
+
+     1        msonic_arr, divvel_arr,
+
+     1        zonebdy_conserved, zonebdy_flux,
+
+     1     eigenval_re, lf_eigenvec_re, rt_eigenvec_re, eigenwt_re,
+     1     conserved_re, flux_re, entropy_flux_re,
+
+     1     rho0, prs0, vlx0, vly0, vlz0, bfy0, bfz0, specie0,
+     1     do_ein )
+
+      ELSE IF ( iriem_solvr == 3) THEN
+
+      CALL MHD_RIEM_HLL
+
+     1   ( nriembegin, nriemend,
+
+     1     double_dissipate_efz, double_dissipate_efy,
+
+     1     gamma, smallnum, prsfloor, rhofloor, pi, fracdiff,
+     1     ientropyfix, iprimitive, use_approx_eos,
+     1     split_prsflux_re, divratio_einfeldt_rs, debug_stop,
+
+     1     gasconst,
+     1     cp_specie, molewt_specie, heat_of_formation,
+
+     1        rhoremi, rhorepl,
+     1        prsremi, prsrepl,
+     1        vlxremi, vlxrepl,
+     1        vlyremi, vlyrepl,
+     1        vlzremi, vlzrepl,
+     1        bfxbar,
+     1        bfyremi, bfyrepl,
+     1        bfzremi, bfzrepl,
+     1        specieremi, specierepl,
+
+     1        gamma_eos_remi, gamma_eos_repl,
+     1        gamma_soundspeed_remi, gamma_soundspeed_repl,
+     1        mean_mol_wt_remi, mean_mol_wt_repl,
+
+     1        msonic_arr, divvel_arr,
+
+     1        zonebdy_conserved, zonebdy_flux,
+
+     1     eigenval_re, lf_eigenvec_re, rt_eigenvec_re, eigenwt_re,
+     1     conserved_re, flux_re, entropy_flux_re,
+
+     1     rho0, prs0, vlx0, vly0, vlz0, bfy0, bfz0, specie0,
+     1     do_ein )
+
+      ELSE IF ( iriem_solvr == 4) THEN
+
+      CALL MHD_RIEM_HLLEM_DB
+
+     1   ( nriembegin, nriemend,
+
+     1     double_dissipate_efz, double_dissipate_efy,
+
+     1     gamma, smallnum, prsfloor, rhofloor, pi, fracdiff,
+     1     ientropyfix, iprimitive, use_approx_eos,
+     1     split_prsflux_re, divratio_einfeldt_rs, debug_stop,
+
+     1     gasconst,
+     1     cp_specie, molewt_specie, heat_of_formation,
+
+     1        rhoremi, rhorepl,
+     1        prsremi, prsrepl,
+     1        vlxremi, vlxrepl,
+     1        vlyremi, vlyrepl,
+     1        vlzremi, vlzrepl,
+     1        bfxbar,
+     1        bfyremi, bfyrepl,
+     1        bfzremi, bfzrepl,
+     1        specieremi, specierepl,
+
+     1        gamma_eos_remi, gamma_eos_repl,
+     1        gamma_soundspeed_remi, gamma_soundspeed_repl,
+     1        mean_mol_wt_remi, mean_mol_wt_repl,
+
+     1        msonic_arr, divvel_arr,
+
+     1        zonebdy_conserved, zonebdy_flux,
+
+     1     eigenval_re, lf_eigenvec_re, rt_eigenvec_re, eigenwt_re,
+     1     conserved_re, flux_re, entropy_flux_re,
+
+     1     rho0, prs0, vlx0, vly0, vlz0, bfy0, bfz0, specie0,
+     1     do_ein )
+
+      ELSE
+
+      WRITE ( 6, *)"iriem_solvr = ", iriem_solvr," out of range."
+      STOP
+
+      END IF
+
+! ----------------------------------------------------------------------
+
+! Unpack "flux_re". Add in an extra Lapidus viscosity if it is warranted.
+
+      DO ix = 0, nzones
+
+      rhoflux ( ix) = flux_re ( ix, 1)
+
+      vlxflux ( ix) = flux_re ( ix, 2)
+      vlyflux ( ix) = flux_re ( ix, 3)
+      vlzflux ( ix) = flux_re ( ix, 4)
+
+      engflux ( ix) = flux_re ( ix, 5)
+
+      prsflux ( ix) = flux_re ( ix, 8)
+
+      bfyflux ( ix) = flux_re ( ix, 6)
+      bfzflux ( ix) = flux_re ( ix, 7)
+
+
+      IF ( divflag ( ix) .EQ. 1) THEN
+
+        rhoflux ( ix) = rhoflux ( ix) - visc_coef ( ix)
+     1                                * ( u ( ix + 1, 1) - u ( ix, 1) )
+
+        vlxflux ( ix) = vlxflux ( ix) - visc_coef ( ix)
+     1                                * ( u ( ix + 1, 2) - u ( ix, 2) )
+
+        vlyflux ( ix) = vlyflux ( ix) - visc_coef ( ix)
+     1                                * ( u ( ix + 1, 3) - u ( ix, 3) )
+
+        vlzflux ( ix) = vlzflux ( ix) - visc_coef ( ix)
+     1                                * ( u ( ix + 1, 4) - u ( ix, 4) )
+
+        engflux ( ix) = engflux ( ix) - visc_coef ( ix)
+     1                                * ( u ( ix + 1, 5) - u ( ix, 5) )
+
+        bfyflux ( ix) = bfyflux ( ix) - visc_coef ( ix)
+     1                                * ( u ( ix + 1, 6) - u ( ix, 6) )
+
+        bfzflux ( ix) = bfzflux ( ix) - visc_coef ( ix)
+     1                                * ( u ( ix + 1, 7) - u ( ix, 7) )
+
+      END IF
+
+      END DO ! End of "DO ix =".
+
+! ----------------------------------------------------------------------
+
+! Use the fluxes to obtain "dudt", the time rate of update.
+
+      DO ix = 1, nzones
+
+      dudt ( ix, 1) = - ( rhoflux ( ix) - rhoflux ( ix - 1)) / dx
+
+      dudt ( ix, 2) = - ( vlxflux ( ix) - vlxflux ( ix - 1)) / dx
+     1                - ( prsflux ( ix) - prsflux ( ix - 1)) / dx
+
+      dudt ( ix, 3) = - ( vlyflux ( ix) - vlyflux ( ix - 1)) / dx
+
+      dudt ( ix, 4) = - ( vlzflux ( ix) - vlzflux ( ix - 1)) / dx
+
+      dudt ( ix, 5) = - ( engflux ( ix) - engflux ( ix - 1)) / dx
+
+      dudt ( ix, 6) = - ( bfyflux ( ix) - bfyflux ( ix - 1)) / dx
+      dudt ( ix, 7) = - ( bfzflux ( ix) - bfzflux ( ix - 1)) / dx
+
+      END DO ! End of "DO ix =".
+
+! ----------------------------------------------------------------------
+
+! Make the predictor or corrector step updates here.
+
+      IF ( ifracstep .EQ. 1) THEN
+
+        DO ix = 1, nzones
+
+        u0 ( ix, :) = u ( ix, :)
+
+        u ( ix, :) = u ( ix, :) + 0.5 * dtcur * dudt ( ix, :)
+
+        END DO ! End of "DO ix =".
+
+      ELSE
+
+        DO ix = 1, nzones
+
+        u ( ix, :) = u0 ( ix, :) + dtcur * dudt ( ix, :)
+
+        END DO ! End of "DO ix =".
+
+      END IF ! End of "IF ( ifracstep .EQ. 1)".
+
+! ----------------------------------------------------------------------
+
+! Obtain primitive variables from recently updated conserved variables
+! and use that to obtain the new timestep "dtcur".
+
+      IF ( ifracstep .EQ. 2) THEN
+
+      t = t + dtcur
+
+      dtprev = dtcur
+      dtcur = 1.0e30
+
+      rhomin = 1.0e30
+      rhomax = - 1.0e30
+      prsmin = 1.0e30
+      prsmax = - 1.0e30
+
+      vlxmin = 1.0e30
+      vlxmax = - 1.0e30
+      vlymin = 1.0e30
+      vlymax = - 1.0e30
+      vlzmin = 1.0e30
+      vlzmax = - 1.0e30
+
+      bfymin = 1.0e30
+      bfymax = - 1.0e30
+      bfzmin = 1.0e30
+      bfzmax = - 1.0e30
+
+! ------------------------------
+
+      DO ix = - 3, nzones + 4
+
+! ----------
+
+
+      v ( ix, 1) = AMAX1 ( u ( ix, 1), rhofloor)
+
+      v ( ix, 2) = u ( ix, 2) / v ( ix, 1)
+      v ( ix, 3) = u ( ix, 3) / v ( ix, 1)
+      v ( ix, 4) = u ( ix, 4) / v ( ix, 1)
+
+      v ( ix, 6) = u ( ix, 6)
+      v ( ix, 7) = u ( ix, 7)
+
+      tempa = 0.5 * v ( ix, 1)
+     1      * ( v ( ix, 2)**2 + v ( ix, 3)**2 + v ( ix, 4)**2)
+     1      + ( bfxbar ( ix)**2
+     1        + v ( ix, 6)**2 + v ( ix, 7)**2) / ( 8.0 * pi)
+
+      v ( ix, 5) = ( u ( ix, 5) - tempa) * ( gamma - 1.0)
+      v ( ix, 5) = AMAX1 ( v ( ix, 5), prsfloor)
+
+      msonic_spd ( ix) = gamma * v ( ix, 5)
+     1      + ( bfxbar ( ix)**2
+     1        + v ( ix, 6)**2 + v ( ix, 7)**2) / ( 4.0 * pi)
+      msonic_spd ( ix) = SQRT ( msonic_spd ( ix) / v ( ix, 1))
+
+      IF ( v ( ix, 5) .LE. prsfloor) u ( ix, 5) = tempa
+     1                             + prsfloor / ( gamma - 1.0)
+
+! ----------
+
+! Make "dtcur" here.
+
+      tempa = ABS ( v ( ix, 2)) + msonic_spd ( ix)
+
+      dtcur = AMIN1 ( dtcur, mu * dx / tempa)
+
+! ----------
+
+      rhomin = AMIN1 ( rhomin, v ( ix, 1))
+      rhomax = AMAX1 ( rhomax, v ( ix, 1))
+
+      prsmin = AMIN1 ( prsmin, v ( ix, 5))
+      prsmax = AMAX1 ( prsmax, v ( ix, 5))
+
+      vlxmin = AMIN1 ( vlxmin, v ( ix, 2))
+      vlxmax = AMAX1 ( vlxmax, v ( ix, 2))
+
+      vlymin = AMIN1 ( vlymin, v ( ix, 3))
+      vlymax = AMAX1 ( vlymax, v ( ix, 3))
+
+      vlzmin = AMIN1 ( vlzmin, v ( ix, 4))
+      vlzmax = AMAX1 ( vlzmax, v ( ix, 4))
+
+      bfymin = AMIN1 ( bfymin, v ( ix, 6))
+      bfymax = AMAX1 ( bfymax, v ( ix, 6))
+
+      bfzmin = AMIN1 ( bfzmin, v ( ix, 7))
+      bfzmax = AMAX1 ( bfzmax, v ( ix, 7))
+
+! ----------
+
+      END DO ! End of "DO ix ="
+
+! ------------------------------
+
+      WRITE ( 6, *)"rhomin, prsmin, vlxmin, vlymin, vlzmin = "
+      WRITE ( 6, *) rhomin, prsmin, vlxmin, vlymin, vlzmin
+      WRITE ( 6, *)"bfymin, bfzmin = "
+      WRITE ( 6, *) bfymin, bfzmin
+      WRITE ( 6, *)" "
+      WRITE ( 6, *)"rhomax, prsmax, vlxmax, vlymax, vlzmax = "
+      WRITE ( 6, *) rhomax, prsmax, vlxmax, vlymax, vlzmax
+      WRITE ( 6, *)"bfymax, bfzmax = "
+      WRITE ( 6, *) bfymax, bfzmax
+      WRITE ( 6, *)" "
+      WRITE ( 6, *)"----------------------------------------"
+      WRITE ( 6, *)" "
+
+
+      IF ( dtcur .GT. 1.1 * dtprev) dtcur = 1.1 * dtprev
+
+      END IF ! End of "IF ( ifracstep .EQ. 2)" where "dtcur" is evaluated.
+
+! ----------------------------------------------------------------------
+
+! Write out final data for imaging and wrap up the timestep loop if
+! the final time has been reached.
+
+      IF ( ( ifracstep .EQ. 2) .AND. ( t .GE. tstop) ) THEN
+
+      OPEN ( unit = 11, file = "rh010001")
+!      DO ix = 1, nzones
+      WRITE ( 11, *) ( v ( ix, 1), ix = 1, nzones)
+!      END DO
+!      DO ix = 1, nzones
+!      WRITE ( 11, *) x ( ix)
+!      END DO
+      CLOSE ( 11)
+
+      OPEN ( unit = 11, file = "vx010001")
+!      DO ix = 1, nzones
+      WRITE ( 11, *) ( v ( ix, 2), ix = 1, nzones)
+!      WRITE ( 11, *) x (ix), v ( ix, 2)
+!      END DO
+!      DO ix = 1, nzones
+!      WRITE ( 11, *) x ( ix)
+!      END DO
+      CLOSE ( 11)
+
+      OPEN ( unit = 11, file = "vy010001")
+!      DO ix = 1, nzones
+!      WRITE ( 11, *) x (ix), v ( ix, 3)
+      WRITE ( 11, *) ( v ( ix, 3), ix = 1, nzones)
+!      END DO
+!      DO ix = 1, nzones
+!      WRITE ( 11, *) x ( ix)
+!      END DO
+      CLOSE ( 11)
+
+      OPEN ( unit = 11, file = "vz010001")
+!      DO ix = 1, nzones
+!      WRITE ( 11, *) x (ix), v ( ix, 4)
+      WRITE ( 11, *) ( v ( ix, 4), ix = 1, nzones)
+!      END DO
+!      DO ix = 1, nzones
+!      WRITE ( 11, *) x ( ix)
+!      END DO
+      CLOSE ( 11)
+
+      OPEN ( unit = 11, file = "pr010001")
+!      DO ix = 1, nzones
+!      WRITE ( 11, *) x(ix), v ( ix, 5)
+      WRITE ( 11, *) ( v ( ix, 5), ix = 1, nzones)
+!      END DO
+!      DO ix = 1, nzones
+!      WRITE ( 11, *) x ( ix)
+!      END DO
+      CLOSE ( 11)
+
+      OPEN ( unit = 11, file = "by010001")
+!      DO ix = 1, nzones
+!      WRITE ( 11, *) x (ix), v ( ix, 6)
+      WRITE ( 11, *) ( v ( ix, 6), ix = 1, nzones)
+!      END DO
+!      DO ix = 1, nzones
+!      WRITE ( 11, *) x ( ix)
+!      END DO
+      CLOSE ( 11)
+
+      OPEN ( unit = 11, file = "bz010001")
+!      DO ix = 1, nzones
+!      WRITE ( 11, *) x(ix), v ( ix, 7)
+      WRITE ( 11, *) ( v ( ix, 7), ix = 1, nzones)
+!      END DO
+!      DO ix = 1, nzones
+!      WRITE ( 11, *) x ( ix)
+!      END DO
+      CLOSE ( 11)
+
+      GO TO 100
+
+      END IF ! End of "IF ( ( ifracstep .EQ. 2) .AND ( t .GT. tstop) )".
+
+! ----------------------------------------------------------------------
+
+      END DO ! End of "DO ifracstep =".
+
+      END DO ! End of "DO istep =".
+
+100   CONTINUE
+
+! ----------------------------------------------------------------------
+
+      STOP
+
+      END PROGRAM MHD_RK_APPROX_RS
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+      SUBROUTINE SET_RP ( iproblem, nzones, gamma, tstop, v, bfxbar)
+
+! ----------------------------------------------------------------------
+
+      IMPLICIT NONE
+
+      INTEGER iproblem, nzones, izonecenter, ix
+
+      REAL gamma, tstop, 
+     1     bfxbar ( ONEDFLUIDBEGIN : ONEDFLUIDEND),
+     1     v ( ONEDFLUIDBEGIN : ONEDFLUIDEND, NFIELD + NFLUID),
+
+     1 rhore_l, prsre_l, vlxre_l, vlyre_l, vlzre_l, bfyre_l, bfzre_l,
+     1 rhore_r, prsre_r, vlxre_r, vlyre_r, vlzre_r, bfyre_r, bfzre_r,
+     1 bfxre_0, fourpi
+
+! ----------------------------------------------------------------------
+
+      fourpi = 16.0 * ATAN ( 1.0)
+
+*****************
+*
+      IF ( iproblem .EQ. 1) THEN
+*
+* Brio and Wu shock tube
+*
+      gamma = 2.0
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.1
+*
+*
+      rhore_l = 1.0
+      prsre_l = 1.0
+*
+      vlxre_l = 0.0
+      vlyre_l = 0.0
+      vlzre_l = 0.0
+*
+      bfyre_l = 1.0 * SQRT ( fourpi)
+      bfzre_l = 0.0 * SQRT ( fourpi)
+*
+*
+      bfxre_0 = 0.75 * SQRT ( fourpi)
+*
+*
+      rhore_r = 0.125
+      prsre_r = 0.1
+*
+      vlxre_r = 0.0
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = -1.0 * SQRT ( fourpi)
+      bfzre_r = 0.0 * SQRT ( fourpi)
+*
+      END IF
+*
+*****************
+*
+      IF ( iproblem .EQ. 2) THEN
+*
+* Supersonic intersecting streams.
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.08
+*
+*
+      rhore_l = 1.0
+      prsre_l = 20.0
+*
+      vlxre_l = 10.0
+      vlyre_l = 0.0
+      vlzre_l = 0.0
+*
+      bfyre_l = 5.0
+      bfzre_l = 0.0
+*
+*
+      bfxre_0 = 5.0
+*
+*
+      rhore_r = 1.0
+      prsre_r = 1.0
+*
+      vlxre_r = -10.0
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = 5.0
+      bfzre_r = 0.0
+*
+      END IF
+*
+*****************
+*
+      IF ( iproblem .EQ. 3) THEN
+*
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.03
+*
+*
+      rhore_l = 1.0
+      prsre_l = 1.0
+*
+      vlxre_l = 0.0
+      vlyre_l = 0.0
+      vlzre_l = 0.0
+*
+      bfyre_l = 5.0
+      bfzre_l = 0.0
+*
+*
+      bfxre_0 = 3.0
+*
+*
+      rhore_r = 0.1
+      prsre_r = 10.0
+*
+      vlxre_r = 0.0
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = 2.0
+      bfzre_r = 0.0
+*
+      END IF
+*
+*****************
+*
+      IF ( iproblem .EQ. 4) THEN
+*
+* Non-coplanar problem with all 7 waves.
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.2
+*
+*
+      rhore_l = 1.08
+      prsre_l = 0.95
+*
+      vlxre_l = 1.2
+      vlyre_l = 0.01
+      vlzre_l = 0.5
+*
+      bfyre_l = 3.6
+      bfzre_l = 2.0
+*
+*
+      bfxre_0 = 2.0
+*
+*
+      rhore_r = 1.0
+      prsre_r = 1.0
+*
+      vlxre_r = 0.0
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = 4.0
+      bfzre_r = 2.0
+*
+      END IF
+*
+*****************
+*
+      IF ( iproblem .EQ. 5) THEN
+*
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.035
+*
+*
+      rhore_l = 1.0
+      prsre_l = 1.0
+*
+      vlxre_l = 0.0
+      vlyre_l = 0.0
+      vlzre_l = 0.0
+*
+      bfyre_l = 6.0
+      bfzre_l = 0.0
+*
+*
+      bfxre_0 = 3.0
+*
+*
+      rhore_r = 0.1
+      prsre_r = 10.0
+*
+      vlxre_r = 0.0
+      vlyre_r = 2.0
+      vlzre_r = 1.0
+*
+      bfyre_r = 1.0
+      bfzre_r = 0.0
+*
+      END IF
+*
+*****************
+*
+      IF ( iproblem .EQ. 6) THEN
+*
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.01
+*
+*
+      rhore_l = 0.1
+      prsre_l = 0.4
+*
+      vlxre_l = 50.0
+      vlyre_l = 0.0
+      vlzre_l = 0.0
+*
+      bfyre_l = -1.0
+      bfzre_l = -2.0
+*
+*
+      bfxre_0 = 0.0
+*
+*
+      rhore_r = 0.1
+      prsre_r = 0.2
+*
+      vlxre_r = 0.0
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = 1.0
+      bfzre_r = 2.0
+*
+      END IF
+*
+*****************
+*
+      IF ( iproblem .EQ. 7) THEN
+*
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.1
+*
+*
+      rhore_l = 1.0
+      prsre_l = 1.0
+*
+      vlxre_l = -1.0
+      vlyre_l = 0.0
+      vlzre_l = 0.0
+*
+      bfyre_l = 1.0 * SQRT ( fourpi)
+      bfzre_l = 0.0 * SQRT ( fourpi)
+*
+*
+      bfxre_0 = 0.0 * SQRT ( fourpi)
+*
+*
+      rhore_r = 1.0
+      prsre_r = 1.0
+*
+      vlxre_r = 1.0
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = 1.0 * SQRT ( fourpi)
+      bfzre_r = 0.0 * SQRT ( fourpi)
+*
+      END IF
+*
+*****************
+*
+      IF ( iproblem .EQ. 8) THEN
+*
+* Switch-on fast shock.
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.15
+*
+*
+      rhore_l = 1.0
+      prsre_l = 1.0
+*
+      vlxre_l = 0.0
+      vlyre_l = 0.0
+      vlzre_l = 0.0
+*
+      bfyre_l = 1.0 * SQRT ( fourpi)
+      bfzre_l = 0.0 * SQRT ( fourpi)
+*
+*
+      bfxre_0 = 1.0 * SQRT ( fourpi)
+*
+*
+      rhore_r = 0.2
+      prsre_r = 0.1
+*
+      vlxre_r = 0.0
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = 0.0 * SQRT ( fourpi)
+      bfzre_r = 0.0 * SQRT ( fourpi)
+*
+      END IF
+*
+*****************
+*
+      IF ( iproblem .EQ. 9) THEN
+*
+* Switch-off fast rarefaction.
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.15
+*
+*
+      rhore_l = 0.4
+      prsre_l = 0.52467
+*
+      vlxre_l = -0.66991
+      vlyre_l = 0.98263
+      vlzre_l = 0.0
+*
+      bfyre_l = 0.0025293 * SQRT ( fourpi)
+      bfzre_l = 0.0 * SQRT ( fourpi)
+*
+*
+      bfxre_0 = 1.3 * SQRT ( fourpi)
+*
+*
+      rhore_r = 1.0
+      prsre_r = 1.0
+*
+      vlxre_r = 0.0
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = 1.0 * SQRT ( fourpi)
+      bfzre_r = 0.0 * SQRT ( fourpi)
+*
+      END IF
+*
+*****************
+*
+      IF ( iproblem .EQ. 10) THEN
+*
+* Switch-off slow shock.
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.15
+*
+*
+      rhore_l = 0.65
+      prsre_l = 0.5
+*
+      vlxre_l = 0.667
+      vlyre_l = -0.257
+      vlzre_l = 0.0
+*
+      bfyre_l = 0.55 * SQRT ( fourpi)
+      bfzre_l = 0.0 * SQRT ( fourpi)
+*
+*
+      bfxre_0 = 0.75 * SQRT ( fourpi)
+*
+*
+      rhore_r = 1.0
+      prsre_r = 0.75
+*
+      vlxre_r = 0.4
+      vlyre_r = -0.94
+      vlzre_r = 0.0
+*
+      bfyre_r = 0.0 * SQRT ( fourpi)
+      bfzre_r = 0.0 * SQRT ( fourpi)
+*
+      END IF
+*
+*****************
+*
+      IF ( iproblem .EQ. 11) THEN
+*
+* Switch-on slow rarefaction.
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.16
+*
+*
+      rhore_l = 1.0
+      prsre_l = 1.0
+*
+      vlxre_l = 0.0
+      vlyre_l = 0.0
+      vlzre_l = 0.0
+*
+      bfyre_l = 0.0 * SQRT ( fourpi)
+      bfzre_l = 0.0 * SQRT ( fourpi)
+*
+*
+      bfxre_0 = 0.7 * SQRT ( fourpi)
+*
+*
+      rhore_r = 0.3
+      prsre_r = 0.2
+*
+      vlxre_r = 0.0
+      vlyre_r = 0.0
+      vlzre_r = 1.0
+*
+      bfyre_r = 1.0 * SQRT ( fourpi)
+      bfzre_r = 0.0 * SQRT ( fourpi)
+*
+      END IF
+*
+*****************
+*
+      IF ( iproblem .EQ. 12) THEN
+*
+* Compound wave formed by fast rarefaction and Alfven wave.
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.16
+*
+*
+      rhore_l = 1.0
+      prsre_l = 1.0
+*
+      vlxre_l = 0.0
+      vlyre_l = 0.0
+      vlzre_l = 0.0
+*
+      bfyre_l = 1.0 * SQRT ( fourpi)
+      bfzre_l = 0.0 * SQRT ( fourpi)
+*
+*
+      bfxre_0 = 1.3 * SQRT ( fourpi)
+*
+*
+      rhore_r = 0.4
+      prsre_r = 0.4
+*
+      vlxre_r = 0.0
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = -1.0 * SQRT ( fourpi)
+      bfzre_r = 0.0 * SQRT ( fourpi)
+*
+      END IF
+*
+*
+*****************
+*
+      IF ( iproblem .EQ. 13) THEN
+*
+* Noh-like problem with colliding supersonic streams.
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.04
+*
+*
+      rhore_l = 0.15
+      prsre_l = 0.28
+*
+      vlxre_l = 21.55
+      vlyre_l = 1.0
+      vlzre_l = 1.0
+*
+      bfyre_l = -2.0
+      bfzre_l = -1.0
+*
+*
+      bfxre_0 = 0.0
+*
+*
+      rhore_r = 0.1
+      prsre_r = 0.1
+*
+      vlxre_r = -26.45
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = 2.0
+      bfzre_r = 1.0
+*
+      END IF
+*
+*
+*****************
+*
+      IF ( iproblem .EQ. 14) THEN
+*
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 5
+*
+      tstop = 0.16
+*
+*
+      rhore_l = 0.32
+      prsre_l = 14.83
+*
+      vlxre_l = 0.0
+      vlyre_l = 1.91
+      vlzre_l = 0.9551
+*
+      bfyre_l = 2.239
+      bfzre_l = 1.12
+*
+*
+      bfxre_0 = 2.0
+*
+*
+      rhore_r = 0.1
+      prsre_r = 0.1
+*
+      vlxre_r = -10.41
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = 2.0
+      bfzre_r = 1.0
+*
+      END IF
+*
+*
+*****************
+*
+      IF ( iproblem .EQ. 15) THEN
+*
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 10
+*
+      tstop = 0.08
+*
+*
+      rhore_l = 0.2
+      prsre_l = 10.79
+*
+      vlxre_l = 4.589
+      vlyre_l = -2.061
+      vlzre_l = 3.317
+*
+      bfyre_l = 3.8
+      bfzre_l = 3.8
+*
+*
+      bfxre_0 = 2.0
+*
+*
+      rhore_r = 0.1
+      prsre_r = 0.2
+*
+      vlxre_r = -4.589
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = 1.0
+      bfzre_r = 1.0
+*
+      END IF
+*
+*
+*****************
+*
+      IF ( iproblem .EQ. 16) THEN
+*
+* Noh-like problem with very fast colliding supersonic streams.
+*
+      gamma = 1.6666666666
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.03
+*
+*
+      rhore_l = 1.0
+      prsre_l = 1.0
+*
+      vlxre_l = 36.87
+      vlyre_l = -0.155
+      vlzre_l = -0.0386
+*
+      bfyre_l = 4.0
+      bfzre_l = 1.0
+*
+*
+      bfxre_0 = 4.0
+*
+*
+      rhore_r = 1.0
+      prsre_r = 1.0
+*
+      vlxre_r = -36.87
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = 4.0
+      bfzre_r = 1.0
+*
+      END IF
+*
+*
+*****************
+*
+      IF ( iproblem .EQ. 17) THEN
+*
+*
+      gamma = 1.6666666666
+*
+      izonecenter = 6 * nzones / 10
+*
+      tstop = 0.4
+*
+*
+      rhore_l = 0.8129
+      prsre_l = 0.4809
+*
+      vlxre_l = 1.801
+      vlyre_l = 0.3672
+      vlzre_l = 0.1836
+*
+      bfyre_l = 1.7856
+      bfzre_l = 0.8928
+*
+*
+      bfxre_0 = 4.0
+*
+*
+      rhore_r = 1.0
+      prsre_r = 0.1
+*
+      vlxre_r = -1.7942
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = 2.0
+      bfzre_r = 1.0
+*
+      END IF
+*
+*
+*****************
+* Stationary Contact discontinuity.
+*
+      IF ( iproblem .EQ. 18) THEN
+*
+*
+      gamma = 1.4
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.25
+*
+*
+      rhore_l = 1.0
+      prsre_l = 1.0
+*
+      vlxre_l = 0.0
+      vlyre_l = 0.0
+      vlzre_l = 0.0
+*
+      bfyre_l = 0.0
+      bfzre_l = 0.0
+*
+*
+      bfxre_0 = 1.0
+*
+*
+      rhore_r = 0.1
+      prsre_r = 1.0
+*
+      vlxre_r = 0.0
+      vlyre_r = 0.0
+      vlzre_r = 0.0
+*
+      bfyre_r = 0.0
+      bfzre_r = 0.0
+*
+      END IF
+*
+*****************
+* Stationary Alfven wave discontinuity.
+*
+      IF ( iproblem .EQ. 19) THEN
+*
+*
+      gamma = 1.4
+*
+      izonecenter = nzones / 2
+*
+      tstop = 0.25
+*
+*
+      rhore_l = 1.0 / fourpi
+      prsre_l = 1.0
+*
+      vlxre_l = - 1.0
+      vlyre_l = 1.0
+      vlzre_l = - 1.0
+*
+      bfyre_l = - 1.0
+      bfzre_l = 1.0
+*
+*
+      bfxre_0 = 1.0
+*
+*
+      rhore_r = 1.0 / fourpi
+      prsre_r = 1.0
+*
+      vlxre_r = - 1.0
+      vlyre_r = - 1.0
+      vlzre_r = - 1.0
+*
+      bfyre_r = 1.0
+      bfzre_r = 1.0
+*
+      END IF
+*
+*****************
+*****************
+
+! Now set up all the primitive variables.
+
+      bfxbar ( :) = bfxre_0
+
+      DO ix = - 3, nzones + 4
+
+      IF ( ix .LE. izonecenter) THEN
+
+      v ( ix, 1) = rhore_l
+      v ( ix, 2) = vlxre_l
+      v ( ix, 3) = vlyre_l
+      v ( ix, 4) = vlzre_l
+      v ( ix, 5) = prsre_l
+      v ( ix, 6) = bfyre_l
+      v ( ix, 7) = bfzre_l
+
+      ELSE
+
+      v ( ix, 1) = rhore_r
+      v ( ix, 2) = vlxre_r
+      v ( ix, 3) = vlyre_r
+      v ( ix, 4) = vlzre_r
+      v ( ix, 5) = prsre_r
+      v ( ix, 6) = bfyre_r
+      v ( ix, 7) = bfzre_r
+
+      END IF
+
+      END DO
+
+      WRITE ( 6, *)" "
+      WRITE ( 6, *)"gamma, tstop, bfxre_0 = ", gamma, tstop, bfxre_0
+      WRITE ( 6, *)" "
+      WRITE ( 6, *)
+     1"rhore_l, prsre_l, vlxre_l, vlyre_l, vlzre_l, bfyre_l, bfzre_l"
+      WRITE ( 6, *)
+     1 rhore_l, prsre_l, vlxre_l, vlyre_l, vlzre_l, bfyre_l, bfzre_l
+      WRITE ( 6, *)" "
+      WRITE ( 6, *)
+     1"rhore_r, prsre_r, vlxre_r, vlyre_r, vlzre_r, bfyre_r, bfzre_r"
+      WRITE ( 6, *)
+     1 rhore_r, prsre_r, vlxre_r, vlyre_r, vlzre_r, bfyre_r, bfzre_r
+
+      WRITE ( 6, *)" "
+
+! ----------------------------------------------------------------------
+
+      RETURN
+
+      END SUBROUTINE SET_RP
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+      SUBROUTINE EIGENVECMHD
+
+     1             ( nriembegin, nriemend, iprimitive,
+
+     1               gamma, smallnum, prsfloor, rhofloor, pi, 
+     1               debug_stop,
+
+     1               gasconst,
+     1               cp_specie, molewt_specie, heat_of_formation,
+
+     1               rhobar, prsbar,
+     1               vlxbar, vlybar, vlzbar,
+     1               bfxbar, bfybar, bfzbar, xbar,
+     1               speciebar,
+
+     1               eigenval,
+     1               lf_eigenvec, rt_eigenvec )
+
+*******************************************************************
+
+* Written by : Dinshaw S. Balsara
+
+* Returns normalized left and right eigenvectors for a specified set
+* of mean states for adiabatic MHD. 
+
+* When "iprimitive == 1" the eigenvectors expressed in terms of primitive
+* variables are returned.
+
+* When "iprimitive == 0" the eigenvectors in terms of conserved variables
+* are returned.
+
+* When "iprimitive == -1" the eigenvectors in terms of "conserved" variables
+* are returned. Here we use the equation for entropy advection instead of
+* the equation for total energy. This formulation is useful for maintaining
+* pressure positivity.
+
+* When primitive variables are used the vector of variables is in the
+* order given by ( rho, vlx,y,z, prs, bfy,z, species_fractions)^T.
+
+* When conserved variables are used the vector of variables is in the
+* order given by ( rho, momx,y,z, eng, bfy,z, species_concentration)^T.
+
+* When entropy-based "conserved" variables are used the vector of variables
+* is in the order given by :
+* ( rho, momx,y,z, prs/rho**(gamma-1), bfy,z, species_concentration)^T.
+
+* Properly normalized eigenvectors as given in Roe and Balsara (1996)
+* are generated.
+
+*******************************************************************
+
+      IMPLICIT NONE
+
+************************************************************************
+************************************************************************
+
+      INTEGER, INTENT ( IN) :: nriembegin, nriemend, iprimitive
+
+      INTEGER, INTENT ( INOUT) :: debug_stop
+
+      REAL, INTENT ( IN) :: gamma, smallnum, prsfloor, rhofloor,
+     1      pi, gasconst
+
+      REAL, DIMENSION ( 0 : NFLUID), INTENT ( IN) ::
+     1      cp_specie, molewt_specie, heat_of_formation
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND),
+     1     INTENT ( INOUT) ::
+     1     rhobar, prsbar, vlxbar, vlybar, vlzbar,
+     1     bfxbar, bfybar, bfzbar, xbar
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND),
+     1     INTENT ( INOUT) ::
+     1      speciebar
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  NFIELD + NFLUID), INTENT ( INOUT) ::
+     1     eigenval
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1      NFIELD + NFLUID, NFIELD + NFLUID), INTENT ( INOUT) ::
+     1     lf_eigenvec, rt_eigenvec
+
+*****************************************************************
+*****************************************************************
+
+      INTEGER i, ii, iii, j, k, ifluid
+
+      REAL fourpi, small_speed
+
+
+* Variables for making wave speeds and eigenvectors.
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     va_x, c_s, v_a, v_f, v_s, beta_y, beta_z,
+     1     alpha_f, alpha_s, sgnbx, sq_4pi_rho, va_perp,
+     1     eps_zone, one_by_4pi_rho,
+
+     1     eng, temperature,
+     1     mean_mol_wt, gamma_eos, gamma_soundspeed,
+     1     dprs_drho, dprs_deng, deng_drho, deng_dprs,
+
+     1     temparr_01, temparr_02, temparr_03
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     dprs_dspecie, deng_dspecie
+
+* Temporary usage of left and right eigenvectors in the primitive variables.
+* Transformation matrices to go from conserved to primitive and back.
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1      NFIELD + NFLUID, NFIELD + NFLUID) ::
+
+     1     lf_eigenvec1, rt_eigenvec1, dudw, dwdu
+
+******************************************************************
+
+!      COMMON /EIGENVECMHD_COM/
+
+!     1     va_x, c_s, v_a, v_f, v_s, beta_y, beta_z,
+!     1     alpha_f, alpha_s, sgnbx, sq_4pi_rho, va_perp,
+!     1     eps_zone, one_by_4pi_rho,
+
+!     1     eng, temperature,
+!     1     mean_mol_wt, gamma_eos, gamma_soundspeed,
+!     1     dprs_drho, dprs_deng, deng_drho, deng_dprs,
+
+!     1     dprs_dspecie, deng_dspecie,
+
+!     1     temparr_01, temparr_02, temparr_03,
+
+!     1     lf_eigenvec1, rt_eigenvec1, dudw, dwdu
+
+#if ( MAKEOPENMP == 1)
+!   !$OMP THREADPRIVATE (/EIGENVECMHD_COM/)
+#endif
+
+******************************************************************
+
+* Make some settings.
+
+      fourpi = 4.0 * pi
+
+* If the alfven speeds in the x or ( y, z) directions fall below "small_speed"
+* times the local sound speed, manoeuvers have to be done to prevent the
+* slow and fast eigenvectors from developing pathologies.
+
+      small_speed = 0.000001
+
+*****************************************************************
+
+      IF ( NFIELD .NE. 7) THEN
+      WRITE ( 6, *)"EIGENVECMHD : NFIELD .NE. 7", NFIELD, 7
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( nriembegin .LT. ONEDFLUIDBEGIN) .OR.
+     1     ( nriembegin .GT. ONEDFLUIDEND) ) THEN
+      WRITE ( 6, *)"EIGENVECMHD : nriembegin out of bounds",
+     1       nriembegin, nriembegin
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( nriemend .LT. ONEDFLUIDBEGIN) .OR.
+     1     ( nriemend .GT. ONEDFLUIDEND) ) THEN
+      WRITE ( 6, *)"EIGENVECMHD : nriemend out of bounds",
+     1       nriemend, nriemend
+      debug_stop = 1
+      RETURN
+      END IF
+
+*****************************************************************
+
+* Bound the density and pressure variables. Divide "xbar" by 4 * pi.
+
+      DO i = nriembegin, nriemend
+
+      rhobar ( i) = AMAX1 ( rhobar ( i), rhofloor)
+      prsbar ( i) = AMAX1 ( prsbar ( i), prsfloor)
+
+      xbar ( i) = xbar ( i) / fourpi
+
+      END DO
+
+******************************************************************
+
+* Fix up "gamma_soundspeed" and partial derivatives of various
+* thermodynamic quantities wrt one another.
+
+#if (NFLUID == 0)
+
+      DO i = nriembegin, nriemend
+      eng ( i) = prsbar ( i) / (gamma - 1.0)
+      mean_mol_wt ( i) = molewt_specie ( 0)
+      gamma_eos ( i) = gamma
+      gamma_soundspeed ( i) = gamma
+
+      temperature ( i) = prsbar ( i) * mean_mol_wt ( i)
+     1                 / ( gasconst * rhobar ( i))
+
+      dprs_drho ( i) = 0.0
+      dprs_deng ( i) = gamma - 1.0
+      deng_drho ( i) = 0.0
+      deng_dprs ( i) = 1.0 / ( gamma - 1.0)
+
+      END DO
+
+#else
+
+      WRITE ( 6, *)"This teaching version is not for multifluid."
+      STOP
+
+#endif
+
+******************************************************************
+
+* Make eigenvalues:
+
+      DO i = nriembegin, nriemend
+
+*****************
+
+      sgnbx ( i) = SIGN ( 1.0, bfxbar ( i) )
+
+      sq_4pi_rho ( i) = SQRT ( fourpi * rhobar ( i) )
+
+*****************
+
+      one_by_4pi_rho ( i) = 1.0 / ( fourpi * rhobar ( i) )
+
+      va_x ( i) = bfxbar ( i)**2 * one_by_4pi_rho ( i)
+      va_x ( i) = SQRT ( va_x ( i) )
+
+      c_s ( i) = gamma_soundspeed ( i) * prsbar ( i) / rhobar ( i)
+      c_s ( i) = SQRT ( c_s ( i) )
+
+      v_a ( i) = ( bfxbar ( i)**2 + bfybar ( i)**2
+     1           + bfzbar ( i)**2) * one_by_4pi_rho ( i)
+      v_a ( i) = SQRT ( v_a ( i) )
+
+      temparr_01 ( i) = v_a ( i)**2 + c_s ( i)**2
+      temparr_02 ( i) = temparr_01 ( i)**2
+     1                - 4.0 * va_x ( i)**2 * c_s ( i)**2
+      temparr_02 ( i) = AMAX1 ( temparr_02 ( i), 0.0)
+      temparr_02 ( i) = SQRT ( temparr_02 ( i))
+
+      v_f ( i) = 0.5 * ( temparr_01 ( i) + temparr_02 ( i))
+      v_f ( i) = SQRT ( v_f ( i) )
+
+      v_s ( i) = 0.5 * ( temparr_01 ( i) - temparr_02 ( i))
+      v_s ( i) = AMAX1 ( v_s ( i), 0.0)
+      v_s ( i) = SQRT ( v_s ( i) )
+
+*****************
+
+* Now make quantities that are essential for making the eigenvectors ( though
+* inessential for just the eigenvalues).
+
+      eps_zone ( i) = small_speed * c_s ( i)
+
+
+      va_perp ( i) = SQRT ( bfybar ( i)**2 + bfzbar ( i)**2)
+     1             / sq_4pi_rho ( i)
+
+
+      IF ( va_perp ( i) .GT. eps_zone ( i)) THEN
+
+      beta_y ( i) = bfybar ( i)
+     1            / ( va_perp ( i) * sq_4pi_rho ( i) )
+      beta_z ( i) = bfzbar ( i)
+     1            / ( va_perp ( i) * sq_4pi_rho ( i) )
+
+      ELSE
+
+      beta_y ( i) = 1.0 / SQRT ( 2.0)
+      beta_z ( i) = beta_y ( i)
+
+      END IF
+
+*******************
+
+      eigenval ( i, 1) = vlxbar ( i) - v_f ( i)
+      eigenval ( i, 2) = vlxbar ( i) - va_x ( i)
+      eigenval ( i, 3) = vlxbar ( i) - v_s ( i)
+      eigenval ( i, 4) = vlxbar ( i)
+      eigenval ( i, 5) = vlxbar ( i) + v_s ( i)
+      eigenval ( i, 6) = vlxbar ( i) + va_x ( i)
+      eigenval ( i, 7) = vlxbar ( i) + v_f ( i)
+
+*******************
+
+      END DO
+
+*******************
+
+#if ( NFLUID >= 1)
+      DO i = nriembegin, nriemend
+
+      eigenval ( i, NFIELD + 1: NFIELD + NFLUID) = vlxbar ( i)
+
+      END DO
+#endif
+
+*******************************************************************
+
+* Make a consistent set of "alpha_f/s" for all the cases.
+
+      DO i = nriembegin, nriemend
+
+*******************
+
+      IF ( v_f ( i) .GE. v_s ( i) + eps_zone ( i) ) THEN
+
+* Straightforward evaluation is adequate here. We are far away from
+* the triple umbilic point.
+
+      temparr_01 ( i) = 1.0 / ( v_f ( i)**2 - v_s ( i)**2)
+
+      alpha_f ( i) = AMAX1 ( ( c_s ( i)**2 - v_s ( i)**2), 0.0 )
+      alpha_f ( i) = SQRT ( temparr_01 ( i) * alpha_f ( i))
+
+      alpha_s ( i) = AMAX1 ( ( v_f ( i)**2 - c_s ( i)**2), 0.0 )
+      alpha_s ( i) = SQRT ( temparr_01 ( i) * alpha_s ( i))
+
+      ELSE IF ( ABS ( va_x ( i) - c_s ( i)) .GT.
+     1          smallnum * c_s ( i) ) THEN
+
+* We are very close to the triple umbilic point but not on it.
+
+      temparr_01 ( i) = va_perp ( i)
+     1       / ( va_x ( i) - c_s ( i))
+      temparr_01 ( i) = ATAN ( temparr_01 ( i)) / 2.0
+
+      alpha_f ( i) = ABS ( SIN ( temparr_01 ( i)))
+      alpha_s ( i) = ABS ( COS ( temparr_01 ( i)))
+
+      ELSE
+
+* We are bang on the triple umbilic point ( indistinguishable
+* upto machine accuracy). Now which way we resolve this could
+* only depend on the structure of the waves in the adjoining zones
+* and we don't address that issue here.
+
+      temparr_01 ( i) = 0.25 * pi
+     1                * SIGN ( 1.0, va_x ( i) - c_s ( i))
+
+      alpha_f ( i) = ABS ( SIN ( temparr_01 ( i)))
+      alpha_s ( i) = ABS ( COS ( temparr_01 ( i)))
+
+      END IF
+
+*******************
+
+      END DO
+
+*******************************************************************
+
+* First zero out the eigenvectors. This is only needed because we can
+* then fill in the species eigenvectors by putting 1's at suitable
+* places on the diagonals.
+
+      rt_eigenvec1 ( :, :, :) = 0.0
+      lf_eigenvec1 ( :, :, :) = 0.0
+
+*******************
+
+* Make right & left eigenvectors for alfven and entropy waves.
+
+      DO i = nriembegin, nriemend
+
+*******************
+
+* Alfven waves
+
+*******************
+
+
+!      rt_eigenvec1 ( i, 1, 2) = 0.0
+!      rt_eigenvec1 ( i, 1, 6) = 0.0
+
+!      rt_eigenvec1 ( i, 2, 2) = 0.0
+!      rt_eigenvec1 ( i, 2, 6) = 0.0
+
+      rt_eigenvec1 ( i, 3, 2) = - beta_z ( i)
+      rt_eigenvec1 ( i, 3, 6) = - rt_eigenvec1 ( i, 3, 2)
+
+      rt_eigenvec1 ( i, 4, 2) = beta_y ( i)
+      rt_eigenvec1 ( i, 4, 6) = - rt_eigenvec1 ( i, 4, 2)
+
+!      rt_eigenvec1 ( i, 5, 2) = 0.0
+!      rt_eigenvec1 ( i, 5, 6) = 0.0
+
+      rt_eigenvec1 ( i, 6, 2) = - sgnbx ( i)
+     1                        * sq_4pi_rho ( i) * beta_z ( i)
+      rt_eigenvec1 ( i, 6, 6) = rt_eigenvec1 ( i, 6, 2)
+
+      rt_eigenvec1 ( i, 7, 2) = sgnbx ( i)
+     1                        * sq_4pi_rho ( i) * beta_y ( i)
+      rt_eigenvec1 ( i, 7, 6) = rt_eigenvec1 ( i, 7, 2)
+
+
+*******************
+
+
+!      lf_eigenvec1 ( i, 2, 1) = 0.0
+!      lf_eigenvec1 ( i, 6, 1) = 0.0
+
+!      lf_eigenvec1 ( i, 2, 2) = 0.0
+!      lf_eigenvec1 ( i, 6, 2) = 0.0
+
+      lf_eigenvec1 ( i, 2, 3) = - 0.5 * beta_z ( i)
+      lf_eigenvec1 ( i, 6, 3) = - lf_eigenvec1 ( i, 2, 3)
+
+      lf_eigenvec1 ( i, 2, 4) = 0.5 * beta_y ( i)
+      lf_eigenvec1 ( i, 6, 4) = - lf_eigenvec1 ( i, 2, 4)
+
+!      lf_eigenvec1 ( i, 2, 5) = 0.0
+!      lf_eigenvec1 ( i, 6, 5) = 0.0
+
+      lf_eigenvec1 ( i, 2, 6) = - 0.5 * sgnbx ( i)
+     1                        * beta_z ( i) / sq_4pi_rho ( i)
+      lf_eigenvec1 ( i, 6, 6) = lf_eigenvec1 ( i, 2, 6)
+
+      lf_eigenvec1 ( i, 2, 7) = 0.5 * sgnbx ( i)
+     1                        * beta_y ( i) / sq_4pi_rho ( i)
+      lf_eigenvec1 ( i, 6, 7) = lf_eigenvec1 ( i, 2, 7)
+
+
+*******************
+
+* Entropy wave
+
+*******************
+
+      rt_eigenvec1 ( i, 1, 4) = 1.0
+!      rt_eigenvec1 ( i, 2, 4) = 0.0
+!      rt_eigenvec1 ( i, 3, 4) = 0.0
+!      rt_eigenvec1 ( i, 4, 4) = 0.0
+      rt_eigenvec1 ( i, 5, 4) = - xbar ( i)
+!      rt_eigenvec1 ( i, 6, 4) = 0.0
+!      rt_eigenvec1 ( i, 7, 4) = 0.0
+
+*******************
+
+      lf_eigenvec1 ( i, 4, 1) = 1.0 - xbar ( i) / c_s ( i)**2
+!      lf_eigenvec1 ( i, 4, 2) = 0.0
+!      lf_eigenvec1 ( i, 4, 3) = 0.0
+!      lf_eigenvec1 ( i, 4, 4) = 0.0
+      lf_eigenvec1 ( i, 4, 5) = - 1.0 / c_s ( i)**2
+!      lf_eigenvec1 ( i, 4, 6) = 0.0
+!      lf_eigenvec1 ( i, 4, 7) = 0.0
+
+*******************
+
+      END DO
+
+*******************************************************************
+
+* Make right & left eigenvectors for slow and fast waves.
+
+      DO i = nriembegin, nriemend
+
+*******************
+
+* Fast waves
+
+*******************
+
+      rt_eigenvec1 ( i, 1, 1) = alpha_f ( i) * rhobar ( i)
+      rt_eigenvec1 ( i, 1, 7) = rt_eigenvec1 ( i, 1, 1)
+
+      rt_eigenvec1 ( i, 2, 1) = - alpha_f ( i) * v_f ( i)
+      rt_eigenvec1 ( i, 2, 7) = - rt_eigenvec1 ( i, 2, 1)
+
+      rt_eigenvec1 ( i, 3, 1) = alpha_s ( i) * v_s ( i)
+     1                        * beta_y ( i) * sgnbx ( i)
+      rt_eigenvec1 ( i, 3, 7) = - rt_eigenvec1 ( i, 3, 1)
+
+      rt_eigenvec1 ( i, 4, 1) = alpha_s ( i) * v_s ( i)
+     1                        * beta_z ( i) * sgnbx ( i)
+      rt_eigenvec1 ( i, 4, 7) = - rt_eigenvec1 ( i, 4, 1)
+
+      rt_eigenvec1 ( i, 5, 1) = alpha_f ( i) * rhobar ( i)
+     1                        * ( c_s ( i)**2 - xbar ( i))
+      rt_eigenvec1 ( i, 5, 7) = rt_eigenvec1 ( i, 5, 1)
+
+      rt_eigenvec1 ( i, 6, 1) = alpha_s ( i) * sq_4pi_rho ( i)
+     1                        * c_s ( i) * beta_y ( i)
+      rt_eigenvec1 ( i, 6, 7) = rt_eigenvec1 ( i, 6, 1)
+
+      rt_eigenvec1 ( i, 7, 1) = alpha_s ( i) * sq_4pi_rho ( i)
+     1                        * c_s ( i) * beta_z ( i)
+      rt_eigenvec1 ( i, 7, 7) = rt_eigenvec1 ( i, 7, 1)
+
+*******************
+
+      temparr_01 ( i) = 0.5 / c_s ( i)**2
+
+      lf_eigenvec1 ( i, 1, 1) = alpha_f ( i) * xbar ( i)
+     1                        * temparr_01 ( i) / rhobar ( i)
+      lf_eigenvec1 ( i, 7, 1) = lf_eigenvec1 ( i, 1, 1)
+
+      lf_eigenvec1 ( i, 1, 2) = temparr_01 ( i)
+     1                        * rt_eigenvec1 ( i, 2, 1)
+      lf_eigenvec1 ( i, 7, 2) = - lf_eigenvec1 ( i, 1, 2)
+
+      lf_eigenvec1 ( i, 1, 3) = temparr_01 ( i)
+     1                        * rt_eigenvec1 ( i, 3, 1)
+      lf_eigenvec1 ( i, 7, 3) = - lf_eigenvec1 ( i, 1, 3)
+
+      lf_eigenvec1 ( i, 1, 4) = temparr_01 ( i)
+     1                        * rt_eigenvec1 ( i, 4, 1)
+      lf_eigenvec1 ( i, 7, 4) = - lf_eigenvec1 ( i, 1, 4)
+
+      lf_eigenvec1 ( i, 1, 5) = temparr_01 ( i)
+     1                        * alpha_f ( i) / rhobar ( i)
+      lf_eigenvec1 ( i, 7, 5) = lf_eigenvec1 ( i, 1, 5)
+
+      lf_eigenvec1 ( i, 1, 6) = temparr_01 ( i)
+     1                        * rt_eigenvec1 ( i, 6, 1)
+     1                        * one_by_4pi_rho ( i)
+      lf_eigenvec1 ( i, 7, 6) = lf_eigenvec1 ( i, 1, 6)
+
+      lf_eigenvec1 ( i, 1, 7) = temparr_01 ( i)
+     1                        * rt_eigenvec1 ( i, 7, 1)
+     1                        * one_by_4pi_rho ( i)
+      lf_eigenvec1 ( i, 7, 7) = lf_eigenvec1 ( i, 1, 7)
+
+*******************
+
+* Slow waves
+
+*******************
+
+      rt_eigenvec1 ( i, 1, 3) = alpha_s ( i) * rhobar ( i)
+      rt_eigenvec1 ( i, 1, 5) = rt_eigenvec1 ( i, 1, 3)
+
+      rt_eigenvec1 ( i, 2, 3) = - alpha_s ( i) * v_s ( i)
+      rt_eigenvec1 ( i, 2, 5) = - rt_eigenvec1 ( i, 2, 3)
+
+      rt_eigenvec1 ( i, 3, 3) = - alpha_f ( i) * v_f ( i)
+     1                        * beta_y ( i) * sgnbx ( i)
+      rt_eigenvec1 ( i, 3, 5) = - rt_eigenvec1 ( i, 3, 3)
+
+      rt_eigenvec1 ( i, 4, 3) = - alpha_f ( i) * v_f ( i)
+     1                        * beta_z ( i) * sgnbx ( i)
+      rt_eigenvec1 ( i, 4, 5) = - rt_eigenvec1 ( i, 4, 3)
+
+      rt_eigenvec1 ( i, 5, 3) = alpha_s ( i) * rhobar ( i)
+     1                        * ( c_s ( i)**2 - xbar ( i))
+      rt_eigenvec1 ( i, 5, 5) = rt_eigenvec1 ( i, 5, 3)
+
+      rt_eigenvec1 ( i, 6, 3) = - alpha_f ( i) * sq_4pi_rho ( i)
+     1                        * c_s ( i) * beta_y ( i)
+      rt_eigenvec1 ( i, 6, 5) = rt_eigenvec1 ( i, 6, 3)
+
+      rt_eigenvec1 ( i, 7, 3) = - alpha_f ( i) * sq_4pi_rho ( i)
+     1                        * c_s ( i) * beta_z ( i)
+      rt_eigenvec1 ( i, 7, 5) = rt_eigenvec1 ( i, 7, 3)
+
+*******************
+
+      temparr_01 ( i) = 0.5 / c_s ( i)**2
+
+      lf_eigenvec1 ( i, 3, 1) = alpha_s ( i) * xbar ( i)
+     1                        * temparr_01 ( i) / rhobar ( i)
+      lf_eigenvec1 ( i, 5, 1) = lf_eigenvec1 ( i, 3, 1)
+
+      lf_eigenvec1 ( i, 3, 2) = temparr_01 ( i)
+     1                        * rt_eigenvec1 ( i, 2, 3)
+      lf_eigenvec1 ( i, 5, 2) = - lf_eigenvec1 ( i, 3, 2)
+
+      lf_eigenvec1 ( i, 3, 3) = temparr_01 ( i)
+     1                        * rt_eigenvec1 ( i, 3, 3)
+      lf_eigenvec1 ( i, 5, 3) = - lf_eigenvec1 ( i, 3, 3)
+
+      lf_eigenvec1 ( i, 3, 4) = temparr_01 ( i)
+     1                        * rt_eigenvec1 ( i, 4, 3)
+      lf_eigenvec1 ( i, 5, 4) = - lf_eigenvec1 ( i, 3, 4)
+
+      lf_eigenvec1 ( i, 3, 5) = temparr_01 ( i)
+     1                        * alpha_s ( i) / rhobar ( i)
+      lf_eigenvec1 ( i, 5, 5) = lf_eigenvec1 ( i, 3, 5)
+
+      lf_eigenvec1 ( i, 3, 6) = temparr_01 ( i)
+     1                        * rt_eigenvec1 ( i, 6, 3)
+     1                        * one_by_4pi_rho ( i)
+      lf_eigenvec1 ( i, 5, 6) = lf_eigenvec1 ( i, 3, 6)
+
+      lf_eigenvec1 ( i, 3, 7) = temparr_01 ( i)
+     1                        * rt_eigenvec1 ( i, 7, 3)
+     1                        * one_by_4pi_rho ( i)
+      lf_eigenvec1 ( i, 5, 7) = lf_eigenvec1 ( i, 3, 7)
+
+
+*******************
+
+      END DO
+
+*******************
+
+* For the multiple species, fix up the eigenvectors that carry the
+* contributions from the species fractions. The zero components of
+* the eigenvectors have already been previously assigned.
+
+#if ( NFLUID >= 1)
+
+      DO j = NFIELD + 1, NFIELD + NFLUID
+
+      DO i = nriembegin, nriemend
+
+      rt_eigenvec1 ( i, j, j) = 1.0
+      lf_eigenvec1 ( i, j, j) = 1.0
+
+      END DO
+
+      END DO
+
+#endif
+
+*******************************************************************
+
+* At this point the eigenvectors in the primitive variables are made
+* and if only that much is desired, we can return at this point.
+
+      IF ( iprimitive .EQ. 1) THEN
+
+      DO j = 1, NFIELD + NFLUID
+      DO k = 1, NFIELD + NFLUID
+      DO i = nriembegin, nriemend
+      rt_eigenvec ( i, j, k) = rt_eigenvec1 ( i, j, k)
+      lf_eigenvec ( i, j, k) = lf_eigenvec1 ( i, j, k)
+      END DO
+      END DO
+      END DO
+
+      RETURN
+
+      END IF
+
+******************************************************************
+
+      IF ( iprimitive .EQ. 0) THEN
+
+******************************************************************
+
+* Make transformation matrices to the conserved variables. First for
+* the right eigenvectors. Don't make those matrix elements that are zero.
+
+      DO i = nriembegin, nriemend
+
+
+      dudw ( i, 1, 1) = 1.0
+*      dudw ( i, 1, 2) = 0.0
+*      dudw ( i, 1, 3) = 0.0
+*      dudw ( i, 1, 4) = 0.0
+*      dudw ( i, 1, 5) = 0.0
+*      dudw ( i, 1, 6) = 0.0
+*      dudw ( i, 1, 7) = 0.0
+
+
+      dudw ( i, 2, 1) = vlxbar ( i)
+      dudw ( i, 2, 2) = rhobar ( i)
+*      dudw ( i, 2, 3) = 0.0
+*      dudw ( i, 2, 4) = 0.0
+*      dudw ( i, 2, 5) = 0.0
+*      dudw ( i, 2, 6) = 0.0
+*      dudw ( i, 2, 7) = 0.0
+
+
+      dudw ( i, 3, 1) = vlybar ( i)
+*      dudw ( i, 3, 2) = 0.0
+      dudw ( i, 3, 3) = rhobar ( i)
+*      dudw ( i, 3, 4) = 0.0
+*      dudw ( i, 3, 5) = 0.0
+*      dudw ( i, 3, 6) = 0.0
+*      dudw ( i, 3, 7) = 0.0
+
+
+      dudw ( i, 4, 1) = vlzbar ( i)
+*      dudw ( i, 4, 2) = 0.0
+*      dudw ( i, 4, 3) = 0.0
+      dudw ( i, 4, 4) = rhobar ( i)
+*      dudw ( i, 4, 5) = 0.0
+*      dudw ( i, 4, 6) = 0.0
+*      dudw ( i, 4, 7) = 0.0
+
+
+      dudw ( i, 5, 1) = 0.5 * ( vlxbar ( i)**2
+     1                        + vlybar ( i)**2 + vlzbar ( i)**2)
+     1                + xbar ( i) + deng_drho ( i)
+      dudw ( i, 5, 2) = rhobar ( i) * vlxbar ( i)
+      dudw ( i, 5, 3) = rhobar ( i) * vlybar ( i)
+      dudw ( i, 5, 4) = rhobar ( i) * vlzbar ( i)
+      dudw ( i, 5, 5) = deng_dprs ( i)
+      dudw ( i, 5, 6) = bfybar ( i) / fourpi
+      dudw ( i, 5, 7) = bfzbar ( i) / fourpi
+
+
+*      dudw ( i, 6, 1) = 0.0
+*      dudw ( i, 6, 2) = 0.0
+*      dudw ( i, 6, 3) = 0.0
+*      dudw ( i, 6, 4) = 0.0
+*      dudw ( i, 6, 5) = 0.0
+      dudw ( i, 6, 6) = 1.0
+*      dudw ( i, 6, 7) = 0.0
+
+
+*      dudw ( i, 7, 1) = 0.0
+*      dudw ( i, 7, 2) = 0.0
+*      dudw ( i, 7, 3) = 0.0
+*      dudw ( i, 7, 4) = 0.0
+*      dudw ( i, 7, 5) = 0.0
+*      dudw ( i, 7, 6) = 0.0
+      dudw ( i, 7, 7) = 1.0
+
+
+      END DO
+
+******************************************************************
+
+* Make transformation matrices to the conserved variables. Then for
+* the left eigenvectors. Don't make those matrix elements that are zero.
+
+      DO i = nriembegin, nriemend
+
+      temparr_01 ( i) = 1.0 / rhobar ( i)
+
+
+      dwdu ( i, 1, 1) = 1.0
+      dwdu ( i, 2, 1) = - temparr_01 ( i) * vlxbar ( i)
+      dwdu ( i, 3, 1) = - temparr_01 ( i) * vlybar ( i)
+      dwdu ( i, 4, 1) = - temparr_01 ( i) * vlzbar ( i)
+      dwdu ( i, 5, 1) = dprs_drho ( i) + dprs_deng ( i)
+     1                * ( 0.5 * ( vlxbar ( i)**2 + vlybar ( i)**2
+     1                          + vlzbar ( i)**2) - xbar ( i) )
+*      dwdu ( i, 6, 1) = 0.0
+*      dwdu ( i, 7, 1) = 0.0
+
+
+*      dwdu ( i, 1, 2) = 0.0
+      dwdu ( i, 2, 2) = temparr_01 ( i)
+*      dwdu ( i, 3, 2) = 0.0
+*      dwdu ( i, 4, 2) = 0.0
+      dwdu ( i, 5, 2) = - dprs_deng ( i) * vlxbar ( i)
+*      dwdu ( i, 6, 2) = 0.0
+*      dwdu ( i, 7, 2) = 0.0
+
+
+*      dwdu ( i, 1, 3) = 0.0
+*      dwdu ( i, 2, 3) = 0.0
+      dwdu ( i, 3, 3) = temparr_01 ( i)
+*      dwdu ( i, 4, 3) = 0.0
+      dwdu ( i, 5, 3) = - dprs_deng ( i) * vlybar ( i)
+*      dwdu ( i, 6, 3) = 0.0
+*      dwdu ( i, 7, 3) = 0.0
+
+
+*      dwdu ( i, 1, 4) = 0.0
+*      dwdu ( i, 2, 4) = 0.0
+*      dwdu ( i, 3, 4) = 0.0
+      dwdu ( i, 4, 4) = temparr_01 ( i)
+      dwdu ( i, 5, 4) = - dprs_deng ( i) * vlzbar ( i)
+*      dwdu ( i, 6, 4) = 0.0
+*      dwdu ( i, 7, 4) = 0.0
+
+
+*      dwdu ( i, 1, 5) = 0.0
+*      dwdu ( i, 2, 5) = 0.0
+*      dwdu ( i, 3, 5) = 0.0
+*      dwdu ( i, 4, 5) = 0.0
+      dwdu ( i, 5, 5) = dprs_deng ( i)
+*      dwdu ( i, 6, 5) = 0.0
+*      dwdu ( i, 7, 5) = 0.0
+
+
+*      dwdu ( i, 1, 6) = 0.0
+*      dwdu ( i, 2, 6) = 0.0
+*      dwdu ( i, 3, 6) = 0.0
+*      dwdu ( i, 4, 6) = 0.0
+      dwdu ( i, 5, 6) = - dprs_deng ( i) * bfybar ( i)
+     1                / fourpi
+      dwdu ( i, 6, 6) = 1.0
+*      dwdu ( i, 7, 6) = 0.0
+
+
+*      dwdu ( i, 1, 7) = 0.0
+*      dwdu ( i, 2, 7) = 0.0
+*      dwdu ( i, 3, 7) = 0.0
+*      dwdu ( i, 4, 7) = 0.0
+      dwdu ( i, 5, 7) = - dprs_deng ( i) * bfzbar ( i)
+     1                / fourpi
+*      dwdu ( i, 6, 7) = 0.0
+      dwdu ( i, 7, 7) = 1.0
+
+
+      END DO
+
+******************************************************************
+
+* Do the matrix multiplications. Then save the eigenvalues. This
+* gives eigenvectors in the conserved variables.
+* Don't multiply those matrix elements that are zero.
+
+
+      DO k = 1, NFIELD
+
+      DO i = nriembegin, nriemend
+
+
+      rt_eigenvec ( i, 1, k) =
+     1     dudw ( i, 1, 1) * rt_eigenvec1 ( i, 1, k)
+
+      rt_eigenvec ( i, 2, k) =
+     1     dudw ( i, 2, 1) * rt_eigenvec1 ( i, 1, k)
+     1   + dudw ( i, 2, 2) * rt_eigenvec1 ( i, 2, k)
+
+      rt_eigenvec ( i, 3, k) =
+     1     dudw ( i, 3, 1) * rt_eigenvec1 ( i, 1, k)
+     1   + dudw ( i, 3, 3) * rt_eigenvec1 ( i, 3, k)
+
+      rt_eigenvec ( i, 4, k) =
+     1     dudw ( i, 4, 1) * rt_eigenvec1 ( i, 1, k)
+     1   + dudw ( i, 4, 4) * rt_eigenvec1 ( i, 4, k)
+
+      rt_eigenvec ( i, 5, k) =
+     1     dudw ( i, 5, 1) * rt_eigenvec1 ( i, 1, k)
+     1   + dudw ( i, 5, 2) * rt_eigenvec1 ( i, 2, k)
+     1   + dudw ( i, 5, 3) * rt_eigenvec1 ( i, 3, k)
+     1   + dudw ( i, 5, 4) * rt_eigenvec1 ( i, 4, k)
+     1   + dudw ( i, 5, 5) * rt_eigenvec1 ( i, 5, k)
+     1   + dudw ( i, 5, 6) * rt_eigenvec1 ( i, 6, k)
+     1   + dudw ( i, 5, 7) * rt_eigenvec1 ( i, 7, k)
+
+      rt_eigenvec ( i, 6, k) =
+     1     dudw ( i, 6, 6) * rt_eigenvec1 ( i, 6, k)
+
+      rt_eigenvec ( i, 7, k) =
+     1     dudw ( i, 7, 7) * rt_eigenvec1 ( i, 7, k)
+
+
+      lf_eigenvec ( i, k, 1) =
+     1     lf_eigenvec1 ( i, k, 1) * dwdu ( i, 1, 1)
+     1   + lf_eigenvec1 ( i, k, 2) * dwdu ( i, 2, 1)
+     1   + lf_eigenvec1 ( i, k, 3) * dwdu ( i, 3, 1)
+     1   + lf_eigenvec1 ( i, k, 4) * dwdu ( i, 4, 1)
+     1   + lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 1)
+
+      lf_eigenvec ( i, k, 2) =
+     1     lf_eigenvec1 ( i, k, 2) * dwdu ( i, 2, 2)
+     1   + lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 2)
+
+      lf_eigenvec ( i, k, 3) =
+     1     lf_eigenvec1 ( i, k, 3) * dwdu ( i, 3, 3)
+     1   + lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 3)
+
+      lf_eigenvec ( i, k, 4) =
+     1     lf_eigenvec1 ( i, k, 4) * dwdu ( i, 4, 4)
+     1   + lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 4)
+
+      lf_eigenvec ( i, k, 5) =
+     1     lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 5)
+
+      lf_eigenvec ( i, k, 6) =
+     1     lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 6)
+     1   + lf_eigenvec1 ( i, k, 6) * dwdu ( i, 6, 6)
+
+      lf_eigenvec ( i, k, 7) =
+     1     lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 7)
+     1   + lf_eigenvec1 ( i, k, 7) * dwdu ( i, 7, 7)
+
+
+      END DO
+
+      END DO
+
+* At this point the eigenvectors in the conserved variables are made
+* for a single species gas.
+
+*******************
+
+* For the situation where multiple species are present, fix up the
+* eigenvectors. This consists of putting in the additional terms in
+* the already existing seven MHD eigenvectors. Furthermore, it also
+* consists of constructing the remaining eigenvectors that carry the
+* species contributions.
+
+#if ( NFLUID >= 1)
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+* Extra parts of the first seven right eigenvectors for MHD.
+      rt_eigenvec ( i, k, 1) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 1)
+      rt_eigenvec ( i, k, 2) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 2)
+      rt_eigenvec ( i, k, 3) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 3)
+      rt_eigenvec ( i, k, 4) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 4)
+      rt_eigenvec ( i, k, 5) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 5)
+      rt_eigenvec ( i, k, 6) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 6)
+      rt_eigenvec ( i, k, 7) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 7)
+
+* Do the entire right eigenvectors for each of the species.
+      rt_eigenvec ( i, 1:4, k) = 0.0
+      rt_eigenvec ( i, 5, k) = deng_dspecie ( ifluid, i)
+      rt_eigenvec ( i, 6:k-1, k) = 0.0
+      rt_eigenvec ( i, k, k) = rhobar ( i)
+      IF ( k + 1 .LE. NFIELD + NFLUID) THEN
+      rt_eigenvec ( i, k+1:NFIELD + NFLUID, k) = 0.0
+      END IF
+
+* Extra parts of the first seven left eigenvectors for MHD.
+      lf_eigenvec ( i, 1, k) = lf_eigenvec1 ( i, 1, 5)
+     1                       * dprs_dspecie ( ifluid, i)
+      lf_eigenvec ( i, 2, k) = lf_eigenvec1 ( i, 2, 5) 
+     1                       * dprs_dspecie ( ifluid, i)
+      lf_eigenvec ( i, 3, k) = lf_eigenvec1 ( i, 3, 5)
+     1                       * dprs_dspecie ( ifluid, i)
+      lf_eigenvec ( i, 4, k) = lf_eigenvec1 ( i, 4, 5)
+     1                       * dprs_dspecie ( ifluid, i)
+      lf_eigenvec ( i, 5, k) = lf_eigenvec1 ( i, 5, 5)
+     1                       * dprs_dspecie ( ifluid, i)
+      lf_eigenvec ( i, 6, k) = lf_eigenvec1 ( i, 6, 5)
+     1                       * dprs_dspecie ( ifluid, i)
+      lf_eigenvec ( i, 7, k) = lf_eigenvec1 ( i, 7, 5)
+     1                       * dprs_dspecie ( ifluid, i)
+
+* Do the entire left eigenvectors for each of the species.
+      lf_eigenvec ( i, k, 1) = - speciebar ( ifluid, i)
+     1                       / rhobar ( i)
+      lf_eigenvec ( i, k, 2:k-1) = 0.0
+      lf_eigenvec ( i, k, k) = 1.0 / rhobar ( i)
+      IF ( k + 1 .LE. NFIELD + NFLUID) THEN
+      lf_eigenvec ( i, k, k+1:NFIELD + NFLUID) = 0.0
+      END IF
+
+      END DO
+
+      END DO
+
+#endif
+
+******************************************************************
+
+      END IF
+
+******************************************************************
+
+      IF ( iprimitive .EQ. -1) THEN
+
+******************************************************************
+
+* Make transformation matrices to the fake "conserved" variables. These
+* are the variables for maintaining pressure positivity. First for
+* the right eigenvectors. Don't make those matrix elements that are zero.
+
+* Even when multiple species are used, these eigenvectors are based
+* on a "frozen local gamma approximation". Thus, the ratio of specific
+* heats, gamma, can vary from zone to zone but is assumed constant within
+* each zone. This is justified because gamma is a very slowly varying
+* function of the species fractions so it is ok to think of it as being
+* (almost) exactly a constant.
+
+      DO i = nriembegin, nriemend
+
+      temparr_01 ( i) = 1.0 / rhobar ( i)
+      temparr_02 ( i) = gamma_soundspeed ( i) - 1.0
+      temparr_03 ( i) = rhobar ( i)**temparr_02 ( i)
+
+      dudw ( i, 1, 1) = 1.0
+*      dudw ( i, 1, 2) = 0.0
+*      dudw ( i, 1, 3) = 0.0
+*      dudw ( i, 1, 4) = 0.0
+*      dudw ( i, 1, 5) = 0.0
+*      dudw ( i, 1, 6) = 0.0
+*      dudw ( i, 1, 7) = 0.0
+
+
+      dudw ( i, 2, 1) = vlxbar ( i)
+      dudw ( i, 2, 2) = rhobar ( i)
+*      dudw ( i, 2, 3) = 0.0
+*      dudw ( i, 2, 4) = 0.0
+*      dudw ( i, 2, 5) = 0.0
+*      dudw ( i, 2, 6) = 0.0
+*      dudw ( i, 2, 7) = 0.0
+
+
+      dudw ( i, 3, 1) = vlybar ( i)
+*      dudw ( i, 3, 2) = 0.0
+      dudw ( i, 3, 3) = rhobar ( i)
+*      dudw ( i, 3, 4) = 0.0
+*      dudw ( i, 3, 5) = 0.0
+*      dudw ( i, 3, 6) = 0.0
+*      dudw ( i, 3, 7) = 0.0
+
+
+      dudw ( i, 4, 1) = vlzbar ( i)
+*      dudw ( i, 4, 2) = 0.0
+*      dudw ( i, 4, 3) = 0.0
+      dudw ( i, 4, 4) = rhobar ( i)
+*      dudw ( i, 4, 5) = 0.0
+*      dudw ( i, 4, 6) = 0.0
+*      dudw ( i, 4, 7) = 0.0
+
+
+      dudw ( i, 5, 1) = - temparr_02 ( i) * prsbar ( i)
+     1                * temparr_01 ( i) / temparr_03 ( i)
+      dudw ( i, 5, 2) = 0.0
+      dudw ( i, 5, 3) = 0.0
+      dudw ( i, 5, 4) = 0.0
+      dudw ( i, 5, 5) = 1.0 / temparr_03 ( i)
+      dudw ( i, 5, 6) = 0.0
+      dudw ( i, 5, 7) = 0.0
+
+
+*      dudw ( i, 6, 1) = 0.0
+*      dudw ( i, 6, 2) = 0.0
+*      dudw ( i, 6, 3) = 0.0
+*      dudw ( i, 6, 4) = 0.0
+*      dudw ( i, 6, 5) = 0.0
+      dudw ( i, 6, 6) = 1.0
+*      dudw ( i, 6, 7) = 0.0
+
+
+*      dudw ( i, 7, 1) = 0.0
+*      dudw ( i, 7, 2) = 0.0
+*      dudw ( i, 7, 3) = 0.0
+*      dudw ( i, 7, 4) = 0.0
+*      dudw ( i, 7, 5) = 0.0
+*      dudw ( i, 7, 6) = 0.0
+      dudw ( i, 7, 7) = 1.0
+
+
+      END DO
+
+******************************************************************
+
+* Make transformation matrices to the fake "conserved" variables. These
+* are the variables for maintaining pressure positivity. Then for
+* the left eigenvectors. Don't make those matrix elements that are zero.
+
+      DO i = nriembegin, nriemend
+
+      temparr_01 ( i) = 1.0 / rhobar ( i)
+      temparr_02 ( i) = gamma_soundspeed ( i) - 1.0
+      temparr_03 ( i) = rhobar ( i)**temparr_02 ( i)
+
+
+      dwdu ( i, 1, 1) = 1.0
+      dwdu ( i, 2, 1) = - temparr_01 ( i) * vlxbar ( i)
+      dwdu ( i, 3, 1) = - temparr_01 ( i) * vlybar ( i)
+      dwdu ( i, 4, 1) = - temparr_01 ( i) * vlzbar ( i)
+      dwdu ( i, 5, 1) = temparr_02 ( i) * prsbar ( i)
+     1                / rhobar ( i)
+*      dwdu ( i, 6, 1) = 0.0
+*      dwdu ( i, 7, 1) = 0.0
+
+
+*      dwdu ( i, 1, 2) = 0.0
+      dwdu ( i, 2, 2) = temparr_01 ( i)
+*      dwdu ( i, 3, 2) = 0.0
+*      dwdu ( i, 4, 2) = 0.0
+      dwdu ( i, 5, 2) = 0.0
+*      dwdu ( i, 6, 2) = 0.0
+*      dwdu ( i, 7, 2) = 0.0
+
+
+*      dwdu ( i, 1, 3) = 0.0
+*      dwdu ( i, 2, 3) = 0.0
+      dwdu ( i, 3, 3) = temparr_01 ( i)
+*      dwdu ( i, 4, 3) = 0.0
+      dwdu ( i, 5, 3) = 0.0
+*      dwdu ( i, 6, 3) = 0.0
+*      dwdu ( i, 7, 3) = 0.0
+
+
+*      dwdu ( i, 1, 4) = 0.0
+*      dwdu ( i, 2, 4) = 0.0
+*      dwdu ( i, 3, 4) = 0.0
+      dwdu ( i, 4, 4) = temparr_01 ( i)
+      dwdu ( i, 5, 4) = 0.0
+*      dwdu ( i, 6, 4) = 0.0
+*      dwdu ( i, 7, 4) = 0.0
+
+
+*      dwdu ( i, 1, 5) = 0.0
+*      dwdu ( i, 2, 5) = 0.0
+*      dwdu ( i, 3, 5) = 0.0
+*      dwdu ( i, 4, 5) = 0.0
+      dwdu ( i, 5, 5) = temparr_03 ( i)
+*      dwdu ( i, 6, 5) = 0.0
+*      dwdu ( i, 7, 5) = 0.0
+
+
+*      dwdu ( i, 1, 6) = 0.0
+*      dwdu ( i, 2, 6) = 0.0
+*      dwdu ( i, 3, 6) = 0.0
+*      dwdu ( i, 4, 6) = 0.0
+      dwdu ( i, 5, 6) = 0.0
+      dwdu ( i, 6, 6) = 1.0
+*      dwdu ( i, 7, 6) = 0.0
+
+
+*      dwdu ( i, 1, 7) = 0.0
+*      dwdu ( i, 2, 7) = 0.0
+*      dwdu ( i, 3, 7) = 0.0
+*      dwdu ( i, 4, 7) = 0.0
+      dwdu ( i, 5, 7) = 0.0
+*      dwdu ( i, 6, 7) = 0.0
+      dwdu ( i, 7, 7) = 1.0
+
+
+      END DO
+
+******************************************************************
+
+* Do the matrix multiplications. Then save the eigenvalues. This
+* gives eigenvectors in the fake "conserved" variables. These
+* are needed to maintain the pressure positivity.
+* Don't multiply those matrix elements that are zero.
+
+
+      DO k = 1, NFIELD
+
+      DO i = nriembegin, nriemend
+
+
+      rt_eigenvec ( i, 1, k) =
+     1     dudw ( i, 1, 1) * rt_eigenvec1 ( i, 1, k)
+
+      rt_eigenvec ( i, 2, k) =
+     1     dudw ( i, 2, 1) * rt_eigenvec1 ( i, 1, k)
+     1   + dudw ( i, 2, 2) * rt_eigenvec1 ( i, 2, k)
+
+      rt_eigenvec ( i, 3, k) =
+     1     dudw ( i, 3, 1) * rt_eigenvec1 ( i, 1, k)
+     1   + dudw ( i, 3, 3) * rt_eigenvec1 ( i, 3, k)
+
+      rt_eigenvec ( i, 4, k) =
+     1     dudw ( i, 4, 1) * rt_eigenvec1 ( i, 1, k)
+     1   + dudw ( i, 4, 4) * rt_eigenvec1 ( i, 4, k)
+
+      rt_eigenvec ( i, 5, k) =
+     1     dudw ( i, 5, 1) * rt_eigenvec1 ( i, 1, k)
+     1   + dudw ( i, 5, 2) * rt_eigenvec1 ( i, 2, k)
+     1   + dudw ( i, 5, 3) * rt_eigenvec1 ( i, 3, k)
+     1   + dudw ( i, 5, 4) * rt_eigenvec1 ( i, 4, k)
+     1   + dudw ( i, 5, 5) * rt_eigenvec1 ( i, 5, k)
+     1   + dudw ( i, 5, 6) * rt_eigenvec1 ( i, 6, k)
+     1   + dudw ( i, 5, 7) * rt_eigenvec1 ( i, 7, k)
+
+      rt_eigenvec ( i, 6, k) =
+     1     dudw ( i, 6, 6) * rt_eigenvec1 ( i, 6, k)
+
+      rt_eigenvec ( i, 7, k) =
+     1     dudw ( i, 7, 7) * rt_eigenvec1 ( i, 7, k)
+
+
+      lf_eigenvec ( i, k, 1) =
+     1     lf_eigenvec1 ( i, k, 1) * dwdu ( i, 1, 1)
+     1   + lf_eigenvec1 ( i, k, 2) * dwdu ( i, 2, 1)
+     1   + lf_eigenvec1 ( i, k, 3) * dwdu ( i, 3, 1)
+     1   + lf_eigenvec1 ( i, k, 4) * dwdu ( i, 4, 1)
+     1   + lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 1)
+
+      lf_eigenvec ( i, k, 2) =
+     1     lf_eigenvec1 ( i, k, 2) * dwdu ( i, 2, 2)
+     1   + lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 2)
+
+      lf_eigenvec ( i, k, 3) =
+     1     lf_eigenvec1 ( i, k, 3) * dwdu ( i, 3, 3)
+     1   + lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 3)
+
+      lf_eigenvec ( i, k, 4) =
+     1     lf_eigenvec1 ( i, k, 4) * dwdu ( i, 4, 4)
+     1   + lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 4)
+
+      lf_eigenvec ( i, k, 5) =
+     1     lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 5)
+
+      lf_eigenvec ( i, k, 6) =
+     1     lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 6)
+     1   + lf_eigenvec1 ( i, k, 6) * dwdu ( i, 6, 6)
+
+      lf_eigenvec ( i, k, 7) =
+     1     lf_eigenvec1 ( i, k, 5) * dwdu ( i, 5, 7)
+     1   + lf_eigenvec1 ( i, k, 7) * dwdu ( i, 7, 7)
+
+
+      END DO
+
+      END DO
+
+* At this point the eigenvectors in the fake "conserved" variables are made
+* for a single species gas.
+
+*******************
+
+* For the situation where multiple species are present, fix up the
+* eigenvectors. This consists of putting in the additional terms in
+* the already existing seven MHD eigenvectors. Furthermore, it also
+* consists of constructing the remaining eigenvectors that carry the
+* species contributions.
+
+#if ( NFLUID >= 1)
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+* Extra parts of the first seven right eigenvectors for MHD.
+      rt_eigenvec ( i, k, 1) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 1)
+      rt_eigenvec ( i, k, 2) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 2)
+      rt_eigenvec ( i, k, 3) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 3)
+      rt_eigenvec ( i, k, 4) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 4)
+      rt_eigenvec ( i, k, 5) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 5)
+      rt_eigenvec ( i, k, 6) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 6)
+      rt_eigenvec ( i, k, 7) =
+     1     speciebar ( ifluid, i) * rt_eigenvec1 ( i, 1, 7)
+
+* Do the entire right eigenvectors for each of the species.
+      rt_eigenvec ( i, 1:k-1, k) = 0.0
+      rt_eigenvec ( i, k, k) = rhobar ( i)
+      IF ( k + 1 .LE. NFIELD + NFLUID) THEN
+      rt_eigenvec ( i, k+1:NFIELD + NFLUID, k) = 0.0
+      END IF
+
+* Do the entire left eigenvectors for each of the species.
+      lf_eigenvec ( i, k, 1) = - speciebar ( ifluid, i)
+     1                       / rhobar ( i)
+      lf_eigenvec ( i, k, 2:k-1) = 0.0
+      lf_eigenvec ( i, k, k) = 1.0 / rhobar ( i)
+      IF ( k + 1 .LE. NFIELD + NFLUID) THEN
+      lf_eigenvec ( i, k, k+1:NFIELD + NFLUID) = 0.0
+      END IF
+
+      END DO
+
+      END DO
+
+#endif
+
+******************************************************************
+
+      END IF
+
+******************************************************************
+******************************************************************
+
+      RETURN
+
+      END SUBROUTINE EIGENVECMHD
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+! We have the option of minimizing the number of EOS calls
+! (which can be quite expensive) by setting "use_approx_eos = 1".
+! This can be a risky step if "gamma_eos" is rapidly varying.
+
+      SUBROUTINE MHD_RIEM_ROE
+
+     1   ( nriembegin, nriemend,
+
+     1     double_dissipate_efz, double_dissipate_efy,
+
+     1     gamma, smallnum, prsfloor, rhofloor, pi, fracdiff,
+     1     ientropyfix, iprimitive, use_approx_eos,
+     1     split_prsflux_re, divratio_einfeldt_rs, debug_stop,
+
+     1     gasconst,
+     1     cp_specie, molewt_specie, heat_of_formation,
+
+     1        rhoremi, rhorepl,
+     1        prsremi, prsrepl,
+     1        vlxremi, vlxrepl,
+     1        vlyremi, vlyrepl,
+     1        vlzremi, vlzrepl,
+     1        bfxre,
+     1        bfyremi, bfyrepl,
+     1        bfzremi, bfzrepl,
+     1        specieremi, specierepl,
+
+     1        gamma_eos_remi, gamma_eos_repl,
+     1        gamma_soundspeed_remi, gamma_soundspeed_repl,
+     1        mean_mol_wt_remi, mean_mol_wt_repl,
+
+     1        msonic_arr, divvel_arr,
+
+     1        zonebdy_conserved, zonebdy_flux,
+
+     1     eigenval_re, lf_eigenvec_re, rt_eigenvec_re, eigenwt_re,
+     1     conserved_re, flux_re, entropy_flux_re,
+
+     1     rho0, prs0, vlx0, vly0, vlz0, bfy0, bfz0, specie0,
+     1     do_ein )
+
+! ----------------------------------------------------------------------
+
+* Written by : Dinshaw S. Balsara
+
+* Does the riemann solver based on Balsara's modification of the Roe-type
+* riemann solver. See Balsara, Astrophysical J. Supp., vol. 132, pg. 1, (2001)
+
+* The x-momentum flux_re is split into an advected part and a ( thermal +
+* magnetic) pressure part.
+
+* ientropyfix = 1 will give the maximal dissipation by using the LLF flux
+* even for characteristic fields that go into eachother.
+
+* ientropyfix = 2 will provide an entropy fix when characteristic fields are
+* going apart but not when they are going into eachother.
+
+* ientropyfix = 3 will provide the basic Harten and Hyman entropy fix.
+
+* ientropyfix = 4 will provide the basic Harten and Hyman entropy fix
+* using the states on either side of a single wave. This is truer to the
+* original Harten and Hyman entropy fix.
+
+* In those zone boundaries where the pressure is negative, an Einfeld
+* or LLF flux is used. A few lines at the beginning of the last
+* loop turn this into an LLF flux. Since that is more stable, we keep
+* those lines uncommented so that the default flux is the LLF flux.
+
+* While the Roe type riemann solver is little more accurate than the
+* HLL solver, it can become very expensive when several species
+* are involved.
+
+* An HLL-based entropy flux is also always calculated and passed through
+* the subroutine interface. This ensures that we are ALWAYS able to
+* enforce pressure positivity at no extra computational cost.
+
+*******************************************************************
+
+      IMPLICIT NONE
+
+      EXTERNAL EIGENVECMHD
+
+*******************************************************************
+
+      INTEGER :: nriembegin, nriemend, 
+     1        double_dissipate_efz, double_dissipate_efy,
+     1        ientropyfix, iprimitive, use_approx_eos,
+     1        split_prsflux_re
+
+      INTEGER :: debug_stop
+
+      REAL :: gamma, smallnum, prsfloor, rhofloor, 
+     1     pi, fracdiff, gasconst, divratio_einfeldt_rs
+
+      REAL, DIMENSION ( 0 : NFLUID) ::
+     1      cp_specie, molewt_specie, heat_of_formation
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     rhoremi, rhorepl, prsremi, prsrepl,
+
+     1     vlxremi, vlxrepl, vlyremi, vlyrepl,
+     1     vlzremi, vlzrepl,
+
+     1     bfxre, bfyremi, bfyrepl, bfzremi, bfzrepl,
+
+     1     mean_mol_wt_remi, gamma_eos_remi, gamma_soundspeed_remi,
+     1     mean_mol_wt_repl, gamma_eos_repl, gamma_soundspeed_repl,
+
+     1     msonic_arr, divvel_arr
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     specieremi, specierepl
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1      NFIELD + NFLUID, NFIELD + NFLUID) ::
+     1    lf_eigenvec_re, rt_eigenvec_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1      NFIELD + NFLUID) ::
+     1     eigenval_re, eigenwt_re, conserved_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                 NFIELD + NFLUID + 1) ::
+     1     flux_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  0 : 1, NFIELD + NFLUID) ::
+     1      zonebdy_flux, zonebdy_conserved
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     rho0, prs0, vlx0, vly0, vlz0, bfy0, bfz0,
+     1     entropy_flux_re
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1      specie0
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) :: do_ein
+
+************************************************************************
+************************************************************************
+
+* Past this point we only declare variables that are internal to the
+* subroutine.
+
+      INTEGER i, ii, j, k, ifield, ifluid, num_ein
+
+      REAL fourpi, one_by_fourpi, small_speed,
+     1     rhofloor_plus_delta, prsfloor_plus_delta
+
+* Variables used for enoized riemann solver.
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1      iwave_1, iwave_2, make_2, make_entropyfix
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                     NFIELD + NFLUID) ::
+
+     1        use_eigenvec, do_roe
+
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  NFIELD + NFLUID) ::
+
+     1      zonebdy_eigenval, eigenval_lf, eigenval_rt, del_cons
+
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  0 : 1, NFIELD + NFLUID) ::
+
+     1      eigenval_db
+
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1      NFIELD + NFLUID) ::
+
+     1      eigenwt_cons, eigenwt_flux,
+     1      eigenval_1, eigenval_2, conserved_2
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     momxremi, momxrepl, momyremi, momyrepl,
+     1     momzremi, momzrepl, engl, engr, eps_zone,
+
+     1     proj_flux_plus, proj_flux_minus,
+     1     proj_cons_plus, proj_cons_minus,
+
+     1     coef_flux_plus_f, coef_flux_plus_c,
+     1     coef_flux_minus_f, coef_flux_minus_c,
+
+     1     coef_cons_plus, coef_cons_minus, wavspd_1, wavspd_2,
+
+     1     temparr_01, temparr_02, temparr_03, ratio_ein
+
+
+******************************************************************
+******************************************************************
+
+* Variables used for Einfeldt fix.
+
+* "conserved_ein, flux_ein" contain the resolved fields and fluxes
+* on either side of the riemann problem.
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  NFIELD + NFLUID) ::
+
+     1     conserved_ein, flux_ein
+
+
+* These should be loaded with the min and max speeds from the roe solver.
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     wavespd_ein_l, wavespd_ein_r
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     eng, temperature,
+     1     mean_mol_wt, gamma_eos, gamma_soundspeed,
+     1     engremi, temperatureremi, total_enthalpy_remi,
+     1     engrepl, temperaturerepl, total_enthalpy_repl,
+     1     mean_mol_wt_re, gamma_eos_re, gamma_soundspeed_re,
+
+     1     entropy_ein_l, entropy_flux_ein_l,
+     1     entropy_ein_r, entropy_flux_ein_r
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1        indx_ein
+
+******************************************************************
+******************************************************************
+
+* Variables used for inlining EIGENVECMHD and EIGENVALMHD.
+
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     va_x, c_s, v_a, v_f, v_s, beta_y, beta_z,
+     1     alpha_f, alpha_s, sgnbx, sq_4pi_rho, va_perp,
+     1     one_by_4pi_rho,
+
+     1     rhobar, prsbar, vlxbar, vlybar, vlzbar, total_enthalpy_bar,
+     1     bfxbar, bfybar, bfzbar, xbar,
+
+     1     dprs_drho, dprs_deng, deng_drho, deng_dprs
+
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1      speciebar, dprs_dspecie, deng_dspecie
+
+* Temporary usage of left and right eigenvectors in the primitive variables.
+* Transformation matrices to go from conserved to primitive and back.
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  NFIELD + NFLUID, NFIELD + NFLUID) ::
+
+     1     lf_eigenvec1, rt_eigenvec1, dudw, dwdu
+
+! ----------------------------------------------------------------------
+
+* Make some settings.
+
+      fourpi = 4.0 * pi
+      one_by_fourpi = 1.0 / fourpi
+
+* Because floor values of density and pressure have already been taken,
+* we set a bottom value that is a little above that floor.
+
+      rhofloor_plus_delta = 1.000001 * rhofloor
+      prsfloor_plus_delta = 1.000001 * prsfloor
+
+
+      IF ( NFIELD .NE. 7) THEN
+      WRITE ( 6, *)"MHD_RIEM_ROE : NFIELD .NE. 7", NFIELD, 7
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( nriembegin .LT. ONEDFLUIDBEGIN) .OR.
+     1     ( nriembegin .GT. ONEDFLUIDEND) ) THEN
+      WRITE ( 6, *)"MHD_RIEM_ROE : nriembegin out of bounds",
+     1       nriembegin, ONEDFLUIDBEGIN, ONEDFLUIDEND
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( nriemend .LT. ONEDFLUIDBEGIN) .OR.
+     1     ( nriemend .GT. ONEDFLUIDEND) ) THEN
+      WRITE ( 6, *)"MHD_RIEM_ROE : nriemend out of bounds",
+     1       nriemend, ONEDFLUIDBEGIN, ONEDFLUIDEND
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( iprimitive .LT. -1) .OR.
+     1     ( iprimitive .GT. 0) ) THEN
+      WRITE ( 6, *)"MHD_RIEM_ROE : iprimitive out of bounds",
+     1  iprimitive
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( ientropyfix .LT. 1) .OR.
+     1     ( ientropyfix .GT. 4) ) THEN
+      WRITE ( 6, *)"MHD_RIEM_ROE : ientropyfix out of bounds",
+     1  ientropyfix
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( split_prsflux_re .LT. 0) .OR.
+     1     ( split_prsflux_re .GT. 1)) THEN
+      WRITE ( 6, *)"MHD_RIEM_ROE : split_prsflux_re ",
+     1             " out of bounds", split_prsflux_re
+      debug_stop = 1
+      RETURN
+      END IF
+
+******************************************************************
+******************************************************************
+
+* Bound the density and pressure variables.
+* For starters none of the zones need Einfeldt fix.
+* Also "rhobar 2" and "prsbar 2" may not be evaluated in all cases
+* later on so we give them a dummy initialization.
+
+      DO i = nriembegin, nriemend
+
+      do_ein ( i) = 0
+
+      rhoremi ( i) = AMAX1 ( rhoremi ( i), rhofloor)
+      rhorepl ( i) = AMAX1 ( rhorepl ( i), rhofloor)
+
+      prsremi ( i) = AMAX1 ( prsremi ( i), prsfloor)
+      prsrepl ( i) = AMAX1 ( prsrepl ( i), prsfloor)
+ 
+      END DO
+
+***********************
+
+* Evaluate the thermal energy density and the local gammas. In doing so, we
+* also make sure the species fractions are individually and cumulatively
+* within reasonable ranges. Do this only if exact EOS's are to be used.
+
+* Because this is a teaching code we will not be using exact EOS's here.
+
+* Relying on approximate EOS's here.
+
+      DO i = nriembegin, nriemend
+
+      engremi ( i) = prsremi ( i) / ( gamma_eos_remi ( i) - 1.0)
+      temperatureremi ( i) = prsremi ( i) * mean_mol_wt_remi ( i)
+     1                     / ( gasconst * rhoremi ( i))
+
+      engrepl ( i) = prsrepl ( i) / ( gamma_eos_repl ( i) - 1.0)
+      temperaturerepl ( i) = prsrepl ( i) * mean_mol_wt_repl ( i)
+     1                     / ( gasconst * rhorepl ( i))
+
+      END DO
+
+***************************
+
+* Make "total_enthalpy_remi" and "total_enthalpy_repl". These are
+* useful in making Roe-averages.
+
+      DO i = nriembegin, nriemend
+
+      total_enthalpy_remi ( i) = ( engremi ( i) + prsremi ( i)
+     1    + 0.5 * rhoremi ( i) * ( vlxremi ( i)**2 + vlyremi ( i)**2
+     1                           + vlzremi ( i)**2)
+     1    + one_by_fourpi * ( bfxre ( i)**2 + bfyremi ( i)**2
+     1                      + bfzremi ( i)**2 ) ) / rhoremi ( i)
+
+      total_enthalpy_repl ( i) = ( engrepl ( i) + prsrepl ( i)
+     1    + 0.5 * rhorepl ( i) * ( vlxrepl ( i)**2 + vlyrepl ( i)**2
+     1                           + vlzrepl ( i)**2)
+     1    + one_by_fourpi * ( bfxre ( i)**2 + bfyrepl ( i)**2
+     1                      + bfzrepl ( i)**2 ) ) / rhorepl ( i)
+
+      END DO
+
+******************************************************************
+******************************************************************
+
+! Build "zonebdy_conserved" and "zonebdy_flux".
+
+      DO i = nriembegin, nriemend
+
+
+      zonebdy_conserved ( i, 0, 1) = rhoremi ( i)
+      zonebdy_conserved ( i, 0, 2) = rhoremi ( i)
+     1                             * vlxremi ( i)
+      zonebdy_conserved ( i, 0, 3) = rhoremi ( i)
+     1                             * vlyremi ( i)
+      zonebdy_conserved ( i, 0, 4) = rhoremi ( i)
+     1                             * vlzremi ( i)
+      zonebdy_conserved ( i, 0, 6) = bfyremi ( i)
+      zonebdy_conserved ( i, 0, 7) = bfzremi ( i)
+
+
+      zonebdy_conserved ( i, 1, 1) = rhorepl ( i)
+      zonebdy_conserved ( i, 1, 2) = rhorepl ( i)
+     1                             * vlxrepl ( i)
+      zonebdy_conserved ( i, 1, 3) = rhorepl ( i)
+     1                             * vlyrepl ( i)
+      zonebdy_conserved ( i, 1, 4) = rhorepl ( i)
+     1                             * vlzrepl ( i)
+      zonebdy_conserved ( i, 1, 6) = bfyrepl ( i)
+      zonebdy_conserved ( i, 1, 7) = bfzrepl ( i)
+
+
+      zonebdy_flux ( i, 0, 1) = zonebdy_conserved ( i, 0, 2)
+      zonebdy_flux ( i, 0, 2) =
+     1     zonebdy_conserved ( i, 0, 2) * vlxremi ( i)
+     1   + prsremi ( i)
+     1   + 0.5 * ( - bfxre ( i)**2 + bfyremi ( i)**2
+     1                             + bfzremi ( i)**2) * one_by_fourpi
+      zonebdy_flux ( i, 0, 3) =
+     1     zonebdy_conserved ( i, 0, 3) * vlxremi ( i)
+     1                - bfxre ( i) * bfyremi ( i) * one_by_fourpi
+      zonebdy_flux ( i, 0, 4) =
+     1     zonebdy_conserved ( i, 0, 4) * vlxremi ( i)
+     1                - bfxre ( i) * bfzremi ( i) * one_by_fourpi
+      zonebdy_flux ( i, 0, 6) = bfyremi ( i) * vlxremi ( i)
+     1                        - bfxre ( i) * vlyremi ( i)
+      zonebdy_flux ( i, 0, 7) = bfzremi ( i) * vlxremi ( i)
+     1                        - bfxre ( i) * vlzremi ( i)
+
+
+      zonebdy_flux ( i, 1, 1) = zonebdy_conserved ( i, 1, 2)
+      zonebdy_flux ( i, 1, 2) =
+     1     zonebdy_conserved ( i, 1, 2) * vlxrepl ( i)
+     1   + prsrepl ( i)
+     1   + 0.5 * ( - bfxre ( i)**2 + bfyrepl ( i)**2
+     1                             + bfzrepl ( i)**2) * one_by_fourpi
+      zonebdy_flux ( i, 1, 3) =
+     1     zonebdy_conserved ( i, 1, 3) * vlxrepl ( i)
+     1                - bfxre ( i) * bfyrepl ( i) * one_by_fourpi
+      zonebdy_flux ( i, 1, 4) =
+     1     zonebdy_conserved ( i, 1, 4) * vlxrepl ( i)
+     1                - bfxre ( i) * bfzrepl ( i) * one_by_fourpi
+      zonebdy_flux ( i, 1, 6) = bfyrepl ( i) * vlxrepl ( i)
+     1                        - bfxre ( i) * vlyrepl ( i)
+      zonebdy_flux ( i, 1, 7) = bfzrepl ( i) * vlxrepl ( i)
+     1                        - bfxre ( i) * vlzrepl ( i)
+
+      END DO
+
+! ------------------------------
+
+* Make the fifth component differently depending on which flux
+* is desired.
+
+      IF ( iprimitive .EQ. 0) THEN
+
+      DO i = nriembegin, nriemend
+
+      zonebdy_conserved ( i, 0, 5) =
+     1      engremi ( i)
+     1    + 0.5 * rhoremi ( i)
+     1    * ( vlxremi ( i)**2 + vlyremi ( i)**2
+     1                        + vlzremi ( i)**2)
+     1    + 0.5 * ( bfxre ( i)**2 + bfyremi ( i)**2
+     1                            + bfzremi ( i)**2) * one_by_fourpi
+
+      zonebdy_conserved ( i, 1, 5) =
+     1      engrepl ( i)
+     1    + 0.5 * rhorepl ( i)
+     1    * ( vlxrepl ( i)**2 + vlyrepl ( i)**2
+     1                        + vlzrepl ( i)**2)
+     1    + 0.5 * ( bfxre ( i)**2 + bfyrepl ( i)**2
+     1                            + bfzrepl ( i)**2) * one_by_fourpi
+
+      zonebdy_flux ( i, 0, 5) =
+     1     ( zonebdy_conserved ( i, 0, 5) + prsremi ( i)
+     1   + 0.5 * ( bfxre ( i)**2 + bfyremi ( i)**2
+     1           + bfzremi ( i)**2) * one_by_fourpi ) * vlxremi ( i)
+     1   - bfxre ( i) * ( bfxre ( i) * vlxremi ( i)
+     1                  + bfyremi ( i) * vlyremi ( i)
+     1                  + bfzremi ( i) * vlzremi ( i) ) * one_by_fourpi
+
+      zonebdy_flux ( i, 1, 5) =
+     1     ( zonebdy_conserved ( i, 1, 5) + prsrepl ( i)
+     1   + 0.5 * ( bfxre ( i)**2 + bfyrepl ( i)**2
+     1           + bfzrepl ( i)**2) * one_by_fourpi ) * vlxrepl ( i)
+     1   - bfxre ( i) * ( bfxre ( i) * vlxrepl ( i)
+     1                  + bfyrepl ( i) * vlyrepl ( i)
+     1                  + bfzrepl ( i) * vlzrepl ( i) ) * one_by_fourpi
+
+      END DO
+
+      END IF
+
+
+      IF ( iprimitive .EQ. - 1) THEN
+
+      DO i = nriembegin, nriemend
+
+      zonebdy_conserved ( i, 0, 5) = prsremi ( i)
+     1        / rhoremi ( i)**( gamma_soundspeed_remi ( i) - 1.0)
+
+      zonebdy_conserved ( i, 1, 5) = prsrepl ( i)
+     1        / rhorepl ( i)**( gamma_soundspeed_repl ( i) - 1.0)
+
+      zonebdy_flux ( i, 0, 5) = zonebdy_conserved ( i, 0, 5)
+     1                        * vlxremi ( i)
+
+      zonebdy_flux ( i, 1, 5) = zonebdy_conserved ( i, 1, 5)
+     1                        * vlxrepl ( i)
+
+      END DO
+
+      END IF
+
+! ------------------------------
+
+* If multiple species are present then initialize their fluxes etc.
+* appropriately also.
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+        zonebdy_conserved ( i, 0, k) = rhoremi ( i)
+     1                               * specieremi ( ifluid, i)
+
+        zonebdy_conserved ( i, 1, k) = rhorepl ( i)
+     1                               * specierepl ( ifluid, i)
+
+        zonebdy_flux ( i, 0, k) = zonebdy_conserved ( i, 0, k)
+     1                          * vlxremi ( i)
+
+        zonebdy_flux ( i, 1, k) = zonebdy_conserved ( i, 1, k)
+     1                          * vlxrepl ( i)
+
+        conserved_re ( i, k) = 0.0
+
+        flux_re ( i, k + 1) = 0.0
+
+      END DO
+
+      END DO
+
+! ------------------------------
+
+! Zero out "flux_re" here.
+
+      DO i = nriembegin, nriemend
+
+      conserved_re ( i, 1) = 0.0
+      conserved_re ( i, 2) = 0.0
+      conserved_re ( i, 3) = 0.0
+      conserved_re ( i, 4) = 0.0
+      conserved_re ( i, 5) = 0.0
+      conserved_re ( i, 6) = 0.0
+      conserved_re ( i, 7) = 0.0
+
+      flux_re ( i, 1) = 0.0
+      flux_re ( i, 2) = 0.0
+      flux_re ( i, 3) = 0.0
+      flux_re ( i, 4) = 0.0
+      flux_re ( i, 5) = 0.0
+      flux_re ( i, 6) = 0.0
+      flux_re ( i, 7) = 0.0
+      flux_re ( i, 8) = 0.0
+
+      END DO
+
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+        conserved_re ( i, k) = 0.0
+
+        flux_re ( i, k + 1) = 0.0
+
+      END DO
+
+      END DO
+
+
+******************************************************************
+******************************************************************
+
+* Here we use Roe averaging and make only one call to the
+* eigenvector subroutine. The "eng, temperature" etc. that we make here
+* can even serve as good initial guesses for an exact EOS.
+
+
+      DO i = nriembegin, nriemend
+
+! ----------
+
+      gamma_eos ( i) = 0.5 * ( gamma_eos_remi ( i)
+     1                       + gamma_eos_repl ( i))
+      gamma_soundspeed ( i) = 0.5 * ( gamma_soundspeed_remi ( i)
+     1                              + gamma_soundspeed_repl ( i))
+      mean_mol_wt ( i) = 0.5 * ( mean_mol_wt_remi ( i)
+     1                         + mean_mol_wt_repl ( i))
+
+! ----------
+
+      temparr_01 ( i) = SQRT ( rhorepl ( i) / rhoremi ( i))
+      temparr_02 ( i) = 1.0 / ( 1.0 + temparr_01 ( i))
+
+      rhobar ( i) = SQRT ( rhoremi ( i) * rhorepl ( i))
+
+      vlxbar ( i) = ( vlxremi ( i) + vlxrepl ( i) * temparr_01 ( i))
+     1            * temparr_02 ( i)
+      vlybar ( i) = ( vlyremi ( i) + vlyrepl ( i) * temparr_01 ( i))
+     1            * temparr_02 ( i)
+      vlzbar ( i) = ( vlzremi ( i) + vlzrepl ( i) * temparr_01 ( i))
+     1            * temparr_02 ( i)
+
+      total_enthalpy_bar ( i) = ( total_enthalpy_remi ( i)
+     1  + total_enthalpy_repl ( i) * temparr_01 ( i)) * temparr_02 ( i)
+
+      bfxbar ( i) = bfxre ( i)
+      bfybar ( i) = ( bfyremi ( i) * temparr_01 ( i) + bfyrepl ( i))
+     1            * temparr_02 ( i)
+      bfzbar ( i) = ( bfzremi ( i) * temparr_01 ( i) + bfzrepl ( i))
+     1            * temparr_02 ( i)
+
+      xbar ( i) = 0.5 * ( ( bfyrepl ( i) - bfyremi ( i))**2
+     1                  + ( bfzrepl ( i) - bfzremi ( i))**2 )
+     1          / ( SQRT ( rhoremi ( i)) + SQRT ( rhorepl ( i)) )**2
+
+      prsbar ( i) = total_enthalpy_bar ( i)
+     1     - 0.5 * ( vlxbar ( i)**2 + vlybar ( i)**2 + vlzbar ( i)**2)
+     1     - ( bfxre ( i)**2 + bfybar ( i)**2 + bfzbar ( i)**2)
+     1     / ( fourpi * rhobar ( i))
+      prsbar ( i) = ( gamma_eos ( i) - 1.0) * rhobar ( i) * prsbar ( i)
+     1            / gamma_eos ( i)
+      prsbar ( i) = prsbar ( i)
+     1     - ( gamma_eos ( i) - 2.0) * rhobar ( i) * xbar ( i)
+     1     / ( fourpi * gamma_eos ( i) )
+      prsbar ( i) = AMAX1 ( prsbar ( i), prsfloor)
+
+! ----------
+
+! Give yourself the option of using arithmetic averages if needed.
+
+      IF ( ( rhobar ( i) .LE. rhofloor_plus_delta) .OR.
+     1     ( prsbar ( i) .LE. prsfloor_plus_delta) ) THEN
+
+      rhobar ( i) = 0.5 * ( rhoremi ( i) + rhorepl ( i))
+      prsbar ( i) = 0.5 * ( prsremi ( i) + prsrepl ( i))
+
+      vlxbar ( i) = 0.5 * ( vlxremi ( i) + vlxrepl ( i))
+      vlybar ( i) = 0.5 * ( vlyremi ( i) + vlyrepl ( i))
+      vlzbar ( i) = 0.5 * ( vlzremi ( i) + vlzrepl ( i))
+
+      bfxbar ( i) = bfxre ( i)
+      bfybar ( i) = 0.5 * ( bfyremi ( i) + bfyrepl ( i))
+      bfzbar ( i) = 0.5 * ( bfzremi ( i) + bfzrepl ( i))
+
+      xbar ( i) = 0.0
+
+      END IF
+
+! ----------
+
+      eng ( i) = prsbar ( i) / ( gamma_eos ( i) - 1.0)
+      temperature ( i) = prsbar ( i) * mean_mol_wt ( i)
+     1                 / ( gasconst * rhobar ( i))
+
+! ----------
+
+      END DO
+
+! ------------------------------
+
+      DO ifluid = 1, NFLUID
+
+      DO i = nriembegin, nriemend
+
+      temparr_01 ( i) = SQRT ( rhorepl ( i) / rhoremi ( i))
+      temparr_02 ( i) = 1.0 / ( 1.0 + temparr_01 ( i))
+
+      speciebar ( ifluid, i) = ( specieremi ( ifluid, i)
+     1 + specierepl ( ifluid, i) * temparr_01 ( i)) * temparr_02 ( i)
+
+      END DO
+
+      END DO
+
+! ------------------------------
+
+* Using exact EOS's here. If that is not needed, then "eng, temperature"
+* etc. have already been made above and the present call is not needed.
+
+* All learning codes are without calls to EOS routines.
+
+
+*********************************************************************
+*********************************************************************
+
+* Make eigenvectors and eigenvalues for the Roe averaged
+* state of the riemann problem.
+
+      CALL EIGENVECMHD
+
+     1           ( nriembegin, nriemend, iprimitive,
+
+     1             gamma, smallnum, prsfloor, rhofloor, pi, 
+     1             debug_stop,
+
+     1             gasconst,
+     1             cp_specie, molewt_specie, heat_of_formation,
+
+     1             rhobar, prsbar,
+     1             vlxbar, vlybar, vlzbar,
+     1             bfxbar, bfybar, bfzbar, xbar,
+     1             speciebar,
+
+     1             eigenval_re,
+     1             lf_eigenvec_re, rt_eigenvec_re )
+
+*********************************************************************
+*********************************************************************
+
+      IF ( debug_stop .EQ. 1) THEN
+      RETURN
+      END IF
+
+
+* And store the eigenvalues on either side of
+* the zone boundary.
+
+      DO i = nriembegin, nriemend
+
+      zonebdy_eigenval ( i, 1) = eigenval_re ( i, 1)
+      eigenval_db ( i, 0, 1) = eigenval_re ( i, 1)
+      eigenval_db ( i, 1, 1) = eigenval_re ( i, 1)
+
+      zonebdy_eigenval ( i, 2) = eigenval_re ( i, 2)
+      eigenval_db ( i, 0, 2) = eigenval_re ( i, 2)
+      eigenval_db ( i, 1, 2) = eigenval_re ( i, 2)
+
+      zonebdy_eigenval ( i, 3) = eigenval_re ( i, 3)
+      eigenval_db ( i, 0, 3) = eigenval_re ( i, 3)
+      eigenval_db ( i, 1, 3) = eigenval_re ( i, 3)
+
+      zonebdy_eigenval ( i, 4) = eigenval_re ( i, 4)
+      eigenval_db ( i, 0, 4) = eigenval_re ( i, 4)
+      eigenval_db ( i, 1, 4) = eigenval_re ( i, 4)
+
+      zonebdy_eigenval ( i, 5) = eigenval_re ( i, 5)
+      eigenval_db ( i, 0, 5) = eigenval_re ( i, 5)
+      eigenval_db ( i, 1, 5) = eigenval_re ( i, 5)
+
+      zonebdy_eigenval ( i, 6) = eigenval_re ( i, 6)
+      eigenval_db ( i, 0, 6) = eigenval_re ( i, 6)
+      eigenval_db ( i, 1, 6) = eigenval_re ( i, 6)
+
+      zonebdy_eigenval ( i, 7) = eigenval_re ( i, 7)
+      eigenval_db ( i, 0, 7) = eigenval_re ( i, 7)
+      eigenval_db ( i, 1, 7) = eigenval_re ( i, 7)
+
+      END DO
+
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+        zonebdy_eigenval ( i, k) = eigenval_re ( i, k)
+        eigenval_db ( i, 0, k) = eigenval_re ( i, k)
+        eigenval_db ( i, 1, k) = eigenval_re ( i, k)
+
+      END DO
+
+      END DO
+
+*********************************************************************
+*********************************************************************
+
+* Here we explicitly need to get the eigenvalues on either
+* side of the zone boundary so that we can maximize / minimize w.r.t.
+* the eigenvalues of the mean state. We reset "eigenval_db" here
+* so that "eigenval_db ( 0, ifield, i)" is the left-most eigenvalue
+* in that characteristic field and "eigenval_db ( 1, ifield, i)" is
+* the right-most.
+
+* Make "eigenval_lf":
+
+      DO i = nriembegin, nriemend
+
+*****************
+
+      one_by_4pi_rho ( i) = 1.0 / ( fourpi * rhoremi ( i) )
+
+      va_x ( i) = bfxre ( i)**2 * one_by_4pi_rho ( i)
+      va_x ( i) = SQRT ( va_x ( i) )
+
+      c_s ( i) = gamma_soundspeed_remi ( i) * prsremi ( i)
+     1         / rhoremi ( i)
+      c_s ( i) = SQRT ( c_s ( i) )
+
+      v_a ( i) = ( bfxre ( i)**2 + bfyremi ( i)**2
+     1           + bfzremi ( i)**2) * one_by_4pi_rho ( i)
+      v_a ( i) = SQRT ( v_a ( i) )
+
+      temparr_01 ( i) = v_a ( i)**2 + c_s ( i)**2
+      temparr_02 ( i) = temparr_01 ( i)**2
+     1                - 4.0 * va_x ( i)**2 * c_s ( i)**2
+      temparr_02 ( i) = AMAX1 ( temparr_02 ( i), 0.0)
+      temparr_02 ( i) = SQRT ( temparr_02 ( i))
+
+      v_f ( i) = 0.5 * ( temparr_01 ( i) + temparr_02 ( i))
+      v_f ( i) = SQRT ( v_f ( i) )
+
+      v_s ( i) = 0.5 * ( temparr_01 ( i) - temparr_02 ( i))
+      v_s ( i) = AMAX1 ( v_s ( i), 0.0)
+      v_s ( i) = SQRT ( v_s ( i) )
+
+*****************
+
+      eigenval_lf ( i, 1) = vlxremi ( i) - v_f ( i)
+      eigenval_lf ( i, 2) = vlxremi ( i) - va_x ( i)
+      eigenval_lf ( i, 3) = vlxremi ( i) - v_s ( i)
+      eigenval_lf ( i, 4) = vlxremi ( i)
+      eigenval_lf ( i, 5) = vlxremi ( i) + v_s ( i)
+      eigenval_lf ( i, 6) = vlxremi ( i) + va_x ( i)
+      eigenval_lf ( i, 7) = vlxremi ( i) + v_f ( i)
+
+*******************
+
+      END DO
+
+*******************
+
+#if ( NFLUID >= 1)
+      DO i = nriembegin, nriemend
+
+      eigenval_lf ( i, NFIELD + 1: NFIELD + NFLUID) = vlxremi ( i)
+
+      END DO
+#endif
+
+* End of making "eigenval_lf"
+
+*********************************************************************
+*********************************************************************
+
+      DO i = nriembegin, nriemend
+
+
+      eigenval_db ( i, 0, 1) =
+     1      AMIN1 ( eigenval_db ( i, 0, 1), eigenval_lf ( i, 1) )
+
+      eigenval_db ( i, 1, 1) =
+     1      AMAX1 ( eigenval_db ( i, 1, 1), eigenval_lf ( i, 1) )
+
+
+      eigenval_db ( i, 0, 2) =
+     1      AMIN1 ( eigenval_db ( i, 0, 2), eigenval_lf ( i, 2) )
+
+      eigenval_db ( i, 1, 2) =
+     1      AMAX1 ( eigenval_db ( i, 1, 2), eigenval_lf ( i, 2) )
+
+
+      eigenval_db ( i, 0, 3) =
+     1      AMIN1 ( eigenval_db ( i, 0, 3), eigenval_lf ( i, 3) )
+
+      eigenval_db ( i, 1, 3) =
+     1      AMAX1 ( eigenval_db ( i, 1, 3), eigenval_lf ( i, 3) )
+
+
+      eigenval_db ( i, 0, 4) =
+     1      AMIN1 ( eigenval_db ( i, 0, 4), eigenval_lf ( i, 4) )
+
+      eigenval_db ( i, 1, 4) =
+     1      AMAX1 ( eigenval_db ( i, 1, 4), eigenval_lf ( i, 4) )
+
+
+      eigenval_db ( i, 0, 5) =
+     1      AMIN1 ( eigenval_db ( i, 0, 5), eigenval_lf ( i, 5) )
+
+      eigenval_db ( i, 1, 5) =
+     1      AMAX1 ( eigenval_db ( i, 1, 5), eigenval_lf ( i, 5) )
+
+
+      eigenval_db ( i, 0, 6) =
+     1      AMIN1 ( eigenval_db ( i, 0, 6), eigenval_lf ( i, 6) )
+
+      eigenval_db ( i, 1, 6) =
+     1      AMAX1 ( eigenval_db ( i, 1, 6), eigenval_lf ( i, 6) )
+
+
+      eigenval_db ( i, 0, 7) =
+     1      AMIN1 ( eigenval_db ( i, 0, 7), eigenval_lf ( i, 7) )
+
+      eigenval_db ( i, 1, 7) =
+     1      AMAX1 ( eigenval_db ( i, 1, 7), eigenval_lf ( i, 7) )
+
+
+      END DO
+
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+        eigenval_db ( i, 0, k) =
+     1        AMIN1 ( eigenval_db ( i, 0, k), eigenval_lf ( i, k) )
+
+        eigenval_db ( i, 1, k) =
+     1        AMAX1 ( eigenval_db ( i, 1, k), eigenval_lf ( i, k) )
+
+      END DO
+
+      END DO
+
+*********************************************************************
+*********************************************************************
+
+* Make "eigenval_rt":
+
+      DO i = nriembegin, nriemend
+
+*****************
+
+      one_by_4pi_rho ( i) = 1.0 / ( fourpi * rhorepl ( i) )
+
+      va_x ( i) = bfxre ( i)**2 * one_by_4pi_rho ( i)
+      va_x ( i) = SQRT ( va_x ( i) )
+
+      c_s ( i) = gamma_soundspeed_repl ( i) * prsrepl ( i)
+     1         / rhorepl ( i)
+      c_s ( i) = SQRT ( c_s ( i) )
+
+      v_a ( i) = ( bfxre ( i)**2 + bfyrepl ( i)**2
+     1           + bfzrepl ( i)**2) * one_by_4pi_rho ( i)
+      v_a ( i) = SQRT ( v_a ( i) )
+
+      temparr_01 ( i) = v_a ( i)**2 + c_s ( i)**2
+      temparr_02 ( i) = temparr_01 ( i)**2
+     1                - 4.0 * va_x ( i)**2 * c_s ( i)**2
+      temparr_02 ( i) = AMAX1 ( temparr_02 ( i), 0.0)
+      temparr_02 ( i) = SQRT ( temparr_02 ( i))
+
+      v_f ( i) = 0.5 * ( temparr_01 ( i) + temparr_02 ( i))
+      v_f ( i) = SQRT ( v_f ( i) )
+
+      v_s ( i) = 0.5 * ( temparr_01 ( i) - temparr_02 ( i))
+      v_s ( i) = AMAX1 ( v_s ( i), 0.0)
+      v_s ( i) = SQRT ( v_s ( i) )
+
+*****************
+
+      eigenval_rt ( i, 1) = vlxrepl ( i) - v_f ( i)
+      eigenval_rt ( i, 2) = vlxrepl ( i) - va_x ( i)
+      eigenval_rt ( i, 3) = vlxrepl ( i) - v_s ( i)
+      eigenval_rt ( i, 4) = vlxrepl ( i)
+      eigenval_rt ( i, 5) = vlxrepl ( i) + v_s ( i)
+      eigenval_rt ( i, 6) = vlxrepl ( i) + va_x ( i)
+      eigenval_rt ( i, 7) = vlxrepl ( i) + v_f ( i)
+
+*******************
+
+      END DO
+
+*******************
+
+#if ( NFLUID >= 1)
+      DO i = nriembegin, nriemend
+
+      eigenval_rt ( i, NFIELD + 1: NFIELD + NFLUID) = vlxrepl ( i)
+
+      END DO
+#endif
+
+
+* End of making "eigenval_rt"
+
+*********************************************************************
+*********************************************************************
+
+      DO i = nriembegin, nriemend
+
+
+      eigenval_db ( i, 0, 1) =
+     1      AMIN1 ( eigenval_db ( i, 0, 1), eigenval_rt ( i, 1) )
+
+      eigenval_db ( i, 1, 1) =
+     1      AMAX1 ( eigenval_db ( i, 1, 1), eigenval_rt ( i, 1) )
+
+
+      eigenval_db ( i, 0, 2) =
+     1      AMIN1 ( eigenval_db ( i, 0, 2), eigenval_rt ( i, 2) )
+
+      eigenval_db ( i, 1, 2) =
+     1      AMAX1 ( eigenval_db ( i, 1, 2), eigenval_rt ( i, 2) )
+
+
+      eigenval_db ( i, 0, 3) =
+     1      AMIN1 ( eigenval_db ( i, 0, 3), eigenval_rt ( i, 3) )
+
+      eigenval_db ( i, 1, 3) =
+     1      AMAX1 ( eigenval_db ( i, 1, 3), eigenval_rt ( i, 3) )
+
+
+      eigenval_db ( i, 0, 4) =
+     1      AMIN1 ( eigenval_db ( i, 0, 4), eigenval_rt ( i, 4) )
+
+      eigenval_db ( i, 1, 4) =
+     1      AMAX1 ( eigenval_db ( i, 1, 4), eigenval_rt ( i, 4) )
+
+
+      eigenval_db ( i, 0, 5) =
+     1      AMIN1 ( eigenval_db ( i, 0, 5), eigenval_rt ( i, 5) )
+
+      eigenval_db ( i, 1, 5) =
+     1      AMAX1 ( eigenval_db ( i, 1, 5), eigenval_rt ( i, 5) )
+
+
+      eigenval_db ( i, 0, 6) =
+     1      AMIN1 ( eigenval_db ( i, 0, 6), eigenval_rt ( i, 6) )
+
+      eigenval_db ( i, 1, 6) =
+     1      AMAX1 ( eigenval_db ( i, 1, 6), eigenval_rt ( i, 6) )
+
+
+      eigenval_db ( i, 0, 7) =
+     1      AMIN1 ( eigenval_db ( i, 0, 7), eigenval_rt ( i, 7) )
+
+      eigenval_db ( i, 1, 7) =
+     1      AMAX1 ( eigenval_db ( i, 1, 7), eigenval_rt ( i, 7) )
+
+
+      END DO
+
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+        eigenval_db ( i, 0, k) =
+     1        AMIN1 ( eigenval_db ( i, 0, k), eigenval_rt ( i, k) )
+
+        eigenval_db ( i, 1, k) =
+     1        AMAX1 ( eigenval_db ( i, 1, k), eigenval_rt ( i, k) )
+
+      END DO
+
+      END DO
+
+* End of making the eigenvectors and appropriate wave speeds.
+
+************************************************************************
+************************************************************************
+
+* We take the conserved state and make the Harten & Hyman entropy fix
+* for it. The Flux is obtained from the conserved state.
+
+      IF ( ientropyfix .EQ. 4) THEN
+
+************************************************************************
+************************************************************************
+
+* Make the differences in conserved_re.
+
+      DO k = 1, NFIELD + NFLUID
+
+        DO i = nriembegin, nriemend
+
+        del_cons ( i, k) = zonebdy_conserved ( i, 1, k)
+     1                   - zonebdy_conserved ( i, 0, k)
+
+        END DO
+
+      END DO
+
+
+* Project the conserved_re differences onto the right eigenvectors.
+
+      eigenwt_re ( nriembegin : nriemend, :) = 0.0
+
+* Left-multiply the kth eigenvector.
+      DO k = 1, NFIELD + NFLUID
+
+* dot product loop.
+        DO j = 1, NFIELD + NFLUID
+
+          DO i = nriembegin, nriemend
+
+          eigenwt_re ( i, k) = eigenwt_re ( i, k)
+     1                   + lf_eigenvec_re ( i, k, j)
+     1                            * del_cons ( i, j)
+
+          END DO
+
+        END DO
+
+      END DO
+
+********************
+
+* Calculate the mean conserved state.
+
+* kth conserved vector component
+      DO k = 1, NFIELD + NFLUID
+
+        DO i = nriembegin, nriemend
+
+        conserved_re ( i, k) =
+     1                    0.5 * ( zonebdy_conserved ( i, 0, k)
+     1                          + zonebdy_conserved ( i, 1, k) )
+
+        END DO
+
+      END DO
+
+********************
+
+* Make eigenweight contributions to the resolved conserved state,
+* assuming no entropy fix for now.
+
+* kth wavespeed being considered here.
+      DO k = 1, NFIELD + NFLUID
+
+        DO i = nriembegin, nriemend
+
+
+        IF ( eigenval_re ( i, k) .LT. 0.0) THEN
+
+! Left-going wave.
+
+        eigenwt_cons ( i, k) = 0.5 * eigenwt_re ( i, k)
+
+        ELSE
+
+! Right-going wave.
+
+        eigenwt_cons ( i, k) = - 0.5 * eigenwt_re ( i, k)
+
+        END IF
+
+
+        END DO
+
+      END DO
+
+
+* Also find the wave that corresponds to the resolved state. "iwave_1"
+* only ranges over 1 to 7.
+
+      iwave_1 ( nriembegin: nriemend) = 0
+
+      DO k = 1, NFIELD
+
+        DO i = nriembegin, nriemend
+
+        IF ( eigenval_re ( i, k) .LT. 0.0) THEN
+
+        iwave_1 ( i) = k
+
+        END IF
+
+        END DO
+
+      END DO
+
+********************
+
+* Add in the eigenweight contributions to the resolved conserved state,
+* assuming no entropy fix for now.
+
+* kth term in the vector of conserved variables.
+      DO k = 1, NFIELD + NFLUID
+
+* jth wave's contribution being considered here.
+        DO j = 1, NFIELD + NFLUID
+
+          DO i = nriembegin, nriemend
+
+          conserved_re ( i, k) = conserved_re ( i, k)
+     1                         + eigenwt_cons ( i, j)
+     1                       * rt_eigenvec_re ( i, k, j)
+
+          END DO
+
+        END DO
+
+      END DO
+
+************************************************************************
+* Make the entropy fix below.
+************************************************************************
+
+* Find the primitive variables in the nominally resolved conserved state.
+
+      DO i = nriembegin, nriemend
+
+      rhobar ( i) = AMAX1 ( conserved_re ( i, 1), rhofloor)
+
+      temparr_01 ( i) = 1.0 / rhobar ( i)
+      vlxbar ( i) = conserved_re ( i, 2) * temparr_01 ( i)
+      vlybar ( i) = conserved_re ( i, 3) * temparr_01 ( i)
+      vlzbar ( i) = conserved_re ( i, 4) * temparr_01 ( i)
+
+      bfybar ( i) = conserved_re ( i, 6)
+      bfzbar ( i) = conserved_re ( i, 7)
+
+
+      IF ( iprimitive .EQ. 0) THEN
+
+      eng ( i) = conserved_re ( i, 5)
+     1   - 0.5 * rhobar ( i) * ( vlxbar ( i)**2 + vlybar ( i)**2
+     1                         + vlzbar ( i)**2 )
+     1   - 0.5 * ( bfxre ( i)**2 + bfybar ( i)**2
+     1           + bfzbar ( i)**2) * one_by_fourpi
+      prsbar ( i) = ( gamma_eos ( i) - 1.0) * eng ( i)
+
+      ELSE
+
+      prsbar ( i) = conserved_re ( i, 5)
+     1          * rhobar ( i)**( gamma_soundspeed ( i) - 1.0)
+      prsbar ( i) = AMAX1 ( prsbar ( i), prsfloor)
+      eng ( i) = prsbar ( i) / ( gamma_eos ( i) - 1.0)
+
+      END IF
+
+#if ( NFLUID >= 1)
+      temparr_01 ( i) = 1.0 / rhobar ( i)
+      speciebar ( 1: NFLUID, i) =
+     1         conserved_re ( i, NFIELD + 1: NFIELD + NFLUID)
+     1       * temparr_01 ( i)
+#endif
+
+      END DO
+
+********************
+
+* Set up to find the wave speeds in the nominally resolved state.
+
+      DO i = nriembegin, nriemend
+
+      one_by_4pi_rho ( i) = 1.0 / ( fourpi * rhobar ( i) )
+
+      va_x ( i) = bfxbar ( i)**2 * one_by_4pi_rho ( i)
+      va_x ( i) = SQRT ( va_x ( i) )
+
+      c_s ( i) = gamma_soundspeed ( i) * prsbar ( i) / rhobar ( i)
+      c_s ( i) = SQRT ( c_s ( i) )
+
+      v_a ( i) = ( bfxbar ( i)**2 + bfybar ( i)**2
+     1           + bfzbar ( i)**2) * one_by_4pi_rho ( i)
+      v_a ( i) = SQRT ( v_a ( i) )
+
+      temparr_01 ( i) = v_a ( i)**2 + c_s ( i)**2
+      temparr_02 ( i) = temparr_01 ( i)**2
+     1                - 4.0 * va_x ( i)**2 * c_s ( i)**2
+      temparr_02 ( i) = AMAX1 ( temparr_02 ( i), 0.0)
+      temparr_02 ( i) = SQRT ( temparr_02 ( i))
+
+      v_f ( i) = 0.5 * ( temparr_01 ( i) + temparr_02 ( i))
+      v_f ( i) = SQRT ( v_f ( i) )
+
+      v_s ( i) = 0.5 * ( temparr_01 ( i) - temparr_02 ( i))
+      v_s ( i) = AMAX1 ( v_s ( i), 0.0)
+      v_s ( i) = SQRT ( v_s ( i) )
+
+      eigenval_1 ( i, 1) = vlxbar ( i) - v_f ( i)
+      eigenval_1 ( i, 2) = vlxbar ( i) - v_a ( i)
+      eigenval_1 ( i, 3) = vlxbar ( i) - v_s ( i)
+      eigenval_1 ( i, 4) = vlxbar ( i)
+      eigenval_1 ( i, 5) = vlxbar ( i) + v_s ( i)
+      eigenval_1 ( i, 6) = vlxbar ( i) + v_a ( i)
+      eigenval_1 ( i, 7) = vlxbar ( i) + v_f ( i)
+
+      END DO
+
+********************
+
+* Now make a decision on which wave we are going to pick out. This is done
+* by making "wavspd_1 ( i)" and setting "make_2 ( i) = 1 or -1" depending on
+* whether the wave from the right or left has to be selected. Note that
+* setting "make_2 ( i) != 0" causes computational effort to be expended
+* to make the wavespeed in the state abutting "iwave_1 ( i)". Thus
+* "make_2 (:) = 0" has already been set by default to start with.
+
+* As a general consideration, we only need to evaluate waves corresponding
+* to families "iwave_2 ( i) = iwave_1 ( i)" and
+* "iwave_2 ( i) = iwave_1 ( i) + 1". ( We do need to assume that the waves
+* are arranged in increasing order of wavespeed.) Then
+* three cases ensue :-
+*
+* 1) If wave speed corresponding to family "iwave_1 ( i)" is positive
+*      then the shock wave on the left of the current state needs to be
+*      examined. It might need a potential entropy fix.
+*
+* 2) If wave speed corresponding to family "iwave_1 ( i)" is negative
+*      while the wave speed corresponding to "iwave_1 ( i) + 1" is
+*      positive then we most certainly do not need to open out either
+*      of the two shock waves on either side.
+*
+* 3) If the wave speed corresponding to "iwave_1 ( i) + 1" is negative
+*      then the shock wave on the right of the current state needs to be
+*      examined. It might need a potential entropy fix.
+
+
+      make_2 ( nriembegin: nriemend) = 0
+      iwave_2 ( nriembegin: nriemend) = -1
+
+
+      DO i = nriembegin, nriemend
+
+        IF ( ( iwave_1 ( i) .EQ. 0) .AND.
+     1       ( eigenval_1 ( i, 1) .LT. 0.0) ) THEN
+! "conserved_2" lies to the right of "conserved_re".
+
+          wavspd_1 ( i) = eigenval_1 ( i, 1)
+          make_2 ( i) = 1
+          iwave_2 ( i) = 1
+
+        ELSE IF ( ( iwave_1 ( i) .EQ. 7) .AND.
+     1       ( eigenval_1 ( i, 7) .GT. 0.0) ) THEN
+! "conserved_2" lies to the left of "conserved_re".
+
+          wavspd_1 ( i) = eigenval_1 ( i, 7)
+          make_2 ( i) = - 1
+          iwave_2 ( i) = 7
+
+        ELSE IF ( ( iwave_1 ( i) .GE. 1) .AND.
+     1            ( iwave_1 ( i) .LE. 6) .AND.
+     1       ( eigenval_1 ( i, iwave_1 ( i) ) .GT. 0.0) ) THEN
+! "conserved_2" lies to the left of "conserved_re".
+
+          wavspd_1 ( i) = eigenval_1 ( i, iwave_1 ( i) )
+          make_2 ( i) = - 1
+          iwave_2 ( i) = iwave_1 ( i)
+
+        ELSE IF ( ( iwave_1 ( i) .GE. 1) .AND.
+     1            ( iwave_1 ( i) .LE. 6) .AND.
+     1       ( eigenval_1 ( i, iwave_1 ( i) + 1 ) .LT. 0.0) ) THEN
+! "conserved_2" lies to the right of "conserved_re".
+
+          wavspd_1 ( i) = eigenval_1 ( i, iwave_1 ( i) + 1 )
+          make_2 ( i) = 1
+          iwave_2 ( i) = iwave_1 ( i) + 1
+
+        END IF
+
+      END DO
+
+********************
+
+* Now make the conserved variables and fluxes in the zone that could
+* possibly contribute to a rarefaction fan ( if one existed).
+* "make_2 ( i)" will tell us which direction to move in and "iwave_2 ( i)"
+* will tell us which wave to choose.
+
+* kth term in the vector of conserved variables.
+      DO k = 1, NFIELD + NFLUID
+
+      DO i = nriembegin, nriemend
+
+        IF ( make_2 ( i) .EQ. - 1) THEN
+
+! "conserved_2" lies to the left of "conserved_re".
+
+          j = iwave_2 ( i)
+
+          conserved_2 ( i, k) = conserved_re ( i, k)
+     1                          - eigenwt_re ( i, j)
+     1                      * rt_eigenvec_re ( i, k, j)
+
+        ELSE IF ( make_2 ( i) .EQ. 1) THEN
+
+! "conserved_2" lies to the right of "conserved_re".
+
+          j = iwave_2 ( i)
+
+          conserved_2 ( i, k) = conserved_re ( i, k)
+     1                          + eigenwt_re ( i, j)
+     1                      * rt_eigenvec_re ( i, k, j)
+
+        END IF
+
+      END DO
+
+      END DO
+
+**********
+
+* But remember that if we are jumping through the fourth wave
+* then, in the multifluid case, there are more eigenvectors that have
+* to be added in.
+* We check to make sure that the entropy fix indeed requires us to
+* jump through the fourth wave and, only in that case, add in the
+* eigenvectors corresponding to the species fields.
+
+#if ( NFLUID >= 1)
+* Working with the jth characteristic field (associated with the
+* (j-NFIELD)th species.
+      DO j = NFIELD + 1, NFIELD + NFLUID
+
+* kth term in the vector of conserved variables.
+      DO k = 1, NFIELD + NFLUID
+
+      DO i = nriembegin, nriemend
+
+        IF ( ( make_2 ( i) .EQ. - 1) .AND.
+     1       ( iwave_2 ( i) .EQ. 4) ) THEN
+
+! "conserved_2" lies to the left of "conserved_re".
+
+          conserved_2 ( i, k) = conserved_re ( i, k)
+     1                          - eigenwt_re ( i, j)
+     1                      * rt_eigenvec_re ( i, k, j)
+
+        ELSE IF ( ( make_2 ( i) .EQ. 1) .AND. 
+     1            ( iwave_2 ( i) .EQ. 4) ) THEN
+
+! "conserved_2" lies to the right of "conserved_re".
+
+          conserved_2 ( i, k) = conserved_re ( i, k)
+     1                          + eigenwt_re ( i, j)
+     1                      * rt_eigenvec_re ( i, k, j)
+
+        END IF
+
+      END DO
+
+      END DO
+
+      END DO
+#endif
+
+
+********************
+
+* Find the primitive variables in the neighboring state that is
+* needed for the entropy fix.
+
+      DO i = nriembegin, nriemend
+
+      IF ( make_2 ( i) .NE. 0) THEN
+
+      rhobar ( i) = AMAX1 ( conserved_2 ( i, 1), rhofloor)
+
+      temparr_01 ( i) = 1.0 / rhobar ( i)
+      vlxbar ( i) = conserved_2 ( i, 2) * temparr_01 ( i)
+      vlybar ( i) = conserved_2 ( i, 3) * temparr_01 ( i)
+      vlzbar ( i) = conserved_2 ( i, 4) * temparr_01 ( i)
+
+      bfybar ( i) = conserved_2 ( i, 6)
+      bfzbar ( i) = conserved_2 ( i, 7)
+
+
+      IF ( iprimitive .EQ. 0) THEN
+
+      eng ( i) = conserved_2 ( i, 5)
+     1   - 0.5 * rhobar ( i) * ( vlxbar ( i)**2 + vlybar ( i)**2
+     1                         + vlzbar ( i)**2 )
+     1   - 0.5 * ( bfxre ( i)**2 + bfybar ( i)**2
+     1           + bfzbar ( i)**2) * one_by_fourpi
+      prsbar ( i) = ( gamma_eos ( i) - 1.0) * eng ( i)
+
+      ELSE 
+
+      prsbar ( i) = conserved_2 ( i, 5)
+     1          * rhobar ( i)**( gamma_soundspeed ( i) - 1.0)
+      prsbar ( i) = AMAX1 ( prsbar ( i), prsfloor)
+      eng ( i) = prsbar ( i) / ( gamma_eos ( i) - 1.0)
+
+      END IF
+
+#if ( NFLUID >= 1)
+      temparr_01 ( i) = 1.0 / rhobar ( i)
+      speciebar ( 1: NFLUID, i) =
+     1         conserved_2 ( i, NFIELD + 1: NFIELD + NFLUID)
+     1       * temparr_01 ( i)
+#endif
+
+      END IF
+
+      END DO
+
+********************
+
+* Set up to find the wave speeds in the neighboring state that is
+* needed for the entropy fix. Load "wavspd_2 ( i)" suitably.
+
+      DO i = nriembegin, nriemend
+
+      IF ( make_2 ( i) .NE. 0) THEN
+
+      one_by_4pi_rho ( i) = 1.0 / ( fourpi * rhobar ( i) )
+
+      va_x ( i) = bfxbar ( i)**2 * one_by_4pi_rho ( i)
+      va_x ( i) = SQRT ( va_x ( i) )
+
+      c_s ( i) = gamma_soundspeed ( i) * prsbar ( i) / rhobar ( i)
+      c_s ( i) = SQRT ( c_s ( i) )
+
+      v_a ( i) = ( bfxbar ( i)**2 + bfybar ( i)**2
+     1           + bfzbar ( i)**2) * one_by_4pi_rho ( i)
+      v_a ( i) = SQRT ( v_a ( i) )
+
+      temparr_01 ( i) = v_a ( i)**2 + c_s ( i)**2
+      temparr_02 ( i) = temparr_01 ( i)**2
+     1                - 4.0 * va_x ( i)**2 * c_s ( i)**2
+      temparr_02 ( i) = AMAX1 ( temparr_02 ( i), 0.0)
+      temparr_02 ( i) = SQRT ( temparr_02 ( i))
+
+      v_f ( i) = 0.5 * ( temparr_01 ( i) + temparr_02 ( i))
+      v_f ( i) = SQRT ( v_f ( i) )
+
+      v_s ( i) = 0.5 * ( temparr_01 ( i) - temparr_02 ( i))
+      v_s ( i) = AMAX1 ( v_s ( i), 0.0)
+      v_s ( i) = SQRT ( v_s ( i) )
+
+      eigenval_2 ( i, 1) = vlxbar ( i) - v_f ( i)
+      eigenval_2 ( i, 2) = vlxbar ( i) - v_a ( i)
+      eigenval_2 ( i, 3) = vlxbar ( i) - v_s ( i)
+      eigenval_2 ( i, 4) = vlxbar ( i)
+      eigenval_2 ( i, 5) = vlxbar ( i) + v_s ( i)
+      eigenval_2 ( i, 6) = vlxbar ( i) + v_a ( i)
+      eigenval_2 ( i, 7) = vlxbar ( i) + v_f ( i)
+
+      wavspd_2 ( i) = eigenval_2 ( i, iwave_2 ( i) )
+
+      END IF
+
+      END DO
+
+********************
+
+* Involve "eigenval_re ( i, j)" to judiciously expand the range of
+* "wavspd_1 and wavspd_2" if an entropy fix is called for.
+
+* Use the Harten, Hyman entropy fix to obtain the weights for
+* "conserved_re" and "conserved_2" in "temparr_01" and "temparr_02" 
+* respectively.
+
+      make_entropyfix ( nriembegin: nriemend) = 0
+
+      DO i = nriembegin, nriemend
+
+! "conserved_2" lies to the left of "conserved_re".
+
+        IF ( ( make_2 ( i) .EQ. - 1) .AND.
+     1       ( wavspd_2 ( i) .LT. - smallnum) .AND.
+     1       ( smallnum .LT. wavspd_1 ( i)) ) THEN
+
+          j = iwave_2 ( i)
+
+          wavspd_1 ( i) = AMAX1 ( wavspd_1 ( i), eigenval_re ( i, j))
+          wavspd_2 ( i) = AMIN1 ( wavspd_2 ( i), eigenval_re ( i, j))
+          make_entropyfix ( i) = - 1
+
+          temparr_01 ( i) = ( wavspd_1 ( i) - eigenval_re ( i, j))
+     1                    / ( wavspd_1 ( i) - wavspd_2 ( i))
+          temparr_02 ( i) = 1.0 - temparr_01 ( i)
+
+        ELSE IF ( ( make_2 ( i) .EQ. 1) .AND.
+     1       ( wavspd_1 ( i) .LT. - smallnum) .AND.
+     1       ( smallnum .LT. wavspd_2 ( i)) ) THEN
+
+! "conserved_2" lies to the right of "conserved_re".
+
+          j = iwave_2 ( i)
+
+          wavspd_1 ( i) = AMIN1 ( wavspd_1 ( i), eigenval_re ( i, j))
+          wavspd_2 ( i) = AMAX1 ( wavspd_2 ( i), eigenval_re ( i, j))
+          make_entropyfix ( i) = 1
+
+          temparr_01 ( i) = ( eigenval_re ( i, j) - wavspd_1 ( i))
+     1                    / ( wavspd_2 ( i) - wavspd_1 ( i))
+          temparr_02 ( i) = 1.0 - temparr_01 ( i)
+
+        END IF
+
+      END DO
+
+********************
+
+* Obtain the final resolved, conserved state WITH the entropy fix.
+
+      DO j = 1, NFIELD + NFLUID
+
+      DO i = nriembegin, nriemend
+
+        IF ( make_entropyfix ( i) .NE. 0) THEN
+
+        conserved_re ( i, j) = temparr_01 ( i) * conserved_re ( i, j)
+     1                       + temparr_02 ( i) * conserved_2 ( i, j)
+
+        END IF
+
+      END DO
+
+      END DO
+
+************************************************************************
+
+* Use the resolved, conserved state "conserved_re" to obtain primitive
+* variables and use them to obtain the flux, "flux_re".
+
+      DO i = nriembegin, nriemend
+
+      rhobar ( i) = AMAX1 ( conserved_re ( i, 1), rhofloor)
+
+      temparr_01 ( i) = 1.0 / rhobar ( i)
+      vlxbar ( i) = conserved_re ( i, 2) * temparr_01 ( i)
+      vlybar ( i) = conserved_re ( i, 3) * temparr_01 ( i)
+      vlzbar ( i) = conserved_re ( i, 4) * temparr_01 ( i)
+
+      bfybar ( i) = conserved_re ( i, 6)
+      bfzbar ( i) = conserved_re ( i, 7)
+
+
+      IF ( iprimitive .EQ. 0) THEN
+
+      eng ( i) = conserved_re ( i, 5)
+     1   - 0.5 * rhobar ( i) * ( vlxbar ( i)**2 + vlybar ( i)**2
+     1                         + vlzbar ( i)**2 )
+     1   - 0.5 * ( bfxre ( i)**2 + bfybar ( i)**2
+     1           + bfzbar ( i)**2) * one_by_fourpi
+      prsbar ( i) = ( gamma_eos ( i) - 1.0) * eng ( i)
+
+      ELSE
+
+      prsbar ( i) = conserved_re ( i, 5)
+     1          * rhobar ( i)**( gamma_soundspeed ( i) - 1.0)
+      prsbar ( i) = AMAX1 ( prsbar ( i), prsfloor)
+      eng ( i) = prsbar ( i) / ( gamma_eos ( i) - 1.0)
+
+      END IF
+
+#if ( NFLUID >= 1)
+      temparr_01 ( i) = 1.0 / rhobar ( i)
+      speciebar ( 1: NFLUID, i) =
+     1         conserved_re ( i, NFIELD + 1: NFIELD + NFLUID)
+     1       * temparr_01 ( i)
+#endif
+
+      END DO
+
+**********
+
+      DO i = nriembegin, nriemend
+
+      flux_re ( i, 1) = conserved_re ( i, 2)
+
+      flux_re ( i, 2) = conserved_re ( i, 2) * vlxbar ( i)
+     1   + prsbar ( i)
+     1   + 0.5 * ( - bfxre ( i)**2 + bfybar ( i)**2
+     1                             + bfzbar ( i)**2) * one_by_fourpi
+      flux_re ( i, 3) = conserved_re ( i, 3) * vlxbar ( i)
+     1                - bfxre ( i) * bfybar ( i) * one_by_fourpi
+      flux_re ( i, 4) = conserved_re ( i, 4) * vlxbar ( i)
+     1                - bfxre ( i) * bfzbar ( i) * one_by_fourpi
+
+      flux_re ( i, 6) = bfybar ( i) * vlxbar ( i)
+     1                 - bfxre ( i) * vlybar ( i)
+      flux_re ( i, 7) = bfzbar ( i) * vlxbar ( i)
+     1                 - bfxre ( i) * vlzbar ( i)
+
+      IF ( iprimitive .EQ. 0) THEN
+
+      flux_re ( i, 5) = ( conserved_re ( i, 5) + prsbar ( i)
+     1   + 0.5 * ( bfxre ( i)**2 + bfybar ( i)**2 + bfzbar ( i)**2)
+     1         * one_by_fourpi ) * vlxbar ( i)
+     1   - bfxre ( i) * ( bfxre ( i) * vlxbar ( i)
+     1                  + bfybar ( i) * vlybar ( i)
+     1                  + bfzbar ( i) * vlzbar ( i) ) * one_by_fourpi
+
+      ELSE
+
+      flux_re ( i, 5) = conserved_re ( i, 5) * vlxbar ( i)
+
+      END IF
+
+      END DO
+
+
+* If multiple species are present then make their fluxes etc.
+* appropriately also.
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+      flux_re ( i, k) = conserved_re ( i, k) * vlxbar ( i)
+
+      END DO
+
+      END DO
+
+************************************************************************
+************************************************************************
+
+      END IF
+
+* End of ientropyfix = 4 case.
+
+************************************************************************
+************************************************************************
+
+* This is a simpler and easier entropy fix strategy.
+
+* No Einfeldt fix is attempted.
+* Likewise, no attempt is made to split the momentum flux_re into pressure and
+* advected parts.
+* The emphasis here is on speed!
+
+      IF ( ientropyfix .EQ. 3) THEN
+
+******************************************************************
+******************************************************************
+
+* Make the differences in conserved_re.
+
+      DO k = 1, NFIELD + NFLUID
+
+        DO i = nriembegin, nriemend
+
+        del_cons ( i, k) = zonebdy_conserved ( i, 1, k)
+     1                   - zonebdy_conserved ( i, 0, k)
+
+        END DO
+
+      END DO
+
+! ------------------------------
+
+* Project the conserved_re differences onto the right eigenvectors.
+
+      eigenwt_re ( nriembegin : nriemend, :) = 0.0
+
+* Left-multiply the kth eigenvector.
+      DO k = 1, NFIELD + NFLUID
+
+* dot product loop.
+        DO j = 1, NFIELD + NFLUID
+
+          DO i = nriembegin, nriemend
+
+          eigenwt_re ( i, k) = eigenwt_re ( i, k)
+     1                   + lf_eigenvec_re ( i, k, j)
+     1                            * del_cons ( i, j)
+
+          END DO
+
+        END DO
+
+      END DO
+
+! ------------------------------
+
+* Calculate the mean fluxes.
+
+* kth flux vector component
+      DO k = 1, NFIELD + NFLUID
+
+        DO i = nriembegin, nriemend
+
+        flux_re ( i, k) = 0.5 * ( zonebdy_flux ( i, 0, k)
+     1                          + zonebdy_flux ( i, 1, k) )
+
+        conserved_re ( i, k) =
+     1                    0.5 * ( zonebdy_conserved ( i, 0, k)
+     1                          + zonebdy_conserved ( i, 1, k) )
+
+        END DO
+
+      END DO
+
+! ------------------------------
+
+* Make entropy fix for the wavespeeds.
+
+* kth wavespeed being considered here.
+      DO k = 1, NFIELD + NFLUID
+
+        DO i = nriembegin, nriemend
+
+! --------------------
+
+        IF ( ( eigenval_db ( i, 0, k) .LT. - smallnum) .AND.
+     1       ( eigenval_db ( i, 1, k) .GT. smallnum) ) THEN
+
+! ----------
+
+! Rarefaction.
+
+
+        temparr_01 ( i) = 1.0 / ( eigenval_db ( i, 1, k)
+     1                          - eigenval_db ( i, 0, k))
+
+! From Eqs. (6.41) and (6.42) of book; this is "0.5*(alpha^minus - alpha^plus)".
+        eigenwt_cons ( i, k) =
+     1   0.5 * ( ( eigenval_db ( i, 1, k) + eigenval_db ( i, 0, k))
+     1         - 2.0 * eigenval_re ( i, k) )
+     1 * temparr_01 ( i) * eigenwt_re ( i, k)
+
+! Eqs. (6.41) and (6.43) of book; this is "lambda^minus".
+        temparr_02 ( i) = eigenval_db ( i, 0, k)
+     1 * ( eigenval_db ( i, 1, k) - eigenval_re ( i, k))
+     1 * temparr_01 ( i)
+
+! Eqs. (6.41) and (6.43) of book; this is "lambda^plus".
+        temparr_03 ( i) = eigenval_db ( i, 1, k)
+     1 * ( eigenval_re ( i, k) - eigenval_db ( i, 0, k))
+     1 * temparr_01 ( i)
+
+! From Eqn. (6.43) of book; this is "0.5*( lambda^minus - lambda^plus)*alpha^m".
+        eigenwt_flux ( i, k) =
+     1   0.5 * ( temparr_02 ( i) - temparr_03 ( i))
+     1 * eigenwt_re ( i, k)
+
+! ----------
+
+        ELSE IF ( eigenval_re ( i, k) .LT. 0.0) THEN
+
+! ----------
+
+! Left-going wave, no rarefaction.
+
+
+        eigenwt_cons ( i, k) = 0.5 * eigenwt_re ( i, k)
+
+        eigenwt_flux ( i, k) = 0.5 * eigenval_re ( i, k)
+     1                       * eigenwt_re ( i, k)
+
+! ----------
+
+        ELSE
+
+! ----------
+
+! Right-going wave, no rarefaction.
+
+
+        eigenwt_cons ( i, k) = - 0.5 * eigenwt_re ( i, k)
+
+        eigenwt_flux ( i, k) = - 0.5 * eigenval_re ( i, k)
+     1                       * eigenwt_re ( i, k)
+
+! ----------
+
+        END IF
+
+! --------------------
+
+        END DO
+
+      END DO
+
+! ------------------------------
+
+* Add in the contribution from the entropy fix to the mean fluxes
+* and conserved variables.
+
+* kth term in the vector of conserved variables.
+      DO k = 1, NFIELD + NFLUID
+
+* jth wave's contribution being considered here.
+        DO j = 1, NFIELD + NFLUID
+
+          DO i = nriembegin, nriemend
+
+          flux_re ( i, k) = flux_re ( i, k)
+     1               + eigenwt_flux ( i, j)
+     1             * rt_eigenvec_re ( i, k, j)
+
+          conserved_re ( i, k) = conserved_re ( i, k)
+     1                         + eigenwt_cons ( i, j)
+     1                       * rt_eigenvec_re ( i, k, j) 
+
+          END DO
+
+        END DO
+
+      END DO
+
+
+******************************************************************
+******************************************************************
+
+      END IF
+
+* End of ientropyfix = 3 case.
+
+******************************************************************
+******************************************************************
+
+* This entropy fix strategy goes all the way from here to the end of
+* the subroutine.
+
+      IF ( ( ientropyfix .EQ. 1) .OR.
+     1     ( ientropyfix .EQ. 2) ) THEN
+
+******************************************************************
+******************************************************************
+
+* Make "use_eigenvec" and "do_roe". "do_roe = 1" tells us that this zone
+* boundary may use a roe construction. "use_eigenvec" tells us
+* which eigensystem to use ( left or right) when roe construction
+* is used. If roe construction is not used we use entropy fix construction.
+*
+* Note too that situations where the left and right wavespeeds are
+* both 0 are treated as shocks. This prevents them from generating
+* divide by zero in the entropy fix ( were they to be treated as
+* rarefactions).
+
+******************************************************************
+
+      IF ( ientropyfix .EQ. 1) THEN
+
+* Beginning of region that is specific to "ientropyfix = 1".
+
+******************************************************************
+
+* kth wavespeeds being considered here.
+      DO k = 1, NFIELD + NFLUID
+
+        DO i = nriembegin, nriemend
+
+        IF ( ( eigenval_db ( i, 0, k) .GE. 0.0) .AND.
+     1       ( eigenval_db ( i, 1, k) .GE. 0.0) ) THEN
+
+        do_roe ( i, k) = 1
+        use_eigenvec ( i, k) = 0
+
+        ELSE IF ( ( eigenval_db ( i, 0, k) .LT. 0.0) .AND.
+     1            ( eigenval_db ( i, 1, k) .LT. 0.0) ) THEN
+
+        do_roe ( i, k) = 1
+        use_eigenvec ( i, k) = 1
+
+        ELSE
+
+        do_roe ( i, k) = 0
+        use_eigenvec ( i, k) = 1
+
+        END IF
+
+        END DO
+
+      END DO
+
+
+* For the case where the characteristic fields are going into each other
+* and both characteristic fields are going into the zone boundary it may
+* help to increase the local dissipation. If so, uncomment the below
+* loop.
+
+* kth wavespeeds being considered here.
+      DO k = 1, NFIELD + NFLUID
+
+        DO i = nriembegin, nriemend
+
+        IF ( ( do_roe ( i, k) .EQ. 0) .AND.
+     1       ( eigenval_lf ( i, k) .GT. 0.0) .AND.
+     1       ( eigenval_rt ( i, k) .LT. 0.0) ) THEN
+
+        eigenval_db ( i, 1, k) =
+     1         AMAX1 ( ABS ( eigenval_db ( i, 1, k)),
+     1                 ABS ( eigenval_db ( i, 0, k)),
+     1                 ABS ( eigenval_lf ( i, k)),
+     1                 ABS ( eigenval_rt ( i, k)) )
+
+        eigenval_db ( i, 0, k) = - eigenval_db ( i, 1, k)
+
+        END IF
+
+        END DO
+
+      END DO
+
+******************************************************************
+
+      END IF
+
+* End of region that is specific to "ientropyfix = 1".
+
+******************************************************************
+
+      IF ( ientropyfix .EQ. 2) THEN
+
+* Beginning of region that is specific to "ientropyfix = 2".
+
+******************************************************************
+
+* kth wavespeeds being considered here.
+      DO k = 1, NFIELD + NFLUID
+
+        DO i = nriembegin, nriemend
+
+        IF ( ( eigenval_lf ( i, k) .LT. 0.0) .AND.
+     1       ( eigenval_rt ( i, k) .GT. 0.0) ) THEN
+
+        do_roe ( i, k) = 0
+        use_eigenvec ( i, k) = 1
+
+        ELSE IF ( eigenval_re ( i, k) .GE. 0.0) THEN
+
+        do_roe ( i, k) = 1
+        use_eigenvec ( i, k) = 0
+
+        ELSE
+
+        do_roe ( i, k) = 1
+        use_eigenvec ( i, k) = 1
+
+        END IF
+
+        END DO
+
+      END DO
+
+******************************************************************
+
+      END IF
+
+* End of region that is specific to "ientropyfix = 2".
+
+******************************************************************
+
+* Loop over the characteristic fields.
+
+      DO ifield = 1, NFIELD + NFLUID
+
+******************************************************************
+
+* Do the Roe fluxes and conserved variables here.
+
+
+* Zero out dot products.
+
+      DO i = nriembegin, nriemend
+
+      proj_flux_plus ( i) = 0.0
+      proj_cons_plus ( i) = 0.0
+
+      END DO
+
+
+* Fill in the dot products.
+
+      DO i = nriembegin, nriemend
+
+
+      IF ( do_roe ( i, ifield) .EQ. 1 ) THEN
+
+      k = use_eigenvec ( i, ifield)
+
+        DO j = 1, NFIELD + NFLUID
+
+        proj_flux_plus ( i) = proj_flux_plus ( i)
+     1                      + lf_eigenvec_re ( i, ifield, j)
+     1                             * zonebdy_flux ( i, k, j)
+
+        proj_cons_plus ( i) = proj_cons_plus ( i)
+     1                      + lf_eigenvec_re ( i, ifield, j)
+     1                        * zonebdy_conserved ( i, k, j)
+
+        END DO
+
+      END IF
+
+
+      END DO
+
+
+* Add in the suitable eigenvectors to the fluxes and conserved variables.
+
+      DO i = nriembegin, nriemend
+
+
+      IF ( do_roe ( i, ifield) .EQ. 1 ) THEN
+
+      flux_re ( i, 1 : NFIELD + NFLUID) =
+     1                  flux_re ( i, 1 : NFIELD + NFLUID)
+     1         + proj_flux_plus ( i)
+     1         * rt_eigenvec_re ( i, 1 : NFIELD + NFLUID, ifield)
+
+      conserved_re ( i, 1 : NFIELD + NFLUID) =
+     1             conserved_re ( i, 1 : NFIELD + NFLUID)
+     1         + proj_cons_plus ( i)
+     1         * rt_eigenvec_re ( i, 1 : NFIELD + NFLUID, ifield)
+
+      END IF
+
+
+      END DO
+*
+******************************************************************
+
+* Do the entropy fix for the fluxes and conserved variables here.
+
+* Zero out dot products.
+
+      DO i = nriembegin, nriemend
+
+      proj_flux_plus ( i) = 0.0
+      proj_cons_plus ( i) = 0.0
+
+      proj_flux_minus ( i) = 0.0
+      proj_cons_minus ( i) = 0.0
+
+      END DO
+
+
+* Make sure left and right eigenvalues are at least a little separated.
+
+      DO i = nriembegin, nriemend
+
+      IF ( ( do_roe ( i, ifield) .EQ. 0 ) .AND.
+     1     ( eigenval_db ( i, 1, ifield)
+     1     - eigenval_db ( i, 0, ifield) .LE. smallnum )
+     1   ) 
+
+     1 eigenval_db ( i, 0, ifield) = eigenval_db ( i, 1, ifield)
+     1                            - smallnum
+
+      END DO
+
+
+* Make coefficients for the flux and conserved variable projections here.
+
+      DO i = nriembegin, nriemend
+
+      IF ( do_roe ( i, ifield) .EQ. 0 ) THEN
+
+
+      temparr_01 ( i) = 1.0 / ( eigenval_db ( i, 1, ifield)
+     1                        - eigenval_db ( i, 0, ifield) )
+
+
+      coef_flux_plus_f ( i) = eigenval_db ( i, 1, ifield)
+     1                      * temparr_01 ( i)
+
+      coef_flux_plus_c ( i) = - eigenval_db ( i, 0, ifield)
+     1                      * coef_flux_plus_f ( i)
+
+      coef_flux_minus_f ( i) = - eigenval_db ( i, 0, ifield)
+     1                      * temparr_01 ( i)
+
+      coef_flux_minus_c ( i) = - coef_flux_plus_c ( i)
+
+
+      coef_cons_plus ( i) = ( zonebdy_eigenval ( i, ifield)
+     1                      - eigenval_db ( i, 0, ifield) )
+     1                    * temparr_01 ( i)
+
+      coef_cons_minus ( i) = ( eigenval_db ( i, 1, ifield)
+     1                       - zonebdy_eigenval ( i, ifield) )
+     1                    * temparr_01 ( i)
+
+      END IF
+
+      END DO
+
+
+* Fill in the dot products.
+
+      DO i = nriembegin, nriemend
+
+      IF ( do_roe ( i, ifield) .EQ. 0 ) THEN
+
+        DO j = 1, NFIELD + NFLUID
+
+        proj_flux_plus ( i) = proj_flux_plus ( i)
+     1                      + lf_eigenvec_re ( i, ifield, j)
+     1                        * zonebdy_flux ( i, 0, j)
+
+        proj_cons_plus ( i) = proj_cons_plus ( i)
+     1                      + lf_eigenvec_re ( i, ifield, j)
+     1                   * zonebdy_conserved ( i, 0, j)
+
+        proj_flux_minus ( i) = proj_flux_minus ( i)
+     1                        + lf_eigenvec_re ( i, ifield, j)
+     1                          * zonebdy_flux ( i, 1, j)
+
+        proj_cons_minus ( i) = proj_cons_minus ( i)
+     1                        + lf_eigenvec_re ( i, ifield, j)
+     1                     * zonebdy_conserved ( i, 1, j)
+
+        END DO
+
+      END IF
+
+      END DO
+
+
+* Add in the suitable eigenvectors to the fluxes and conserved variables.
+
+      DO i = nriembegin, nriemend
+
+
+      IF ( do_roe ( i, ifield) .EQ. 0 ) THEN
+
+
+      temparr_01 ( i) =
+
+     1       coef_flux_plus_f ( i) * proj_flux_plus ( i)
+     1     + coef_flux_plus_c ( i) * proj_cons_plus ( i)
+
+     1     + coef_flux_minus_f ( i) * proj_flux_minus ( i)
+     1     + coef_flux_minus_c ( i) * proj_cons_minus ( i)
+
+      flux_re ( i, 1 : NFIELD + NFLUID) =
+     1                  flux_re ( i, 1 : NFIELD + NFLUID)
+     1             + temparr_01 ( i)
+     1         * rt_eigenvec_re ( i, 1 : NFIELD + NFLUID, ifield)
+
+
+      temparr_02 ( i) =
+
+     1       coef_cons_plus ( i) * proj_cons_plus ( i)
+
+     1     + coef_cons_minus ( i) * proj_cons_minus ( i)
+
+      conserved_re ( i, 1 : NFIELD + NFLUID) =
+     1             conserved_re ( i, 1 : NFIELD + NFLUID)
+     1             + temparr_02 ( i)
+     1         * rt_eigenvec_re ( i, 1 : NFIELD + NFLUID, ifield)
+
+      END IF
+
+
+      END DO
+
+
+******************************************************************
+
+      END DO
+
+* End of ifield loop.
+
+******************************************************************
+******************************************************************
+
+* This way of obtaining the entropy flux ensures that even during a
+* normal call to the Riemann solver we get an HLL-based entropy
+* flux with which to enforce pressure positivity.
+
+      DO i = nriembegin, nriemend
+
+      entropy_ein_l ( i) = prsremi ( i)
+     1        / rhoremi ( i)**( gamma_soundspeed_remi ( i) - 1.0)
+      entropy_ein_r ( i) = prsrepl ( i)
+     1        / rhorepl ( i)**( gamma_soundspeed_repl ( i) - 1.0)
+
+      entropy_flux_ein_l ( i) = entropy_ein_l ( i) * vlxremi ( i)
+      entropy_flux_ein_r ( i) = entropy_ein_r ( i) * vlxrepl ( i)
+
+
+      wavespd_ein_l ( i) = AMIN1 ( eigenval_db ( i, 0, 1),
+     1                             eigenval_db ( i, 0, 2) )
+
+      wavespd_ein_r ( i) = AMAX1 ( eigenval_db ( i, 1, 7),
+     1                             eigenval_db ( i, 1, 6) )
+
+      wavespd_ein_l ( i) = AMIN1 ( wavespd_ein_l ( i), 0.0)
+      wavespd_ein_r ( i) = AMAX1 ( wavespd_ein_r ( i), 0.0)
+
+      temparr_01 ( i) = 1.0 / ( wavespd_ein_r ( i)
+     1                        - wavespd_ein_l ( i))
+
+      temparr_02 ( i) = wavespd_ein_r ( i) * wavespd_ein_l ( i)
+     1       / ( wavespd_ein_r ( i) - wavespd_ein_l ( i))
+
+
+      entropy_flux_re ( i) = 
+
+     1     ( wavespd_ein_r ( i) * entropy_flux_ein_l ( i)
+     1     - wavespd_ein_l ( i) * entropy_flux_ein_r ( i) )
+     1     * temparr_01 ( i)
+
+     1     + ( entropy_ein_r ( i) - entropy_ein_l ( i) )
+     1     * temparr_02 ( i)
+
+      END DO
+
+******************************************************************
+******************************************************************
+
+      END IF
+
+* End of ientropyfix = 1 or 2 case.
+
+******************************************************************
+******************************************************************
+
+! Build "do_ein" and "ratio_ein" so that one can treat strong
+! shock situations by blending in parts of an HLLE riemann solver.
+! There are two alternatives, one which treats strong rarefactions
+! on the same footing as shocks; the other which only goes after shocks.
+
+      DO i = nriembegin, nriemend
+
+      temparr_01 ( i) = AMIN1 ( msonic_arr ( i),
+     1                          eigenval_lf ( i, 7) - vlxremi ( i),
+     1                          eigenval_rt ( i, 7) - vlxrepl ( i) )
+
+#if ( 1 == 1)
+! Here we treat strong rarefactions on an equal footing with strong shocks.
+      temparr_02 ( i) = AMAX1 ( ABS ( divvel_arr ( i) ),
+     1                          ABS ( vlxrepl ( i) - vlxremi ( i) ),
+     1            ABS ( eigenval_rt ( i, 7) - eigenval_lf ( i, 7) ),
+     1            ABS ( eigenval_rt ( i, 1) - eigenval_lf ( i, 1) ) )
+
+      temparr_03 ( i) = - temparr_02 ( i)
+     1                + divratio_einfeldt_rs * temparr_01 ( i)
+#else
+! Here we only try to detect strong shocks. We don't detect strong rarefactions.
+      temparr_02 ( i) = AMIN1 ( divvel_arr ( i),
+     1                          vlxrepl ( i) - vlxremi ( i),
+     1            eigenval_rt ( i, 7) - eigenval_lf ( i, 7),
+     1            eigenval_rt ( i, 1) - eigenval_lf ( i, 1) )
+
+      temparr_03 ( i) = temparr_02 ( i)
+     1                + divratio_einfeldt_rs * temparr_01 ( i)
+#endif
+
+      IF ( temparr_03 ( i) .GE. 0.0) THEN
+        do_ein ( i) = 0
+        ratio_ein ( i) = 0.0
+      ELSE
+        do_ein ( i) = 1
+        ratio_ein ( i) = ABS ( temparr_03 ( i))
+     1                   / ( divratio_einfeldt_rs * temparr_01 ( i))
+        ratio_ein ( i) = AMIN1 ( ratio_ein ( i), 1.0)
+      END IF
+
+      END DO
+
+******************************************************************
+******************************************************************
+
+! Now check to see if each zone boundary has positive density
+! and pressure. If not, give that zone an Einfeldt fix.
+
+! For multispecies we have to also approximate the value of "gamma".
+! This is done in the most reasonable way that is relatively inexpensive.
+! i.e. it is not the scientifically best choice, but it is
+! the most expedient one.
+
+! For a more traditional interpretation of the Einfeldt fix, uncomment
+! the ensuing do loop.
+!      DO i = nriembegin, nriemend
+!      do_ein ( i) = 0
+!      ratio_ein ( i) = 0.0
+!      END DO
+
+
+      DO i = nriembegin, nriemend
+
+! Form the ratio of specific heats etc.
+
+      IF ( ( eigenval_db ( i, 0, 4) .GT. 0.0) .AND.
+     1     ( eigenval_db ( i, 1, 4) .GT. 0.0) ) THEN
+
+      mean_mol_wt_re ( i) = mean_mol_wt_remi ( i)
+      gamma_eos_re ( i) = gamma_eos_remi ( i)
+      gamma_soundspeed_re ( i) = gamma_soundspeed_remi ( i)
+
+      ELSE IF ( ( eigenval_db ( i, 0, 4) .LT. 0.0) .AND.
+     1          ( eigenval_db ( i, 1, 4) .LT. 0.0) ) THEN
+
+      mean_mol_wt_re ( i) = mean_mol_wt_repl ( i)
+      gamma_eos_re ( i) = gamma_eos_repl ( i)
+      gamma_soundspeed_re ( i) = gamma_soundspeed_repl ( i)
+
+      ELSE
+
+      mean_mol_wt_re ( i) = mean_mol_wt ( i)
+      gamma_eos_re ( i) = gamma_eos ( i)
+      gamma_soundspeed_re ( i) = gamma_soundspeed ( i)
+
+      END IF
+
+
+! Form the flow variables at the resolved state.
+
+      rho0 ( i) = AMAX1 ( conserved_re ( i, 1), rhofloor)
+
+      temparr_01 ( i) = 1.0 / rho0 ( i)
+      vlx0 ( i) = conserved_re ( i, 2) * temparr_01 ( i)
+      vly0 ( i) = conserved_re ( i, 3) * temparr_01 ( i)
+      vlz0 ( i) = conserved_re ( i, 4) * temparr_01 ( i)
+
+      bfy0 ( i) = conserved_re ( i, 6)
+      bfz0 ( i) = conserved_re ( i, 7)
+
+
+      prs0 ( i) = conserved_re ( i, 5)
+     1   - 0.5 * rho0 ( i) * ( vlx0 ( i)**2 + vly0 ( i)**2
+     1                       + vlz0 ( i)**2 )
+     1   - 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2
+     1           + bfz0 ( i)**2) * one_by_fourpi
+      prs0 ( i) = ( gamma_eos_re ( i) - 1.0) * prs0 ( i)
+
+
+#if ( NFLUID >= 1)
+      temparr_01 ( i) = 1.0 / rho0 ( i)
+      specie0 ( 1: NFLUID, i) =
+     1         conserved_re ( i, NFIELD + 1: NFIELD + NFLUID)
+     1       * temparr_01 ( i)
+#endif
+
+
+! Flag zones for Einfeldt fix, if that is needed.
+
+      IF ( ( rho0 ( i) .LE. rhofloor_plus_delta) .OR.
+     1     ( prs0 ( i) .LE. prsfloor_plus_delta) ) THEN
+        do_ein ( i) = 1
+        ratio_ein ( i) = 1.0
+      END IF
+
+      IF ( ( rhoremi ( i) .LE. rhofloor_plus_delta) .OR.
+     1     ( prsremi ( i) .LE. prsfloor_plus_delta) ) THEN
+        do_ein ( i) = 1
+        ratio_ein ( i) = 1.0
+      END IF
+
+      IF ( ( rhorepl ( i) .LE. rhofloor_plus_delta) .OR.
+     1     ( prsrepl ( i) .LE. prsfloor_plus_delta) ) THEN
+        do_ein ( i) = 1
+        ratio_ein ( i) = 1.0
+      END IF
+
+      IF ( ( rhobar ( i) .LE. rhofloor_plus_delta) .OR.
+     1     ( prsbar ( i) .LE. prsfloor_plus_delta) ) THEN
+        do_ein ( i) = 1
+        ratio_ein ( i) = 1.0
+      END IF
+
+      END DO
+
+
+* If the species fractions in the resolved state are less than 0.0
+* or greater than 1.0 then too we need to invoke the HLL riemann solver.
+* Because it is based on a linear, convex arithmetic sum of the left
+* and right states, the HLL riemann solver can be relied on to
+* produce species fractions that satisfy this physical requirement
+* of lying between 0 and 1. This property also ensures that if both
+* the right and left states of the riemann problem have the property
+* that the sum of the active species fractions remains less than one then 
+* the resolved state from the riemann solver also has that property.
+
+      DO ifluid = 1, NFLUID
+
+        DO i = nriembegin, nriemend
+
+        IF ( ( specie0 ( ifluid, i) .LT. - smallnum) .OR.
+     1       ( specie0 ( ifluid, i) .GT. 1.0 + smallnum) ) THEN
+          do_ein ( i) = 1
+          ratio_ein ( i) = 1.0
+        END IF
+
+        END DO
+
+      END DO
+*
+*
+* Now make index array with which we will access those zones that need
+* the Einfeldt fix.
+*
+      num_ein = nriembegin - 1
+
+      DO i = nriembegin, nriemend
+
+      IF ( do_ein ( i) .EQ. 1) THEN
+
+      num_ein = num_ein + 1
+
+      indx_ein ( num_ein) = i
+
+      END IF
+
+      END DO
+
+! Note that we have commented out the warning when Einfeldt fix is invoked.
+
+!      IF ( num_ein .GE. nriembegin )
+!     1      WRITE ( 6, *)" ntstep = ", ntstep,
+!     1       " gives num_ein = ", num_ein - nriembegin + 1
+
+*******************************************************************
+
+      IF ( num_ein .GE. nriembegin) THEN
+
+*******************************************************************
+
+! First gather zones that need Einfeldt fix. 
+! The bounding eigenvalues are those produced from the
+! Roe solver.
+! Since the Roe solver always produces a good
+! value for the Alfven speed we include it in here. 
+
+      DO i = nriembegin, num_ein
+
+****************
+
+      ii = indx_ein ( i)
+
+****************
+
+      wavespd_ein_l ( i) = AMIN1 ( eigenval_db ( ii, 0, 1),
+     1                             eigenval_db ( ii, 0, 2) )
+
+      wavespd_ein_r ( i) = AMAX1 ( eigenval_db ( ii, 1, 7),
+     1                             eigenval_db ( ii, 1, 6) )
+
+****************
+
+! The lines below make the flux into an LLF flux (which is more stabilizing).
+! Comment them out to get an Einfeldt flux.
+
+      temparr_01 ( i) = AMAX1 ( ABS ( eigenval_db ( ii, 0, 1)), 
+     1                          ABS ( eigenval_db ( ii, 0, 2)), 
+     1                          ABS ( eigenval_db ( ii, 1, 7)),
+     1                          ABS ( eigenval_db ( ii, 1, 6)))
+      wavespd_ein_l ( i) = - 1.0 * temparr_01 ( i)
+      wavespd_ein_r ( i) = 1.0 * temparr_01 ( i)
+
+****************
+
+! Here we make the Einfeldt fix directly without invoking a subroutine call.
+
+      IF ( wavespd_ein_l ( i) .GT. 0.0) THEN
+! Pick left conserved state.
+
+      conserved_ein ( i, 1: NFIELD + NFLUID) =
+     1              zonebdy_conserved ( ii, 0, 1: NFIELD + NFLUID)
+
+      flux_ein ( i, 1: NFIELD + NFLUID) =
+     1              zonebdy_flux ( ii, 0, 1: NFIELD + NFLUID)
+
+      ELSE IF ( wavespd_ein_r ( i) .LT. 0.0) THEN
+! Pick right conserved state.
+
+      conserved_ein ( i, 1: NFIELD + NFLUID) =
+     1              zonebdy_conserved ( ii, 1, 1: NFIELD + NFLUID)
+
+      flux_ein ( i, 1: NFIELD + NFLUID) =
+     1              zonebdy_flux ( ii, 1, 1: NFIELD + NFLUID)
+
+      ELSE
+! Pick HLL with one mean, conserved state.
+
+      temparr_01 ( i) = 1.0 / ( wavespd_ein_r ( i)
+     1                        - wavespd_ein_l ( i))
+
+      temparr_02 ( i) = wavespd_ein_r ( i) * wavespd_ein_l ( i)
+     1       / ( wavespd_ein_r ( i) - wavespd_ein_l ( i))
+
+
+      conserved_ein ( i, 1: NFIELD + NFLUID) =
+
+     1  ( wavespd_ein_r ( i)
+     1  * zonebdy_conserved ( ii, 1, 1: NFIELD + NFLUID)
+     1  -  wavespd_ein_l ( i)
+     1  * zonebdy_conserved ( ii, 0, 1: NFIELD + NFLUID) )
+     1  * temparr_01 ( i)
+
+     1  - ( zonebdy_flux ( ii, 1, 1: NFIELD + NFLUID)
+     1    - zonebdy_flux ( ii, 0, 1: NFIELD + NFLUID) )
+     1  * temparr_01 ( i)
+
+      flux_ein ( i, 1: NFIELD + NFLUID) =
+
+     1 ( wavespd_ein_r ( i) * zonebdy_flux ( ii, 0, 1: NFIELD + NFLUID)
+     1 - wavespd_ein_l ( i) * zonebdy_flux ( ii, 1, 1: NFIELD + NFLUID))
+     1 * temparr_01 ( i)
+
+     1 + ( zonebdy_conserved ( ii, 1, 1: NFIELD + NFLUID)
+     1   - zonebdy_conserved ( ii, 0, 1: NFIELD + NFLUID) )
+     1 * temparr_02 ( i)
+
+      END IF
+
+****************
+
+! And hand them back. This is where we blend "1.0 - ratio_ein ( ii)" of the
+! Roe type Riemann solver with "ratio_ein ( ii)" of the HLLE Riemann solver.
+
+      temparr_02 ( i) = 1.0 - ratio_ein ( ii)
+
+      conserved_re ( ii, 1: NFIELD + NFLUID) =
+     1   temparr_02 ( i) * conserved_re ( ii, 1: NFIELD + NFLUID)
+     1 + ratio_ein ( ii) * conserved_ein ( i, 1: NFIELD + NFLUID)
+
+      flux_re ( ii, 1: NFIELD + NFLUID) = 
+     1   temparr_02 ( i) * flux_re ( ii, 1: NFIELD + NFLUID)
+     1 + ratio_ein ( ii) * flux_ein ( i, 1: NFIELD + NFLUID)
+
+      END DO
+
+******************************************************************
+
+      END IF
+
+! End of making Einfeldt fix.
+
+******************************************************************
+******************************************************************
+
+! Wind-up operations done past this point:
+
+******************************************************************
+
+! Move the species fluxes by one to make way for the split
+! in the advected and pressure parts of the x-momentum flux.
+
+! To do that, we realize first that the 8th component of the flux will
+! have to contain the pressure. Right now, the fluxes are all contiguous
+! even when multiple species are present. So we first move the fluxes
+! over by one when multiple species are present.
+
+      DO ifluid = NFLUID, 1, -1
+
+      k = NFIELD + ifluid
+
+        DO i = nriembegin, nriemend
+
+        flux_re ( i, k + 1) = flux_re ( i, k)
+
+        END DO
+
+      END DO
+
+! Zero out the eighth component of "flux_re" because we have not
+! yet made the pressure split.
+
+      DO i = nriembegin, nriemend
+
+      flux_re ( i, 8) = 0.0
+
+      END DO
+
+******************************************************************
+******************************************************************
+
+! Form the flow variables at the resolved state.
+! Also split the momentum flux_re into advected and pressure parts and
+! store the pressure part separately.
+
+      IF ( split_prsflux_re .EQ. 1) THEN
+
+      DO i = nriembegin, nriemend
+
+      rho0 ( i) = AMAX1 ( conserved_re ( i, 1), rhofloor)
+
+      temparr_01 ( i) = 1.0 / rho0 ( i)
+      vlx0 ( i) = conserved_re ( i, 2) * temparr_01 ( i)
+      vly0 ( i) = conserved_re ( i, 3) * temparr_01 ( i)
+      vlz0 ( i) = conserved_re ( i, 4) * temparr_01 ( i)
+
+      bfy0 ( i) = conserved_re ( i, 6)
+      bfz0 ( i) = conserved_re ( i, 7)
+
+
+      prs0 ( i) = conserved_re ( i, 5)
+     1   - 0.5 * rho0 ( i) * ( vlx0 ( i)**2 + vly0 ( i)**2
+     1                       + vlz0 ( i)**2 )
+     1   - 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2
+     1           + bfz0 ( i)**2) * one_by_fourpi
+      prs0 ( i) = ( gamma_eos_re ( i) - 1.0) * prs0 ( i)
+
+
+#if ( NFLUID >= 1)
+      temparr_01 ( i) = 1.0 / rho0 ( i)
+      specie0 ( 1: NFLUID, i) =
+     1         conserved_re ( i, NFIELD + 1: NFIELD + NFLUID)
+     1       * temparr_01 ( i)
+#endif
+
+
+! Make the part of the momentum flux that acts like a pressure.
+
+      flux_re ( i, 8) = prs0 ( i)
+     1   + 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2
+     1           + bfz0 ( i)**2) * one_by_fourpi
+
+      flux_re ( i, 2) = flux_re ( i, 2) - flux_re ( i, 8)
+
+      END DO
+
+      END IF
+! End of "split_prsflux_re .EQ. 1" part.
+
+******************************************************************
+******************************************************************
+
+! It may be useful to double the dissipation of the magnetic fields,
+! not that it has ever produced wrong answers. For some problems like
+! turbulence, increasing B-field dissipation is especially counter-productive.
+
+! It is also inadvisable for fully supersonic flow, where the one-sided
+! fluxes are indeed just right.
+
+      IF ( double_dissipate_efz .EQ. 1) THEN
+
+      DO i = nriembegin, nriemend
+
+        IF ( ( eigenval_db ( i, 0, 1) .LT. 0.0) .AND. 
+     1       ( eigenval_db ( i, 1, 7) .GT. 0.0) ) THEN
+
+        flux_re ( i, 6) = 2.0 * flux_re ( i, 6)
+     1             - 0.5 * ( zonebdy_flux ( i, 0, 6)
+     1                     + zonebdy_flux ( i, 1, 6) )
+
+        END IF
+
+      END DO
+
+      END IF
+
+! ------------------------------
+
+      IF ( double_dissipate_efy .EQ. 1) THEN
+
+      DO i = nriembegin, nriemend
+
+        IF ( ( eigenval_db ( i, 0, 1) .LT. 0.0) .AND.
+     1       ( eigenval_db ( i, 1, 7) .GT. 0.0) ) THEN
+
+        flux_re ( i, 7) = 2.0 * flux_re ( i, 7)
+     1             - 0.5 * ( zonebdy_flux ( i, 0, 7)
+     1                     + zonebdy_flux ( i, 1, 7) )
+
+        END IF
+
+      END DO
+
+      END IF
+
+**********************************************************************
+**********************************************************************
+
+      RETURN
+
+      END SUBROUTINE MHD_RIEM_ROE
+
+******************************************************************
+******************************************************************
+
+! We have the option of minimizing the number of EOS calls
+! (which can be quite expensive) by setting "use_approx_eos = 1".
+! This can be a risky step if "gamma_eos" is rapidly varying.
+
+      SUBROUTINE MHD_RIEM_HLL
+
+     1   ( nriembegin, nriemend,
+
+     1     double_dissipate_efz, double_dissipate_efy,
+
+     1     gamma, smallnum, prsfloor, rhofloor, pi, fracdiff,
+     1     ientropyfix, iprimitive, use_approx_eos,
+     1     split_prsflux_re, divratio_einfeldt_rs, debug_stop,
+
+     1     gasconst,
+     1     cp_specie, molewt_specie, heat_of_formation,
+
+     1        rhoremi, rhorepl,
+     1        prsremi, prsrepl,
+     1        vlxremi, vlxrepl,
+     1        vlyremi, vlyrepl,
+     1        vlzremi, vlzrepl,
+     1        bfxre,
+     1        bfyremi, bfyrepl,
+     1        bfzremi, bfzrepl,
+     1        specieremi, specierepl,
+
+     1        gamma_eos_remi, gamma_eos_repl,
+     1        gamma_soundspeed_remi, gamma_soundspeed_repl,
+     1        mean_mol_wt_remi, mean_mol_wt_repl,
+
+     1        msonic_arr, divvel_arr,
+
+     1        zonebdy_conserved, zonebdy_flux,
+
+     1     eigenval_re, lf_eigenvec_re, rt_eigenvec_re, eigenwt_re,
+     1     conserved_re, flux_re, entropy_flux_re,
+
+     1     rho0, prs0, vlx0, vly0, vlz0, bfy0, bfz0, specie0,
+     1     do_ein )
+
+! ----------------------------------------------------------------------
+
+* Written by : Dinshaw S. Balsara
+
+* Does the riemann solver based on Balsara's modification of the Roe-type
+* riemann solver. See Balsara, Astrophysical J. Supp., vol. 132, pg. 1, (2001)
+
+* The x-momentum flux_re is split into an advected part and a ( thermal +
+* magnetic) pressure part.
+
+* ientropyfix = 1 will give the maximal dissipation by using the LLF flux
+* even for characteristic fields that go into eachother.
+
+* ientropyfix = 2 will provide an entropy fix when characteristic fields are
+* going apart but not when they are going into eachother.
+
+* ientropyfix = 3 will provide the basic Harten and Hyman entropy fix.
+
+* ientropyfix = 4 will provide the basic Harten and Hyman entropy fix
+* using the states on either side of a single wave. This is truer to the
+* original Harten and Hyman entropy fix.
+
+* In those zone boundaries where the pressure is negative, an Einfeld
+* or LLF flux is used. A few lines at the beginning of the last
+* loop turn this into an LLF flux. Since that is more stable, we keep
+* those lines uncommented so that the default flux is the LLF flux.
+
+* While the Roe type riemann solver is little more accurate than the
+* HLL solver, it can become very expensive when several species
+* are involved.
+
+* An HLL-based entropy flux is also always calculated and passed through
+* the subroutine interface. This ensures that we are ALWAYS able to
+* enforce pressure positivity at no extra computational cost.
+
+*******************************************************************
+
+      IMPLICIT NONE
+
+*******************************************************************
+
+      INTEGER :: nriembegin, nriemend, 
+     1        double_dissipate_efz, double_dissipate_efy,
+     1        ientropyfix, iprimitive, use_approx_eos,
+     1        split_prsflux_re
+
+      INTEGER :: debug_stop
+
+      REAL :: gamma, smallnum, prsfloor, rhofloor, 
+     1     pi, fracdiff, gasconst, divratio_einfeldt_rs
+
+      REAL, DIMENSION ( 0 : NFLUID) ::
+     1      cp_specie, molewt_specie, heat_of_formation
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     rhoremi, rhorepl, prsremi, prsrepl,
+
+     1     vlxremi, vlxrepl, vlyremi, vlyrepl,
+     1     vlzremi, vlzrepl,
+
+     1     bfxre, bfyremi, bfyrepl, bfzremi, bfzrepl,
+
+     1     mean_mol_wt_remi, gamma_eos_remi, gamma_soundspeed_remi,
+     1     mean_mol_wt_repl, gamma_eos_repl, gamma_soundspeed_repl,
+
+     1     msonic_arr, divvel_arr
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     specieremi, specierepl
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1      NFIELD + NFLUID, NFIELD + NFLUID) ::
+     1    lf_eigenvec_re, rt_eigenvec_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1      NFIELD + NFLUID) ::
+     1     eigenval_re, eigenwt_re, conserved_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                 NFIELD + NFLUID + 1) ::
+     1     flux_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  0 : 1, NFIELD + NFLUID) ::
+     1      zonebdy_flux, zonebdy_conserved
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     rho0, prs0, vlx0, vly0, vlz0, bfy0, bfz0,
+     1     entropy_flux_re
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1      specie0
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) :: do_ein
+
+************************************************************************
+************************************************************************
+
+* Past this point we only declare variables that are internal to the
+* subroutine.
+
+      INTEGER i, ii, j, k, ifield, ifluid, num_ein
+
+      REAL fourpi, one_by_fourpi, small_speed,
+     1     rhofloor_plus_delta, prsfloor_plus_delta
+
+* Variables used for enoized riemann solver.
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1      iwave_1, iwave_2, make_2, make_entropyfix
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                     NFIELD + NFLUID) ::
+
+     1        use_eigenvec, do_roe
+
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  NFIELD + NFLUID) ::
+
+     1      zonebdy_eigenval, eigenval_lf, eigenval_rt, del_cons
+
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  0 : 1, NFIELD + NFLUID) ::
+
+     1      eigenval_db
+
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1      NFIELD + NFLUID) ::
+
+     1      eigenwt_cons, eigenwt_flux,
+     1      eigenval_1, eigenval_2, conserved_2
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     momxremi, momxrepl, momyremi, momyrepl,
+     1     momzremi, momzrepl, engl, engr, eps_zone,
+
+     1     proj_flux_plus, proj_flux_minus,
+     1     proj_cons_plus, proj_cons_minus,
+
+     1     coef_flux_plus_f, coef_flux_plus_c,
+     1     coef_flux_minus_f, coef_flux_minus_c,
+
+     1     coef_cons_plus, coef_cons_minus, wavspd_1, wavspd_2,
+
+     1     temparr_01, temparr_02, temparr_03, ratio_ein
+
+
+******************************************************************
+******************************************************************
+
+* Variables used for Einfeldt fix.
+
+* "conserved_ein, flux_ein" contain the resolved fields and fluxes
+* on either side of the riemann problem.
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  NFIELD + NFLUID) ::
+
+     1     conserved_ein, flux_ein
+
+
+* These should be loaded with the min and max speeds from the roe solver.
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     wavespd_ein_l, wavespd_ein_r
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     eng, temperature,
+     1     mean_mol_wt, gamma_eos, gamma_soundspeed,
+     1     engremi, temperatureremi, total_enthalpy_remi,
+     1     engrepl, temperaturerepl, total_enthalpy_repl,
+     1     mean_mol_wt_re, gamma_eos_re, gamma_soundspeed_re,
+
+     1     entropy_ein_l, entropy_flux_ein_l,
+     1     entropy_ein_r, entropy_flux_ein_r
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1        indx_ein
+
+******************************************************************
+******************************************************************
+
+* Variables used for inlining EIGENVECMHD and EIGENVALMHD.
+
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     va_x, c_s, v_a, v_f, v_s, beta_y, beta_z,
+     1     alpha_f, alpha_s, sgnbx, sq_4pi_rho, va_perp,
+     1     one_by_4pi_rho,
+
+     1     rhobar, prsbar, vlxbar, vlybar, vlzbar, total_enthalpy_bar,
+     1     bfxbar, bfybar, bfzbar, xbar,
+
+     1     dprs_drho, dprs_deng, deng_drho, deng_dprs
+
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1      speciebar, dprs_dspecie, deng_dspecie
+
+* Temporary usage of left and right eigenvectors in the primitive variables.
+* Transformation matrices to go from conserved to primitive and back.
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  NFIELD + NFLUID, NFIELD + NFLUID) ::
+
+     1     lf_eigenvec1, rt_eigenvec1, dudw, dwdu
+
+! ----------------------------------------------------------------------
+
+* Make some settings.
+
+      fourpi = 4.0 * pi
+      one_by_fourpi = 1.0 / fourpi
+
+* Because floor values of density and pressure have already been taken,
+* we set a bottom value that is a little above that floor.
+
+      rhofloor_plus_delta = 1.000001 * rhofloor
+      prsfloor_plus_delta = 1.000001 * prsfloor
+
+
+      IF ( NFIELD .NE. 7) THEN
+      WRITE ( 6, *)"MHD_RIEM_HLL : NFIELD .NE. 7", NFIELD, 7
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( nriembegin .LT. ONEDFLUIDBEGIN) .OR.
+     1     ( nriembegin .GT. ONEDFLUIDEND) ) THEN
+      WRITE ( 6, *)"MHD_RIEM_HLL : nriembegin out of bounds",
+     1       nriembegin, ONEDFLUIDBEGIN, ONEDFLUIDEND
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( nriemend .LT. ONEDFLUIDBEGIN) .OR.
+     1     ( nriemend .GT. ONEDFLUIDEND) ) THEN
+      WRITE ( 6, *)"MHD_RIEM_HLL : nriemend out of bounds",
+     1       nriemend, ONEDFLUIDBEGIN, ONEDFLUIDEND
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( iprimitive .LT. -1) .OR.
+     1     ( iprimitive .GT. 0) ) THEN
+      WRITE ( 6, *)"MHD_RIEM_HLL : iprimitive out of bounds",
+     1  iprimitive
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( ientropyfix .LT. 1) .OR.
+     1     ( ientropyfix .GT. 4) ) THEN
+      WRITE ( 6, *)"MHD_RIEM_HLL : ientropyfix out of bounds",
+     1  ientropyfix
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( split_prsflux_re .LT. 0) .OR.
+     1     ( split_prsflux_re .GT. 1)) THEN
+      WRITE ( 6, *)"MHD_RIEM_HLL : split_prsflux_re ",
+     1             " out of bounds", split_prsflux_re
+      debug_stop = 1
+      RETURN
+      END IF
+
+******************************************************************
+******************************************************************
+
+* Bound the density and pressure variables.
+* For starters none of the zones need Einfeldt fix.
+* Also "rhobar 2" and "prsbar 2" may not be evaluated in all cases
+* later on so we give them a dummy initialization.
+
+      DO i = nriembegin, nriemend
+
+      do_ein ( i) = 0
+
+      rhoremi ( i) = AMAX1 ( rhoremi ( i), rhofloor)
+      rhorepl ( i) = AMAX1 ( rhorepl ( i), rhofloor)
+
+      prsremi ( i) = AMAX1 ( prsremi ( i), prsfloor)
+      prsrepl ( i) = AMAX1 ( prsrepl ( i), prsfloor)
+ 
+      END DO
+
+***********************
+
+* Evaluate the thermal energy density and the local gammas. In doing so, we
+* also make sure the species fractions are individually and cumulatively
+* within reasonable ranges. Do this only if exact EOS's are to be used.
+
+* Because this is a teaching code we will not be using exact EOS's here.
+
+* Relying on approximate EOS's here.
+
+      DO i = nriembegin, nriemend
+
+      engremi ( i) = prsremi ( i) / ( gamma_eos_remi ( i) - 1.0)
+      temperatureremi ( i) = prsremi ( i) * mean_mol_wt_remi ( i)
+     1                     / ( gasconst * rhoremi ( i))
+
+      engrepl ( i) = prsrepl ( i) / ( gamma_eos_repl ( i) - 1.0)
+      temperaturerepl ( i) = prsrepl ( i) * mean_mol_wt_repl ( i)
+     1                     / ( gasconst * rhorepl ( i))
+
+      END DO
+
+***************************
+
+* Make "total_enthalpy_remi" and "total_enthalpy_repl". These are
+* useful in making Roe-averages.
+
+      DO i = nriembegin, nriemend
+
+      total_enthalpy_remi ( i) = ( engremi ( i) + prsremi ( i)
+     1    + 0.5 * rhoremi ( i) * ( vlxremi ( i)**2 + vlyremi ( i)**2
+     1                           + vlzremi ( i)**2)
+     1    + one_by_fourpi * ( bfxre ( i)**2 + bfyremi ( i)**2
+     1                      + bfzremi ( i)**2 ) ) / rhoremi ( i)
+
+      total_enthalpy_repl ( i) = ( engrepl ( i) + prsrepl ( i)
+     1    + 0.5 * rhorepl ( i) * ( vlxrepl ( i)**2 + vlyrepl ( i)**2
+     1                           + vlzrepl ( i)**2)
+     1    + one_by_fourpi * ( bfxre ( i)**2 + bfyrepl ( i)**2
+     1                      + bfzrepl ( i)**2 ) ) / rhorepl ( i)
+
+      END DO
+
+******************************************************************
+******************************************************************
+
+! Build "zonebdy_conserved" and "zonebdy_flux".
+
+      DO i = nriembegin, nriemend
+
+
+      zonebdy_conserved ( i, 0, 1) = rhoremi ( i)
+      zonebdy_conserved ( i, 0, 2) = rhoremi ( i)
+     1                             * vlxremi ( i)
+      zonebdy_conserved ( i, 0, 3) = rhoremi ( i)
+     1                             * vlyremi ( i)
+      zonebdy_conserved ( i, 0, 4) = rhoremi ( i)
+     1                             * vlzremi ( i)
+      zonebdy_conserved ( i, 0, 6) = bfyremi ( i)
+      zonebdy_conserved ( i, 0, 7) = bfzremi ( i)
+
+
+      zonebdy_conserved ( i, 1, 1) = rhorepl ( i)
+      zonebdy_conserved ( i, 1, 2) = rhorepl ( i)
+     1                             * vlxrepl ( i)
+      zonebdy_conserved ( i, 1, 3) = rhorepl ( i)
+     1                             * vlyrepl ( i)
+      zonebdy_conserved ( i, 1, 4) = rhorepl ( i)
+     1                             * vlzrepl ( i)
+      zonebdy_conserved ( i, 1, 6) = bfyrepl ( i)
+      zonebdy_conserved ( i, 1, 7) = bfzrepl ( i)
+
+
+      zonebdy_flux ( i, 0, 1) = zonebdy_conserved ( i, 0, 2)
+      zonebdy_flux ( i, 0, 2) =
+     1     zonebdy_conserved ( i, 0, 2) * vlxremi ( i)
+     1   + prsremi ( i)
+     1   + 0.5 * ( - bfxre ( i)**2 + bfyremi ( i)**2
+     1                             + bfzremi ( i)**2) * one_by_fourpi
+      zonebdy_flux ( i, 0, 3) =
+     1     zonebdy_conserved ( i, 0, 3) * vlxremi ( i)
+     1                - bfxre ( i) * bfyremi ( i) * one_by_fourpi
+      zonebdy_flux ( i, 0, 4) =
+     1     zonebdy_conserved ( i, 0, 4) * vlxremi ( i)
+     1                - bfxre ( i) * bfzremi ( i) * one_by_fourpi
+      zonebdy_flux ( i, 0, 6) = bfyremi ( i) * vlxremi ( i)
+     1                        - bfxre ( i) * vlyremi ( i)
+      zonebdy_flux ( i, 0, 7) = bfzremi ( i) * vlxremi ( i)
+     1                        - bfxre ( i) * vlzremi ( i)
+
+
+      zonebdy_flux ( i, 1, 1) = zonebdy_conserved ( i, 1, 2)
+      zonebdy_flux ( i, 1, 2) =
+     1     zonebdy_conserved ( i, 1, 2) * vlxrepl ( i)
+     1   + prsrepl ( i)
+     1   + 0.5 * ( - bfxre ( i)**2 + bfyrepl ( i)**2
+     1                             + bfzrepl ( i)**2) * one_by_fourpi
+      zonebdy_flux ( i, 1, 3) =
+     1     zonebdy_conserved ( i, 1, 3) * vlxrepl ( i)
+     1                - bfxre ( i) * bfyrepl ( i) * one_by_fourpi
+      zonebdy_flux ( i, 1, 4) =
+     1     zonebdy_conserved ( i, 1, 4) * vlxrepl ( i)
+     1                - bfxre ( i) * bfzrepl ( i) * one_by_fourpi
+      zonebdy_flux ( i, 1, 6) = bfyrepl ( i) * vlxrepl ( i)
+     1                        - bfxre ( i) * vlyrepl ( i)
+      zonebdy_flux ( i, 1, 7) = bfzrepl ( i) * vlxrepl ( i)
+     1                        - bfxre ( i) * vlzrepl ( i)
+
+      END DO
+
+! ------------------------------
+
+* Make the fifth component differently depending on which flux
+* is desired.
+
+      IF ( iprimitive .EQ. 0) THEN
+
+      DO i = nriembegin, nriemend
+
+      zonebdy_conserved ( i, 0, 5) =
+     1      engremi ( i)
+     1    + 0.5 * rhoremi ( i)
+     1    * ( vlxremi ( i)**2 + vlyremi ( i)**2
+     1                        + vlzremi ( i)**2)
+     1    + 0.5 * ( bfxre ( i)**2 + bfyremi ( i)**2
+     1                            + bfzremi ( i)**2) * one_by_fourpi
+
+      zonebdy_conserved ( i, 1, 5) =
+     1      engrepl ( i)
+     1    + 0.5 * rhorepl ( i)
+     1    * ( vlxrepl ( i)**2 + vlyrepl ( i)**2
+     1                        + vlzrepl ( i)**2)
+     1    + 0.5 * ( bfxre ( i)**2 + bfyrepl ( i)**2
+     1                            + bfzrepl ( i)**2) * one_by_fourpi
+
+      zonebdy_flux ( i, 0, 5) =
+     1     ( zonebdy_conserved ( i, 0, 5) + prsremi ( i)
+     1   + 0.5 * ( bfxre ( i)**2 + bfyremi ( i)**2
+     1           + bfzremi ( i)**2) * one_by_fourpi ) * vlxremi ( i)
+     1   - bfxre ( i) * ( bfxre ( i) * vlxremi ( i)
+     1                  + bfyremi ( i) * vlyremi ( i)
+     1                  + bfzremi ( i) * vlzremi ( i) ) * one_by_fourpi
+
+      zonebdy_flux ( i, 1, 5) =
+     1     ( zonebdy_conserved ( i, 1, 5) + prsrepl ( i)
+     1   + 0.5 * ( bfxre ( i)**2 + bfyrepl ( i)**2
+     1           + bfzrepl ( i)**2) * one_by_fourpi ) * vlxrepl ( i)
+     1   - bfxre ( i) * ( bfxre ( i) * vlxrepl ( i)
+     1                  + bfyrepl ( i) * vlyrepl ( i)
+     1                  + bfzrepl ( i) * vlzrepl ( i) ) * one_by_fourpi
+
+      END DO
+
+      END IF
+
+
+      IF ( iprimitive .EQ. - 1) THEN
+
+      DO i = nriembegin, nriemend
+
+      zonebdy_conserved ( i, 0, 5) = prsremi ( i)
+     1        / rhoremi ( i)**( gamma_soundspeed_remi ( i) - 1.0)
+
+      zonebdy_conserved ( i, 1, 5) = prsrepl ( i)
+     1        / rhorepl ( i)**( gamma_soundspeed_repl ( i) - 1.0)
+
+      zonebdy_flux ( i, 0, 5) = zonebdy_conserved ( i, 0, 5)
+     1                        * vlxremi ( i)
+
+      zonebdy_flux ( i, 1, 5) = zonebdy_conserved ( i, 1, 5)
+     1                        * vlxrepl ( i)
+
+      END DO
+
+      END IF
+
+! ------------------------------
+
+* If multiple species are present then initialize their fluxes etc.
+* appropriately also.
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+        zonebdy_conserved ( i, 0, k) = rhoremi ( i)
+     1                               * specieremi ( ifluid, i)
+
+        zonebdy_conserved ( i, 1, k) = rhorepl ( i)
+     1                               * specierepl ( ifluid, i)
+
+        zonebdy_flux ( i, 0, k) = zonebdy_conserved ( i, 0, k)
+     1                          * vlxremi ( i)
+
+        zonebdy_flux ( i, 1, k) = zonebdy_conserved ( i, 1, k)
+     1                          * vlxrepl ( i)
+
+        conserved_re ( i, k) = 0.0
+
+        flux_re ( i, k + 1) = 0.0
+
+      END DO
+
+      END DO
+
+! ------------------------------
+
+! Zero out "flux_re" here.
+
+      DO i = nriembegin, nriemend
+
+      conserved_re ( i, 1) = 0.0
+      conserved_re ( i, 2) = 0.0
+      conserved_re ( i, 3) = 0.0
+      conserved_re ( i, 4) = 0.0
+      conserved_re ( i, 5) = 0.0
+      conserved_re ( i, 6) = 0.0
+      conserved_re ( i, 7) = 0.0
+
+      flux_re ( i, 1) = 0.0
+      flux_re ( i, 2) = 0.0
+      flux_re ( i, 3) = 0.0
+      flux_re ( i, 4) = 0.0
+      flux_re ( i, 5) = 0.0
+      flux_re ( i, 6) = 0.0
+      flux_re ( i, 7) = 0.0
+      flux_re ( i, 8) = 0.0
+
+      END DO
+
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+        conserved_re ( i, k) = 0.0
+
+        flux_re ( i, k + 1) = 0.0
+
+      END DO
+
+      END DO
+
+
+******************************************************************
+******************************************************************
+
+* Here we use Roe averaging and make only one call to the
+* eigenvector subroutine. The "eng, temperature" etc. that we make here
+* can even serve as good initial guesses for an exact EOS.
+
+
+      DO i = nriembegin, nriemend
+
+! ----------
+
+      gamma_eos ( i) = 0.5 * ( gamma_eos_remi ( i)
+     1                       + gamma_eos_repl ( i))
+      gamma_soundspeed ( i) = 0.5 * ( gamma_soundspeed_remi ( i)
+     1                              + gamma_soundspeed_repl ( i))
+      mean_mol_wt ( i) = 0.5 * ( mean_mol_wt_remi ( i)
+     1                         + mean_mol_wt_repl ( i))
+
+! ----------
+
+      temparr_01 ( i) = SQRT ( rhorepl ( i) / rhoremi ( i))
+      temparr_02 ( i) = 1.0 / ( 1.0 + temparr_01 ( i))
+
+      rhobar ( i) = SQRT ( rhoremi ( i) * rhorepl ( i))
+
+      vlxbar ( i) = ( vlxremi ( i) + vlxrepl ( i) * temparr_01 ( i))
+     1            * temparr_02 ( i)
+      vlybar ( i) = ( vlyremi ( i) + vlyrepl ( i) * temparr_01 ( i))
+     1            * temparr_02 ( i)
+      vlzbar ( i) = ( vlzremi ( i) + vlzrepl ( i) * temparr_01 ( i))
+     1            * temparr_02 ( i)
+
+      total_enthalpy_bar ( i) = ( total_enthalpy_remi ( i)
+     1  + total_enthalpy_repl ( i) * temparr_01 ( i)) * temparr_02 ( i)
+
+      bfxbar ( i) = bfxre ( i)
+      bfybar ( i) = ( bfyremi ( i) * temparr_01 ( i) + bfyrepl ( i))
+     1            * temparr_02 ( i)
+      bfzbar ( i) = ( bfzremi ( i) * temparr_01 ( i) + bfzrepl ( i))
+     1            * temparr_02 ( i)
+
+      xbar ( i) = 0.5 * ( ( bfyrepl ( i) - bfyremi ( i))**2
+     1                  + ( bfzrepl ( i) - bfzremi ( i))**2 )
+     1          / ( SQRT ( rhoremi ( i)) + SQRT ( rhorepl ( i)) )**2
+
+      prsbar ( i) = total_enthalpy_bar ( i)
+     1     - 0.5 * ( vlxbar ( i)**2 + vlybar ( i)**2 + vlzbar ( i)**2)
+     1     - ( bfxre ( i)**2 + bfybar ( i)**2 + bfzbar ( i)**2)
+     1     / ( fourpi * rhobar ( i))
+      prsbar ( i) = ( gamma_eos ( i) - 1.0) * rhobar ( i) * prsbar ( i)
+     1            / gamma_eos ( i)
+      prsbar ( i) = prsbar ( i)
+     1     - ( gamma_eos ( i) - 2.0) * rhobar ( i) * xbar ( i)
+     1     / ( fourpi * gamma_eos ( i) )
+      prsbar ( i) = AMAX1 ( prsbar ( i), prsfloor)
+
+! ----------
+
+! Give yourself the option of using arithmetic averages if needed.
+
+      IF ( ( rhobar ( i) .LE. rhofloor_plus_delta) .OR.
+     1     ( prsbar ( i) .LE. prsfloor_plus_delta) ) THEN
+
+      rhobar ( i) = 0.5 * ( rhoremi ( i) + rhorepl ( i))
+      prsbar ( i) = 0.5 * ( prsremi ( i) + prsrepl ( i))
+
+      vlxbar ( i) = 0.5 * ( vlxremi ( i) + vlxrepl ( i))
+      vlybar ( i) = 0.5 * ( vlyremi ( i) + vlyrepl ( i))
+      vlzbar ( i) = 0.5 * ( vlzremi ( i) + vlzrepl ( i))
+
+      bfxbar ( i) = bfxre ( i)
+      bfybar ( i) = 0.5 * ( bfyremi ( i) + bfyrepl ( i))
+      bfzbar ( i) = 0.5 * ( bfzremi ( i) + bfzrepl ( i))
+
+      xbar ( i) = 0.0
+
+      END IF
+
+! ----------
+
+      eng ( i) = prsbar ( i) / ( gamma_eos ( i) - 1.0)
+      temperature ( i) = prsbar ( i) * mean_mol_wt ( i)
+     1                 / ( gasconst * rhobar ( i))
+
+! ----------
+
+      END DO
+
+! ------------------------------
+
+      DO ifluid = 1, NFLUID
+
+      DO i = nriembegin, nriemend
+
+      temparr_01 ( i) = SQRT ( rhorepl ( i) / rhoremi ( i))
+      temparr_02 ( i) = 1.0 / ( 1.0 + temparr_01 ( i))
+
+      speciebar ( ifluid, i) = ( specieremi ( ifluid, i)
+     1 + specierepl ( ifluid, i) * temparr_01 ( i)) * temparr_02 ( i)
+
+      END DO
+
+      END DO
+
+! ------------------------------
+
+* Using exact EOS's here. If that is not needed, then "eng, temperature"
+* etc. have already been made above and the present call is not needed.
+
+* All learning codes are without calls to EOS routines.
+
+
+*********************************************************************
+*********************************************************************
+
+* Make "eigenval_re" for the Roe averaged state:
+
+      DO i = nriembegin, nriemend
+
+*****************
+
+      one_by_4pi_rho ( i) = 1.0 / ( fourpi * rhobar ( i) )
+
+      va_x ( i) = bfxre ( i)**2 * one_by_4pi_rho ( i)
+      va_x ( i) = SQRT ( va_x ( i) )
+
+      c_s ( i) = gamma_soundspeed ( i) * prsbar ( i)
+     1         / rhobar ( i)
+      c_s ( i) = SQRT ( c_s ( i) )
+
+      v_a ( i) = ( bfxre ( i)**2 + bfybar ( i)**2
+     1           + bfzbar ( i)**2) * one_by_4pi_rho ( i)
+      v_a ( i) = SQRT ( v_a ( i) )
+
+      temparr_01 ( i) = v_a ( i)**2 + c_s ( i)**2
+      temparr_02 ( i) = temparr_01 ( i)**2
+     1                - 4.0 * va_x ( i)**2 * c_s ( i)**2
+      temparr_02 ( i) = AMAX1 ( temparr_02 ( i), 0.0)
+      temparr_02 ( i) = SQRT ( temparr_02 ( i))
+
+      v_f ( i) = 0.5 * ( temparr_01 ( i) + temparr_02 ( i))
+      v_f ( i) = SQRT ( v_f ( i) )
+
+      v_s ( i) = 0.5 * ( temparr_01 ( i) - temparr_02 ( i))
+      v_s ( i) = AMAX1 ( v_s ( i), 0.0)
+      v_s ( i) = SQRT ( v_s ( i) )
+
+*****************
+
+      eigenval_re ( i, 1) = vlxbar ( i) - v_f ( i)
+      eigenval_re ( i, 2) = vlxbar ( i) - va_x ( i)
+      eigenval_re ( i, 3) = vlxbar ( i) - v_s ( i)
+      eigenval_re ( i, 4) = vlxbar ( i)
+      eigenval_re ( i, 5) = vlxbar ( i) + v_s ( i)
+      eigenval_re ( i, 6) = vlxbar ( i) + va_x ( i)
+      eigenval_re ( i, 7) = vlxbar ( i) + v_f ( i)
+
+*******************
+
+      END DO
+
+*******************
+
+#if ( NFLUID >= 1)
+      DO i = nriembegin, nriemend
+
+      eigenval_re ( i, NFIELD + 1: NFIELD + NFLUID) = vlxbar ( i)
+
+      END DO
+#endif
+
+* End of making "eigenval_re"
+
+*********************************************************************
+*********************************************************************
+
+* And store the eigenvalues on either side of
+* the zone boundary.
+
+      DO i = nriembegin, nriemend
+
+      zonebdy_eigenval ( i, 1) = eigenval_re ( i, 1)
+      eigenval_db ( i, 0, 1) = eigenval_re ( i, 1)
+      eigenval_db ( i, 1, 1) = eigenval_re ( i, 1)
+
+      zonebdy_eigenval ( i, 2) = eigenval_re ( i, 2)
+      eigenval_db ( i, 0, 2) = eigenval_re ( i, 2)
+      eigenval_db ( i, 1, 2) = eigenval_re ( i, 2)
+
+      zonebdy_eigenval ( i, 3) = eigenval_re ( i, 3)
+      eigenval_db ( i, 0, 3) = eigenval_re ( i, 3)
+      eigenval_db ( i, 1, 3) = eigenval_re ( i, 3)
+
+      zonebdy_eigenval ( i, 4) = eigenval_re ( i, 4)
+      eigenval_db ( i, 0, 4) = eigenval_re ( i, 4)
+      eigenval_db ( i, 1, 4) = eigenval_re ( i, 4)
+
+      zonebdy_eigenval ( i, 5) = eigenval_re ( i, 5)
+      eigenval_db ( i, 0, 5) = eigenval_re ( i, 5)
+      eigenval_db ( i, 1, 5) = eigenval_re ( i, 5)
+
+      zonebdy_eigenval ( i, 6) = eigenval_re ( i, 6)
+      eigenval_db ( i, 0, 6) = eigenval_re ( i, 6)
+      eigenval_db ( i, 1, 6) = eigenval_re ( i, 6)
+
+      zonebdy_eigenval ( i, 7) = eigenval_re ( i, 7)
+      eigenval_db ( i, 0, 7) = eigenval_re ( i, 7)
+      eigenval_db ( i, 1, 7) = eigenval_re ( i, 7)
+
+      END DO
+
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+        zonebdy_eigenval ( i, k) = eigenval_re ( i, k)
+        eigenval_db ( i, 0, k) = eigenval_re ( i, k)
+        eigenval_db ( i, 1, k) = eigenval_re ( i, k)
+
+      END DO
+
+      END DO
+
+*********************************************************************
+*********************************************************************
+
+* Here we explicitly need to get the eigenvalues on either
+* side of the zone boundary so that we can maximize / minimize w.r.t.
+* the eigenvalues of the mean state. We reset "eigenval_db" here
+* so that "eigenval_db ( 0, ifield, i)" is the left-most eigenvalue
+* in that characteristic field and "eigenval_db ( 1, ifield, i)" is
+* the right-most.
+
+* Make "eigenval_lf":
+
+      DO i = nriembegin, nriemend
+
+*****************
+
+      one_by_4pi_rho ( i) = 1.0 / ( fourpi * rhoremi ( i) )
+
+      va_x ( i) = bfxre ( i)**2 * one_by_4pi_rho ( i)
+      va_x ( i) = SQRT ( va_x ( i) )
+
+      c_s ( i) = gamma_soundspeed_remi ( i) * prsremi ( i)
+     1         / rhoremi ( i)
+      c_s ( i) = SQRT ( c_s ( i) )
+
+      v_a ( i) = ( bfxre ( i)**2 + bfyremi ( i)**2
+     1           + bfzremi ( i)**2) * one_by_4pi_rho ( i)
+      v_a ( i) = SQRT ( v_a ( i) )
+
+      temparr_01 ( i) = v_a ( i)**2 + c_s ( i)**2
+      temparr_02 ( i) = temparr_01 ( i)**2
+     1                - 4.0 * va_x ( i)**2 * c_s ( i)**2
+      temparr_02 ( i) = AMAX1 ( temparr_02 ( i), 0.0)
+      temparr_02 ( i) = SQRT ( temparr_02 ( i))
+
+      v_f ( i) = 0.5 * ( temparr_01 ( i) + temparr_02 ( i))
+      v_f ( i) = SQRT ( v_f ( i) )
+
+      v_s ( i) = 0.5 * ( temparr_01 ( i) - temparr_02 ( i))
+      v_s ( i) = AMAX1 ( v_s ( i), 0.0)
+      v_s ( i) = SQRT ( v_s ( i) )
+
+*****************
+
+      eigenval_lf ( i, 1) = vlxremi ( i) - v_f ( i)
+      eigenval_lf ( i, 2) = vlxremi ( i) - va_x ( i)
+      eigenval_lf ( i, 3) = vlxremi ( i) - v_s ( i)
+      eigenval_lf ( i, 4) = vlxremi ( i)
+      eigenval_lf ( i, 5) = vlxremi ( i) + v_s ( i)
+      eigenval_lf ( i, 6) = vlxremi ( i) + va_x ( i)
+      eigenval_lf ( i, 7) = vlxremi ( i) + v_f ( i)
+
+*******************
+
+      END DO
+
+*******************
+
+#if ( NFLUID >= 1)
+      DO i = nriembegin, nriemend
+
+      eigenval_lf ( i, NFIELD + 1: NFIELD + NFLUID) = vlxremi ( i)
+
+      END DO
+#endif
+
+* End of making "eigenval_lf"
+
+*********************************************************************
+*********************************************************************
+
+      DO i = nriembegin, nriemend
+
+
+      eigenval_db ( i, 0, 1) =
+     1      AMIN1 ( eigenval_db ( i, 0, 1), eigenval_lf ( i, 1) )
+
+      eigenval_db ( i, 1, 1) =
+     1      AMAX1 ( eigenval_db ( i, 1, 1), eigenval_lf ( i, 1) )
+
+
+      eigenval_db ( i, 0, 2) =
+     1      AMIN1 ( eigenval_db ( i, 0, 2), eigenval_lf ( i, 2) )
+
+      eigenval_db ( i, 1, 2) =
+     1      AMAX1 ( eigenval_db ( i, 1, 2), eigenval_lf ( i, 2) )
+
+
+      eigenval_db ( i, 0, 3) =
+     1      AMIN1 ( eigenval_db ( i, 0, 3), eigenval_lf ( i, 3) )
+
+      eigenval_db ( i, 1, 3) =
+     1      AMAX1 ( eigenval_db ( i, 1, 3), eigenval_lf ( i, 3) )
+
+
+      eigenval_db ( i, 0, 4) =
+     1      AMIN1 ( eigenval_db ( i, 0, 4), eigenval_lf ( i, 4) )
+
+      eigenval_db ( i, 1, 4) =
+     1      AMAX1 ( eigenval_db ( i, 1, 4), eigenval_lf ( i, 4) )
+
+
+      eigenval_db ( i, 0, 5) =
+     1      AMIN1 ( eigenval_db ( i, 0, 5), eigenval_lf ( i, 5) )
+
+      eigenval_db ( i, 1, 5) =
+     1      AMAX1 ( eigenval_db ( i, 1, 5), eigenval_lf ( i, 5) )
+
+
+      eigenval_db ( i, 0, 6) =
+     1      AMIN1 ( eigenval_db ( i, 0, 6), eigenval_lf ( i, 6) )
+
+      eigenval_db ( i, 1, 6) =
+     1      AMAX1 ( eigenval_db ( i, 1, 6), eigenval_lf ( i, 6) )
+
+
+      eigenval_db ( i, 0, 7) =
+     1      AMIN1 ( eigenval_db ( i, 0, 7), eigenval_lf ( i, 7) )
+
+      eigenval_db ( i, 1, 7) =
+     1      AMAX1 ( eigenval_db ( i, 1, 7), eigenval_lf ( i, 7) )
+
+
+      END DO
+
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+        eigenval_db ( i, 0, k) =
+     1        AMIN1 ( eigenval_db ( i, 0, k), eigenval_lf ( i, k) )
+
+        eigenval_db ( i, 1, k) =
+     1        AMAX1 ( eigenval_db ( i, 1, k), eigenval_lf ( i, k) )
+
+      END DO
+
+      END DO
+
+*********************************************************************
+*********************************************************************
+
+* Make "eigenval_rt":
+
+      DO i = nriembegin, nriemend
+
+*****************
+
+      one_by_4pi_rho ( i) = 1.0 / ( fourpi * rhorepl ( i) )
+
+      va_x ( i) = bfxre ( i)**2 * one_by_4pi_rho ( i)
+      va_x ( i) = SQRT ( va_x ( i) )
+
+      c_s ( i) = gamma_soundspeed_repl ( i) * prsrepl ( i)
+     1         / rhorepl ( i)
+      c_s ( i) = SQRT ( c_s ( i) )
+
+      v_a ( i) = ( bfxre ( i)**2 + bfyrepl ( i)**2
+     1           + bfzrepl ( i)**2) * one_by_4pi_rho ( i)
+      v_a ( i) = SQRT ( v_a ( i) )
+
+      temparr_01 ( i) = v_a ( i)**2 + c_s ( i)**2
+      temparr_02 ( i) = temparr_01 ( i)**2
+     1                - 4.0 * va_x ( i)**2 * c_s ( i)**2
+      temparr_02 ( i) = AMAX1 ( temparr_02 ( i), 0.0)
+      temparr_02 ( i) = SQRT ( temparr_02 ( i))
+
+      v_f ( i) = 0.5 * ( temparr_01 ( i) + temparr_02 ( i))
+      v_f ( i) = SQRT ( v_f ( i) )
+
+      v_s ( i) = 0.5 * ( temparr_01 ( i) - temparr_02 ( i))
+      v_s ( i) = AMAX1 ( v_s ( i), 0.0)
+      v_s ( i) = SQRT ( v_s ( i) )
+
+*****************
+
+      eigenval_rt ( i, 1) = vlxrepl ( i) - v_f ( i)
+      eigenval_rt ( i, 2) = vlxrepl ( i) - va_x ( i)
+      eigenval_rt ( i, 3) = vlxrepl ( i) - v_s ( i)
+      eigenval_rt ( i, 4) = vlxrepl ( i)
+      eigenval_rt ( i, 5) = vlxrepl ( i) + v_s ( i)
+      eigenval_rt ( i, 6) = vlxrepl ( i) + va_x ( i)
+      eigenval_rt ( i, 7) = vlxrepl ( i) + v_f ( i)
+
+*******************
+
+      END DO
+
+*******************
+
+#if ( NFLUID >= 1)
+      DO i = nriembegin, nriemend
+
+      eigenval_rt ( i, NFIELD + 1: NFIELD + NFLUID) = vlxrepl ( i)
+
+      END DO
+#endif
+
+
+* End of making "eigenval_rt"
+
+*********************************************************************
+*********************************************************************
+
+      DO i = nriembegin, nriemend
+
+
+      eigenval_db ( i, 0, 1) =
+     1      AMIN1 ( eigenval_db ( i, 0, 1), eigenval_rt ( i, 1) )
+
+      eigenval_db ( i, 1, 1) =
+     1      AMAX1 ( eigenval_db ( i, 1, 1), eigenval_rt ( i, 1) )
+
+
+      eigenval_db ( i, 0, 2) =
+     1      AMIN1 ( eigenval_db ( i, 0, 2), eigenval_rt ( i, 2) )
+
+      eigenval_db ( i, 1, 2) =
+     1      AMAX1 ( eigenval_db ( i, 1, 2), eigenval_rt ( i, 2) )
+
+
+      eigenval_db ( i, 0, 3) =
+     1      AMIN1 ( eigenval_db ( i, 0, 3), eigenval_rt ( i, 3) )
+
+      eigenval_db ( i, 1, 3) =
+     1      AMAX1 ( eigenval_db ( i, 1, 3), eigenval_rt ( i, 3) )
+
+
+      eigenval_db ( i, 0, 4) =
+     1      AMIN1 ( eigenval_db ( i, 0, 4), eigenval_rt ( i, 4) )
+
+      eigenval_db ( i, 1, 4) =
+     1      AMAX1 ( eigenval_db ( i, 1, 4), eigenval_rt ( i, 4) )
+
+
+      eigenval_db ( i, 0, 5) =
+     1      AMIN1 ( eigenval_db ( i, 0, 5), eigenval_rt ( i, 5) )
+
+      eigenval_db ( i, 1, 5) =
+     1      AMAX1 ( eigenval_db ( i, 1, 5), eigenval_rt ( i, 5) )
+
+
+      eigenval_db ( i, 0, 6) =
+     1      AMIN1 ( eigenval_db ( i, 0, 6), eigenval_rt ( i, 6) )
+
+      eigenval_db ( i, 1, 6) =
+     1      AMAX1 ( eigenval_db ( i, 1, 6), eigenval_rt ( i, 6) )
+
+
+      eigenval_db ( i, 0, 7) =
+     1      AMIN1 ( eigenval_db ( i, 0, 7), eigenval_rt ( i, 7) )
+
+      eigenval_db ( i, 1, 7) =
+     1      AMAX1 ( eigenval_db ( i, 1, 7), eigenval_rt ( i, 7) )
+
+
+      END DO
+
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+        eigenval_db ( i, 0, k) =
+     1        AMIN1 ( eigenval_db ( i, 0, k), eigenval_rt ( i, k) )
+
+        eigenval_db ( i, 1, k) =
+     1        AMAX1 ( eigenval_db ( i, 1, k), eigenval_rt ( i, k) )
+
+      END DO
+
+      END DO
+
+* End of making the eigenvectors and appropriate wave speeds.
+
+************************************************************************
+************************************************************************
+
+! First gather zones that need Einfeldt fix. 
+! The bounding eigenvalues are those produced from the
+! Roe solver.
+! Since the Roe solver always produces a good
+! value for the Alfven speed we include it in here. 
+
+      DO i = nriembegin, nriemend
+
+****************
+
+      wavespd_ein_l ( i) = AMIN1 ( eigenval_db ( i, 0, 1),
+     1                             eigenval_db ( i, 0, 2) )
+
+      wavespd_ein_r ( i) = AMAX1 ( eigenval_db ( i, 1, 7),
+     1                             eigenval_db ( i, 1, 6) )
+
+****************
+
+! The lines below make the flux into an LLF flux (which is more stabilizing).
+! Comment them out to get an Einfeldt flux.
+
+      temparr_01 ( i) = AMAX1 ( ABS ( eigenval_db ( i, 0, 1)), 
+     1                          ABS ( eigenval_db ( i, 0, 2)), 
+     1                          ABS ( eigenval_db ( i, 1, 7)),
+     1                          ABS ( eigenval_db ( i, 1, 6)))
+      wavespd_ein_l ( i) = - 1.0 * temparr_01 ( i)
+      wavespd_ein_r ( i) = 1.0 * temparr_01 ( i)
+
+****************
+
+! Here we make the Einfeldt fix directly without invoking a subroutine call.
+
+      IF ( wavespd_ein_l ( i) .GT. 0.0) THEN
+! Pick left conserved state.
+
+      conserved_ein ( i, 1: NFIELD + NFLUID) =
+     1              zonebdy_conserved ( i, 0, 1: NFIELD + NFLUID)
+
+      flux_ein ( i, 1: NFIELD + NFLUID) =
+     1              zonebdy_flux ( i, 0, 1: NFIELD + NFLUID)
+
+      ELSE IF ( wavespd_ein_r ( i) .LT. 0.0) THEN
+! Pick right conserved state.
+
+      conserved_ein ( i, 1: NFIELD + NFLUID) =
+     1              zonebdy_conserved ( i, 1, 1: NFIELD + NFLUID)
+
+      flux_ein ( i, 1: NFIELD + NFLUID) =
+     1              zonebdy_flux ( i, 1, 1: NFIELD + NFLUID)
+
+      ELSE
+! Pick HLL with one mean, conserved state.
+
+      temparr_01 ( i) = 1.0 / ( wavespd_ein_r ( i)
+     1                        - wavespd_ein_l ( i))
+
+      temparr_02 ( i) = wavespd_ein_r ( i) * wavespd_ein_l ( i)
+     1       / ( wavespd_ein_r ( i) - wavespd_ein_l ( i))
+
+
+      conserved_ein ( i, 1: NFIELD + NFLUID) =
+
+     1  ( wavespd_ein_r ( i)
+     1  * zonebdy_conserved ( i, 1, 1: NFIELD + NFLUID)
+     1  -  wavespd_ein_l ( i)
+     1  * zonebdy_conserved ( i, 0, 1: NFIELD + NFLUID) )
+     1  * temparr_01 ( i)
+
+     1  - ( zonebdy_flux ( i, 1, 1: NFIELD + NFLUID)
+     1    - zonebdy_flux ( i, 0, 1: NFIELD + NFLUID) )
+     1  * temparr_01 ( i)
+
+      flux_ein ( i, 1: NFIELD + NFLUID) =
+
+     1 ( wavespd_ein_r ( i) * zonebdy_flux ( i, 0, 1: NFIELD + NFLUID)
+     1 - wavespd_ein_l ( i) * zonebdy_flux ( i, 1, 1: NFIELD + NFLUID))
+     1 * temparr_01 ( i)
+
+     1 + ( zonebdy_conserved ( i, 1, 1: NFIELD + NFLUID)
+     1   - zonebdy_conserved ( i, 0, 1: NFIELD + NFLUID) )
+     1 * temparr_02 ( i)
+
+      END IF
+
+****************
+
+! And hand them back.
+
+      conserved_re ( i, 1: NFIELD + NFLUID) =
+     1             conserved_ein ( i, 1: NFIELD + NFLUID)
+
+      flux_re ( i, 1: NFIELD + NFLUID) = 
+     1             flux_ein ( i, 1: NFIELD + NFLUID)
+
+      END DO
+
+******************************************************************
+******************************************************************
+
+! Wind-up operations done past this point:
+
+******************************************************************
+
+! Move the species fluxes by one to make way for the split
+! in the advected and pressure parts of the x-momentum flux.
+
+! To do that, we realize first that the 8th component of the flux will
+! have to contain the pressure. Right now, the fluxes are all contiguous
+! even when multiple species are present. So we first move the fluxes
+! over by one when multiple species are present.
+
+      DO ifluid = NFLUID, 1, -1
+
+      k = NFIELD + ifluid
+
+        DO i = nriembegin, nriemend
+
+        flux_re ( i, k + 1) = flux_re ( i, k)
+
+        END DO
+
+      END DO
+
+! Zero out the eighth component of "flux_re" because we have not
+! yet made the pressure split.
+
+      DO i = nriembegin, nriemend
+
+      flux_re ( i, 8) = 0.0
+
+      END DO
+
+******************************************************************
+******************************************************************
+
+! Form the flow variables at the resolved state.
+! Also split the momentum flux_re into advected and pressure parts and
+! store the pressure part separately.
+
+      IF ( split_prsflux_re .EQ. 1) THEN
+
+      DO i = nriembegin, nriemend
+
+      rho0 ( i) = AMAX1 ( conserved_re ( i, 1), rhofloor)
+
+      temparr_01 ( i) = 1.0 / rho0 ( i)
+      vlx0 ( i) = conserved_re ( i, 2) * temparr_01 ( i)
+      vly0 ( i) = conserved_re ( i, 3) * temparr_01 ( i)
+      vlz0 ( i) = conserved_re ( i, 4) * temparr_01 ( i)
+
+      bfy0 ( i) = conserved_re ( i, 6)
+      bfz0 ( i) = conserved_re ( i, 7)
+
+
+      prs0 ( i) = conserved_re ( i, 5)
+     1   - 0.5 * rho0 ( i) * ( vlx0 ( i)**2 + vly0 ( i)**2
+     1                       + vlz0 ( i)**2 )
+     1   - 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2
+     1           + bfz0 ( i)**2) * one_by_fourpi
+      prs0 ( i) = ( gamma_eos_re ( i) - 1.0) * prs0 ( i)
+
+
+#if ( NFLUID >= 1)
+      temparr_01 ( i) = 1.0 / rho0 ( i)
+      specie0 ( 1: NFLUID, i) =
+     1         conserved_re ( i, NFIELD + 1: NFIELD + NFLUID)
+     1       * temparr_01 ( i)
+#endif
+
+
+! Make the part of the momentum flux that acts like a pressure.
+
+      flux_re ( i, 8) = prs0 ( i)
+     1   + 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2
+     1           + bfz0 ( i)**2) * one_by_fourpi
+
+      flux_re ( i, 2) = flux_re ( i, 2) - flux_re ( i, 8)
+
+      END DO
+
+      END IF
+! End of "split_prsflux_re .EQ. 1" part.
+
+******************************************************************
+******************************************************************
+
+! It may be useful to double the dissipation of the magnetic fields,
+! not that it has ever produced wrong answers. For some problems like
+! turbulence, increasing B-field dissipation is especially counter-productive.
+
+! It is also inadvisable for fully supersonic flow, where the one-sided
+! fluxes are indeed just right.
+
+      IF ( double_dissipate_efz .EQ. 1) THEN
+
+      DO i = nriembegin, nriemend
+
+        IF ( ( eigenval_db ( i, 0, 1) .LT. 0.0) .AND. 
+     1       ( eigenval_db ( i, 1, 7) .GT. 0.0) ) THEN
+
+        flux_re ( i, 6) = 2.0 * flux_re ( i, 6)
+     1             - 0.5 * ( zonebdy_flux ( i, 0, 6)
+     1                     + zonebdy_flux ( i, 1, 6) )
+
+        END IF
+
+      END DO
+
+      END IF
+
+! ------------------------------
+
+      IF ( double_dissipate_efy .EQ. 1) THEN
+
+      DO i = nriembegin, nriemend
+
+        IF ( ( eigenval_db ( i, 0, 1) .LT. 0.0) .AND.
+     1       ( eigenval_db ( i, 1, 7) .GT. 0.0) ) THEN
+
+        flux_re ( i, 7) = 2.0 * flux_re ( i, 7)
+     1             - 0.5 * ( zonebdy_flux ( i, 0, 7)
+     1                     + zonebdy_flux ( i, 1, 7) )
+
+        END IF
+
+      END DO
+
+      END IF
+
+**********************************************************************
+**********************************************************************
+
+      RETURN
+
+      END SUBROUTINE MHD_RIEM_HLL
+
+*******************************************************************
+*******************************************************************
+
+! The below switch, if turned on, helps a little with stability
+! by pushing us away from some situations where the denominator
+! can become zero in the HLLD solver. However, : 
+! a) it costs more and b) it may produce little more dissipation.
+! It also produces more safety on more recondite problems.
+#define EXTRA_WAVSPEED_FIX 1
+
+! In HLLD, we traditionally do not provide any entropy fix to the linearly
+! degenerate waves. Yet, even in a Roe-type linearized Riemann solver, we
+! do provide such a fix. The ensuing switch, if set to 1, will provide
+! an entropy fix to the linearly degenerate waves. This could be useful
+! in certain stringent problems.
+#define ENTROPY_FIX_LIN_DEG 1
+
+* We have the option of minimizing the number of EOS calls
+* (which can be quite expensive) by setting "use_approx_eos = 1".
+* This may perhaps be a risky step if "gamma_eos" is rapidly varying.
+
+      SUBROUTINE MHD_RIEM_HLLD
+
+     1   ( nriembegin, nriemend,
+
+     1     double_dissipate_efz, double_dissipate_efy,
+
+     1     gamma, smallnum, prsfloor, rhofloor, pi, fracdiff,
+     1     ientropyfix, iprimitive, use_approx_eos,
+     1     split_prsflux_re, divratio_einfeldt_rs, debug_stop,
+
+     1     gasconst,
+     1     cp_specie, molewt_specie, heat_of_formation,
+
+     1        rhoremi, rhorepl,
+     1        prsremi, prsrepl,
+     1        vlxremi, vlxrepl,
+     1        vlyremi, vlyrepl,
+     1        vlzremi, vlzrepl,
+     1        bfxre,
+     1        bfyremi, bfyrepl,
+     1        bfzremi, bfzrepl,
+     1        specieremi, specierepl,
+
+     1        gamma_eos_remi, gamma_eos_repl,
+     1        gamma_soundspeed_remi, gamma_soundspeed_repl,
+     1        mean_mol_wt_remi, mean_mol_wt_repl,
+
+     1        msonic_arr, divvel_arr,
+
+     1        zonebdy_conserved, zonebdy_flux,
+
+     1     eigenval_re, lf_eigenvec_re, rt_eigenvec_re, eigenwt_re,
+     1     conserved_re, flux_re, entropy_flux_re,
+
+     1     rho0, prs0, vlx0, vly0, vlz0, bfy0, bfz0, specie0,
+     1     do_ein )
+
+*******************************************************************
+
+* Written by : Dinshaw S. Balsara
+
+* Does the riemann solver based on a simple HLLD scheme. The HLLD scheme is
+* described in Miyoshi & Kusano, 2005, J. Comput. Phys, 208, 315 (MK). This
+* is done so that we can make an inexpensive Riemann solver for evaluating
+* the transverse fluxes. Also, a few lines at the beginning of the last
+* loop may turn problematic situations into an LLF flux. Since that is
+* more stable, we keep those lines uncommented so that when one runs 
+* into trouble, the flux is the LLF flux.
+
+
+* Note that "MHD_RIEM_DB" and "MHD_RIEM_HLLD" have the same interface.
+* As a result, if one wants a higher quality riemann solver at a greater
+* computational cost, one can always call "MHD_RIEM_DB".
+
+* The x-momentum flux_re is split into an advected part and a ( thermal +
+* magnetic) pressure part.
+
+* The HLLD flux does not cause a great deal of degradation on multidimensional
+* problems. For problems with a large number of species it can, therefore,
+* be a very desirable alternative to the Roe type riemann solver.
+
+* The HLL riemann solver has another advantage over the Roe
+* solver when multiple species are involved.
+* Because it is based on a linear, convex arithmetic sum of the left
+* and right states, the HLL riemann solver can be relied on to
+* produce species fractions that satisfy this physical requirement
+* of lying between 0 and 1. This property also ensures that if both
+* the right and left states of the riemann problem have the property
+* that the sum of the active species fractions remains less than one then
+* the resolved state from the riemann solver also has that property.
+
+* An HLL-based entropy flux is also always calculated and passed through
+* the subroutine interface. This ensures that we are ALWAYS able to
+* enforce pressure positivity at no extra computational cost.
+
+*******************************************************************
+
+* INPUT VARIABLES:
+
+* gamma : Ratio of specific heats.
+* smallnum : A number that would be small in the code's arithmetic.
+* prsfloor : Floor value for the pressure variable.
+* rhofloor : Floor value for the density variable.
+* pi : pi
+* split_prsflux_re : If set to 1, it splits the normal momentum flux into
+* advected part and a gas+magnetic pressure part.
+* debug_stop : 0 on entry. Will be set to 1 on exit only if the code
+* encountered a problem.
+
+* gasconst : Gas constant. Not used for polytropic gases.
+* cp_specie(NFLUID) : Specific heat at constant pressure for all the
+* contituent fluid species.
+* molewt_specie(NFLUID) : Mole wt. for all the contituent fluid species.
+* heat_of_formation(NFLUID) : Heat of formation for all the contituent
+* fluid species.
+
+* rhoremi, rhorepl : Density at the left and right of Riemann Problem (RP).
+* prsremi, prsrepl : Pressure at the left and right of RP.
+* vlxremi, vlxrepl : Velocity normal to the face at the left and right of RP.
+* vlyremi, vlyrepl : Velocity transverse to the face at left and right of RP.
+* vlzremi, vlzrepl : Velocity transverse to the face at left and right of RP.
+* bfxre : Normal component of magnetic field at the face.
+* bfyremi, bfyrepl : B-field transverse to the face at left and right of RP.
+* bfzremi, bfzrepl : B-field transverse to the face at left and right of RP.
+* specieremi(0:NFLUID), specierepl(0:NFLUID) : Species fraction at
+* left and right of RP.
+
+* gamma_eos_remi, gamma_eos_repl : Gas gamma for energy computation at
+* left and right of RP.
+* gamma_soundspeed_remi, gamma_soundspeed_repl : Gas gamma for sound speed
+* computation at left and right of RP.
+* mean_mol_wt_remi, mean_mol_wt_repl : Mean molecular wt. at
+* left and right of RP.
+
+* OUTPUT VARIABLES:
+
+* conserved_re(NFIELD+NFLUID) : Conserved variables in the resolved state of RP.
+* The order is ( density, x-momentum density, y-momentum density,
+*  z-momentum density, energy density, y-magnetic field, z-magnetic field)
+* If "NFLUID != 0", the last "NFLUID" components contain the species density.
+
+* flux_re(NFIELD + 1 + NFLUID) : Flux variables in the resolved state of RP.
+* When "split_prsflux_re = 0", the fluxes have the same order as the
+* conserved variables above. When "split_prsflux_re = 1", we split the
+* gas+mag. pressure off from the x-momentum flux and give it to the
+* eighth component of "flux_re".
+* If "NFLUID != 0", the last "NFLUID" components contain the species flux.
+
+* entropy_flux_re : Flux of entropy density. This could be useful in situations
+* where we lose pressure positivity as shown in the paper by Balsara & Spicer
+* (1999) JCP.
+
+* rho0 : Density in the resolved state of RP.
+* prs0 : Pressure in the resolved state of RP.
+* eng0 : Total energy density in the resolved state of RP.
+
+* vlx0, vly0, vlz0 : x,y,z-velocities in the resolved state of RP.
+*        x-velocity is normal to face; y,z-velocities are transverse.
+
+* bfy0, bfz0 : Transverse components of the B-field in the resolved
+*        state of RP.
+
+* specie0(0:NFLUID) : Species fraction in the resolved state of RP.
+
+*******************************************************************
+
+      IMPLICIT NONE
+
+************************************************************************
+************************************************************************
+
+      INTEGER :: nriembegin, nriemend,
+     1        double_dissipate_efz, double_dissipate_efy,
+     1        ientropyfix, iprimitive, use_approx_eos,
+     1        split_prsflux_re
+
+      INTEGER :: debug_stop
+
+      REAL :: gamma, smallnum, prsfloor, rhofloor,
+     1     pi, fracdiff, gasconst, divratio_einfeldt_rs
+
+      REAL, DIMENSION ( 0 : NFLUID) ::
+     1      cp_specie, molewt_specie, heat_of_formation
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     rhoremi, rhorepl, prsremi, prsrepl,
+
+     1     vlxremi, vlxrepl, vlyremi, vlyrepl,
+     1     vlzremi, vlzrepl,
+
+     1     bfxre, bfyremi, bfyrepl, bfzremi, bfzrepl,
+
+     1     mean_mol_wt_remi, gamma_eos_remi, gamma_soundspeed_remi,
+     1     mean_mol_wt_repl, gamma_eos_repl, gamma_soundspeed_repl,
+
+     1     msonic_arr, divvel_arr
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     specieremi, specierepl
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1      NFIELD + NFLUID, NFIELD + NFLUID) ::
+     1    lf_eigenvec_re, rt_eigenvec_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1      NFIELD + NFLUID) ::
+     1     eigenval_re, eigenwt_re, conserved_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                 NFIELD + NFLUID + 1) ::
+     1     flux_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  0 : 1, NFIELD + NFLUID) ::
+     1      zonebdy_flux, zonebdy_conserved
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     rho0, prs0, vlx0, vly0, vlz0, bfy0, bfz0,
+     1     entropy_flux_re
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1      specie0
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) :: do_ein
+
+************************************************************************
+************************************************************************
+
+* Past this point we only declare variables that are internal to the
+* subroutine.
+
+      INTEGER i, j, k, ifield, ifluid
+
+      REAL fourpi, one_by_fourpi, sqrt_fourpi, one_by_sqrt_fourpi,
+     1     prs_jump_too_large_fac, denominator_too_small_fac,
+     1     rhofloor_plus_delta, prsfloor_plus_delta
+
+* Variables used for HLL/LLF riemann solver.
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     make_llf, iwave_entropy_fix
+
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  NFIELD + NFLUID) ::
+
+     1      zonebdy_eigenval, eigenval_lf, eigenval_rt
+
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  0 : 1, NFIELD + NFLUID) ::
+
+     1      eigenval_db,
+     1      zone_star_conserved, zone_star_flux,
+     1      zone_dblstar_conserved, zone_dblstar_flux
+
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     engl, engr, eng0,
+
+     1     prs_tot_remi, prs_tot_repl, prs_tot_0, prs_tot_min,
+     1     rho_r_star, vly_r_star, vlz_r_star, bfy_r_star,
+     1     bfz_r_star, eng_r_star,
+     1     rho_l_star, vly_l_star, vlz_l_star, bfy_l_star,
+     1     bfz_l_star, eng_l_star,
+     1     alfven_r_star, alfven_l_star, small_signal_speed,
+
+     1     rho_r_dblstar, vly_r_dblstar, vlz_r_dblstar,
+     1     bfy_r_dblstar, bfz_r_dblstar, eng_r_dblstar,
+
+     1     rho_l_dblstar, vly_l_dblstar, vlz_l_dblstar,
+     1     bfy_l_dblstar, bfz_l_dblstar, eng_l_dblstar,
+
+     1     del_prs_thermal,
+
+     1     n_bx0, n_by0, n_bz0, efx0, efy0, efz0,
+
+     1     temparr_01, temparr_02, temparr_03, temparr_04,
+     1     temparr_05, temparr_06, temparr_07, temparr_08
+
+
+******************************************************************
+******************************************************************
+
+* Variables used for Einfeldt fix.
+
+* "conserved_ein, flux_ein" contain the resolved fields and fluxes
+* on either side of the riemann problem.
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  NFIELD + NFLUID) ::
+
+     1     conserved_ein_l, conserved_ein_r,
+     1     flux_ein_l, flux_ein_r, conserved_ein, flux_ein
+
+
+* These should be loaded with the min and max speeds from the roe solver.
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     wavespd_ein_l, wavespd_ein_r
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     eng, temperature,
+     1     mean_mol_wt, gamma_eos, gamma_soundspeed,
+     1     engremi, temperatureremi, total_enthalpy_remi,
+     1     engrepl, temperaturerepl, total_enthalpy_repl,
+     1     mean_mol_wt_re, gamma_eos_re, gamma_soundspeed_re,
+
+     1     entropy_ein_l, entropy_flux_ein_l,
+     1     entropy_ein_r, entropy_flux_ein_r,
+     1     entropy_ein, entropy_flux_ein
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     im_done, make_plain_hll, open_fan
+
+******************************************************************
+******************************************************************
+
+* Variables used for inlining EIGENVALMHD.
+
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+
+     1     va_x, c_s, v_a, v_f, v_s, beta_y, beta_z,
+     1     alpha_f, alpha_s, sgnbx, sq_4pi_rho, va_perp,
+     1     one_by_4pi_rho,
+
+     1     rhobar, prsbar, vlxbar, vlybar, vlzbar, total_enthalpy_bar,
+     1     bfxbar, bfybar, bfzbar, xbar
+
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1      speciebar
+
+******************************************************************
+
+!      COMMON /MHD_RIEM_HLLD_COM/
+
+!     1     make_llf,
+
+!     1      zonebdy_eigenval, eigenval_lf, eigenval_rt,
+
+!     1      zonebdy_conserved, eigenval_db,
+
+!     1     engl, engr, eng0,
+
+!     1     prs_tot_remi, prs_tot_repl, prs_tot_0,
+!     1     rho_r_star, vly_r_star, vlz_r_star, bfy_r_star,
+!     1     bfz_r_star, eng_r_star,
+!     1     rho_l_star, vly_l_star, vlz_l_star, bfy_l_star,
+!     1     bfz_l_star, eng_l_star,
+!     1     alfven_r_star, alfven_l_star, small_signal_speed,
+
+!     1     rho_r_dblstar, vly_r_dblstar, vlz_r_dblstar,
+!     1     bfy_r_dblstar, bfz_r_dblstar, eng_r_dblstar,
+
+!     1     rho_l_dblstar, vly_l_dblstar, vlz_l_dblstar,
+!     1     bfy_l_dblstar, bfz_l_dblstar, eng_l_dblstar,
+
+!     1     del_prs_thermal,
+
+!     1     n_bx0, n_by0, n_bz0, efx0, efy0, efz0,
+
+!     1     temparr_01, temparr_02, temparr_03, temparr_04,
+!     1     temparr_05, temparr_06, temparr_07, temparr_08,
+
+!     1     conserved_ein_l, conserved_ein_r,
+!     1     flux_ein_l, flux_ein_r, conserved_ein, flux_ein,
+
+!     1     wavespd_ein_l, wavespd_ein_r,
+
+!     1     eng, temperature,
+!     1     mean_mol_wt, gamma_eos, gamma_soundspeed,
+!     1     engremi, temperatureremi,
+!     1     engrepl, temperaturerepl,
+!     1     mean_mol_wt_re, gamma_eos_re, gamma_soundspeed_re,
+
+!     1     entropy_ein_l, entropy_flux_ein_l,
+!     1     entropy_ein_r, entropy_flux_ein_r,
+!     1     entropy_ein, entropy_flux_ein,
+
+!     1     va_x, c_s, v_a, v_f, v_s, beta_y, beta_z,
+!     1     alpha_f, alpha_s, sgnbx, sq_4pi_rho, va_perp,
+!     1     one_by_4pi_rho,
+
+!     1     rhobar, prsbar, vlxbar, vlybar, vlzbar,
+!     1     bfxbar, bfybar, bfzbar,
+!     1     speciebar
+
+#if ( MAKEOPENMP == 1)
+!   !$OMP THREADPRIVATE (/MHD_RIEM_HLLD_COM/)
+#endif
+
+******************************************************************
+
+* Make some settings.
+
+      fourpi = 4.0 * pi
+      one_by_fourpi = 1.0 / fourpi
+      sqrt_fourpi = SQRT ( fourpi)
+      one_by_sqrt_fourpi = 1.0 / sqrt_fourpi
+
+* If the pressure jump at the contact is too large by this factor then
+* we go directly to an HLL Riemann solver.
+
+      prs_jump_too_large_fac = 0.1
+
+* Similarly for the denominator that can be close to zero in certain
+* situations in the HLLD Riemann solver.
+
+      denominator_too_small_fac = 1.0e-5
+
+* Because floor values of density and pressure have already been taken,
+* we set a bottom value that is a little above that floor.
+
+      rhofloor_plus_delta = 1.000001 * rhofloor
+      prsfloor_plus_delta = 1.000001 * prsfloor
+
+
+      IF ( NFIELD .NE. 7) THEN
+!      WRITE ( 6, *)"MHD_RIEM_HLLD : NFIELD .NE. 7", NFIELD, 7
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( nriembegin .LT. ONEDFLUIDBEGIN) .OR.
+     1     ( nriembegin .GT. ONEDFLUIDEND) ) THEN
+!      WRITE ( 6, *)"MHD_RIEM_HLLD : nriembegin out of bounds",
+!     1       nriembegin, ONEDFLUIDBEGIN, ONEDFLUIDEND
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( nriemend .LT. ONEDFLUIDBEGIN) .OR.
+     1     ( nriemend .GT. ONEDFLUIDEND) ) THEN
+!      WRITE ( 6, *)"MHD_RIEM_HLLD : nriemend out of bounds",
+!     1       nriemend, ONEDFLUIDBEGIN, ONEDFLUIDEND
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( iprimitive .LT. -1) .OR.
+     1     ( iprimitive .GT. 0) ) THEN
+!      WRITE ( 6, *)"MHD_RIEM_HLLD : iprimitive out of bounds",
+!     1  iprimitive
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( ( split_prsflux_re .LT. 0) .OR.
+     1     ( split_prsflux_re .GT. 2)) THEN
+!      WRITE ( 6, *)"MHD_RIEM_HLLD : split_prsflux_re ",
+!     1             " out of bounds", split_prsflux_re
+      debug_stop = 1
+      RETURN
+      END IF
+
+      IF ( iprimitive .NE. 0) THEN
+!      WRITE ( 6, *)"MHD_RIEM_HLLD : iprimitive .NE. 0"
+      debug_stop = 1
+      RETURN
+      END IF
+
+******************************************************************
+
+* To make all LLF fluxes, set this to "1".
+      make_llf ( nriembegin: nriemend) = 0
+
+* Set up integer array that tells us that a zone is done.
+      im_done ( nriembegin: nriemend) = 0
+
+* Also, by default, we assume that the Riemann fan is not open.
+* If it is made to open up in an HLLD solver then we at least
+* want the minimal consistency check that the jump in the thermal pressure 
+* across the contact is small. We, therefore, need to tag whether the
+* fan is open or not.
+      open_fan ( nriembegin: nriemend) = 0
+
+* If the jump in the thermal pressure is large across the contact then
+* the HLLD construction is a crock and we are better off using an HLL
+* formulation.
+      make_plain_hll ( nriembegin: nriemend) = 0
+
+******************************************************************
+******************************************************************
+
+* Bound the density and pressure variables.
+* For starters none of the zones need Einfeldt fix.
+* Also "rhobar 2" and "prsbar 2" may not be evaluated in all cases
+* later on so we give them a dummy initialization.
+
+      DO i = nriembegin, nriemend
+
+      rhoremi ( i) = AMAX1 ( rhoremi ( i), rhofloor)
+      rhorepl ( i) = AMAX1 ( rhorepl ( i), rhofloor)
+
+      prsremi ( i) = AMAX1 ( prsremi ( i), prsfloor)
+      prsrepl ( i) = AMAX1 ( prsrepl ( i), prsfloor)
+ 
+      END DO
+
+***********************
+
+* Evaluate the thermal energy density and the local gammas. In doing so, we
+* also make sure the species fractions are individually and cumulatively
+* within reasonable ranges. Do this only if exact EOS's are to be used.
+
+* Relying on approximate EOS's here.
+* The temperature is not needed below, so it is comented out.
+
+      DO i = nriembegin, nriemend
+
+      engremi ( i) = prsremi ( i) / ( gamma_eos_remi ( i) - 1.0)
+*      temperatureremi ( i) = prsremi ( i) * mean_mol_wt_remi ( i)
+*     1                     / ( gasconst * rhoremi ( i))
+
+      engrepl ( i) = prsrepl ( i) / ( gamma_eos_repl ( i) - 1.0)
+*      temperaturerepl ( i) = prsrepl ( i) * mean_mol_wt_repl ( i)
+*     1                     / ( gasconst * rhorepl ( i))
+
+      END DO
+
+***************************
+
+* Make "total_enthalpy_remi" and "total_enthalpy_repl". These are
+* useful in making Roe-averages.
+
+      DO i = nriembegin, nriemend
+
+      total_enthalpy_remi ( i) = ( engremi ( i) + prsremi ( i)
+     1    + 0.5 * rhoremi ( i) * ( vlxremi ( i)**2 + vlyremi ( i)**2
+     1                           + vlzremi ( i)**2)
+     1    + one_by_fourpi * ( bfxre ( i)**2 + bfyremi ( i)**2
+     1                      + bfzremi ( i)**2 ) ) / rhoremi ( i)
+
+      total_enthalpy_repl ( i) = ( engrepl ( i) + prsrepl ( i)
+     1    + 0.5 * rhorepl ( i) * ( vlxrepl ( i)**2 + vlyrepl ( i)**2
+     1                           + vlzrepl ( i)**2)
+     1    + one_by_fourpi * ( bfxre ( i)**2 + bfyrepl ( i)**2
+     1                      + bfzrepl ( i)**2 ) ) / rhorepl ( i)
+
+      END DO
+
+******************************************************************
+******************************************************************
+
+! Construction of "zonebdy_conserved" and "zonebdy_flux".
+
+      DO i = nriembegin, nriemend
+
+
+      zonebdy_conserved ( i, 0, 1) = rhoremi ( i)
+      zonebdy_conserved ( i, 0, 2) = rhoremi ( i)
+     1                             * vlxremi ( i)
+      zonebdy_conserved ( i, 0, 3) = rhoremi ( i)
+     1                             * vlyremi ( i)
+      zonebdy_conserved ( i, 0, 4) = rhoremi ( i)
+     1                             * vlzremi ( i)
+      zonebdy_conserved ( i, 0, 6) = bfyremi ( i)
+      zonebdy_conserved ( i, 0, 7) = bfzremi ( i)
+
+
+      zonebdy_conserved ( i, 1, 1) = rhorepl ( i)
+      zonebdy_conserved ( i, 1, 2) = rhorepl ( i)
+     1                             * vlxrepl ( i)
+      zonebdy_conserved ( i, 1, 3) = rhorepl ( i)
+     1                             * vlyrepl ( i)
+      zonebdy_conserved ( i, 1, 4) = rhorepl ( i)
+     1                             * vlzrepl ( i)
+      zonebdy_conserved ( i, 1, 6) = bfyrepl ( i)
+      zonebdy_conserved ( i, 1, 7) = bfzrepl ( i)
+
+
+      zonebdy_flux ( i, 0, 1) = zonebdy_conserved ( i, 0, 2)
+      zonebdy_flux ( i, 0, 2) =
+     1     zonebdy_conserved ( i, 0, 2) * vlxremi ( i)
+     1   + prsremi ( i)
+     1   + 0.5 * ( - bfxre ( i)**2 + bfyremi ( i)**2
+     1                             + bfzremi ( i)**2) * one_by_fourpi
+      zonebdy_flux ( i, 0, 3) =
+     1     zonebdy_conserved ( i, 0, 3) * vlxremi ( i)
+     1                - bfxre ( i) * bfyremi ( i) * one_by_fourpi
+      zonebdy_flux ( i, 0, 4) =
+     1     zonebdy_conserved ( i, 0, 4) * vlxremi ( i)
+     1                - bfxre ( i) * bfzremi ( i) * one_by_fourpi
+      zonebdy_flux ( i, 0, 6) = bfyremi ( i) * vlxremi ( i)
+     1                        - bfxre ( i) * vlyremi ( i)
+      zonebdy_flux ( i, 0, 7) = bfzremi ( i) * vlxremi ( i)
+     1                        - bfxre ( i) * vlzremi ( i)
+
+
+      zonebdy_flux ( i, 1, 1) = zonebdy_conserved ( i, 1, 2)
+      zonebdy_flux ( i, 1, 2) =
+     1     zonebdy_conserved ( i, 1, 2) * vlxrepl ( i)
+     1   + prsrepl ( i)
+     1   + 0.5 * ( - bfxre ( i)**2 + bfyrepl ( i)**2
+     1                             + bfzrepl ( i)**2) * one_by_fourpi
+      zonebdy_flux ( i, 1, 3) =
+     1     zonebdy_conserved ( i, 1, 3) * vlxrepl ( i)
+     1                - bfxre ( i) * bfyrepl ( i) * one_by_fourpi
+      zonebdy_flux ( i, 1, 4) =
+     1     zonebdy_conserved ( i, 1, 4) * vlxrepl ( i)
+     1                - bfxre ( i) * bfzrepl ( i) * one_by_fourpi
+      zonebdy_flux ( i, 1, 6) = bfyrepl ( i) * vlxrepl ( i)
+     1                        - bfxre ( i) * vlyrepl ( i)
+      zonebdy_flux ( i, 1, 7) = bfzrepl ( i) * vlxrepl ( i)
+     1                        - bfxre ( i) * vlzrepl ( i)
+
+
+      prs_tot_remi ( i) = prsremi ( i)
+     1   + 0.5 * ( bfxre ( i)**2 + bfyremi ( i)**2
+     1                           + bfzremi ( i)**2) * one_by_fourpi
+
+      prs_tot_repl ( i) = prsrepl ( i)
+     1   + 0.5 * ( bfxre ( i)**2 + bfyrepl ( i)**2
+     1                           + bfzrepl ( i)**2) * one_by_fourpi
+
+      END DO
+
+! ------------------------------
+
+* Make the fifth component differently depending on which flux
+* is desired.
+
+      IF ( iprimitive .EQ. 0) THEN
+
+      DO i = nriembegin, nriemend
+
+      zonebdy_conserved ( i, 0, 5) =
+     1      engremi ( i)
+     1    + 0.5 * rhoremi ( i)
+     1    * ( vlxremi ( i)**2 + vlyremi ( i)**2
+     1                        + vlzremi ( i)**2)
+     1    + 0.5 * ( bfxre ( i)**2 + bfyremi ( i)**2
+     1                            + bfzremi ( i)**2) * one_by_fourpi
+
+      zonebdy_conserved ( i, 1, 5) =
+     1      engrepl ( i)
+     1    + 0.5 * rhorepl ( i)
+     1    * ( vlxrepl ( i)**2 + vlyrepl ( i)**2
+     1                        + vlzrepl ( i)**2)
+     1    + 0.5 * ( bfxre ( i)**2 + bfyrepl ( i)**2
+     1                            + bfzrepl ( i)**2) * one_by_fourpi
+
+      zonebdy_flux ( i, 0, 5) =
+     1     ( zonebdy_conserved ( i, 0, 5) + prsremi ( i)
+     1   + 0.5 * ( bfxre ( i)**2 + bfyremi ( i)**2
+     1           + bfzremi ( i)**2) * one_by_fourpi ) * vlxremi ( i)
+     1   - bfxre ( i) * ( bfxre ( i) * vlxremi ( i)
+     1                  + bfyremi ( i) * vlyremi ( i)
+     1                  + bfzremi ( i) * vlzremi ( i) ) * one_by_fourpi
+
+      zonebdy_flux ( i, 1, 5) =
+     1     ( zonebdy_conserved ( i, 1, 5) + prsrepl ( i)
+     1   + 0.5 * ( bfxre ( i)**2 + bfyrepl ( i)**2
+     1           + bfzrepl ( i)**2) * one_by_fourpi ) * vlxrepl ( i)
+     1   - bfxre ( i) * ( bfxre ( i) * vlxrepl ( i)
+     1                  + bfyrepl ( i) * vlyrepl ( i)
+     1                  + bfzrepl ( i) * vlzrepl ( i) ) * one_by_fourpi
+
+      END DO
+
+      END IF
+
+
+      IF ( iprimitive .EQ. - 1) THEN
+
+      DO i = nriembegin, nriemend
+
+      zonebdy_conserved ( i, 0, 5) = prsremi ( i)
+     1        / rhoremi ( i)**( gamma_soundspeed_remi ( i) - 1.0)
+
+      zonebdy_conserved ( i, 1, 5) = prsrepl ( i)
+     1        / rhorepl ( i)**( gamma_soundspeed_repl ( i) - 1.0)
+
+      zonebdy_flux ( i, 0, 5) = zonebdy_conserved ( i, 0, 5)
+     1                        * vlxremi ( i)
+
+      zonebdy_flux ( i, 1, 5) = zonebdy_conserved ( i, 1, 5)
+     1                        * vlxrepl ( i)
+
+      END DO
+
+      END IF
+
+! ------------------------------
+
+* If multiple species are present then initialize their fluxes etc.
+* appropriately also.
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+        zonebdy_conserved ( i, 0, k) = rhoremi ( i)
+     1                               * specieremi ( ifluid, i)
+
+        zonebdy_conserved ( i, 1, k) = rhorepl ( i) 
+     1                               * specierepl ( ifluid, i)
+
+        zonebdy_flux ( i, 0, k) = zonebdy_conserved ( i, 0, k)
+     1                          * vlxremi ( i)
+
+        zonebdy_flux ( i, 1, k) = zonebdy_conserved ( i, 1, k)
+     1                          * vlxrepl ( i)
+
+      END DO
+
+      END DO
+
+! ------------------------------
+
+! Zero out "flux_re" here.
+
+      DO i = nriembegin, nriemend
+
+      conserved_re ( i, 1) = 0.0
+      conserved_re ( i, 2) = 0.0
+      conserved_re ( i, 3) = 0.0
+      conserved_re ( i, 4) = 0.0
+      conserved_re ( i, 5) = 0.0
+      conserved_re ( i, 6) = 0.0
+      conserved_re ( i, 7) = 0.0
+
+      flux_re ( i, 1) = 0.0
+      flux_re ( i, 2) = 0.0
+      flux_re ( i, 3) = 0.0
+      flux_re ( i, 4) = 0.0
+      flux_re ( i, 5) = 0.0
+      flux_re ( i, 6) = 0.0
+      flux_re ( i, 7) = 0.0
+      flux_re ( i, 8) = 0.0
+
+      END DO
+
+
+      DO ifluid = 1, NFLUID
+
+      k = NFIELD + ifluid
+
+      DO i = nriembegin, nriemend
+
+        conserved_re ( i, k) = 0.0
+
+        flux_re ( i, k + 1) = 0.0
+
+      END DO
+
+      END DO
+
+******************************************************************
+*
+* Store left and right conserved variables and fluxes. Similarly for entropy.
+*
+      DO i = nriembegin, nriemend
+*
+      conserved_ein_l ( i, 1) = zonebdy_conserved ( i, 0, 1)
+      conserved_ein_l ( i, 2) = zonebdy_conserved ( i, 0, 2)
+      conserved_ein_l ( i, 3) = zonebdy_conserved ( i, 0, 3)
+      conserved_ein_l ( i, 4) = zonebdy_conserved ( i, 0, 4)
+      conserved_ein_l ( i, 5) = zonebdy_conserved ( i, 0, 5)
+      conserved_ein_l ( i, 6) = zonebdy_conserved ( i, 0, 6)
+      conserved_ein_l ( i, 7) = zonebdy_conserved ( i, 0, 7)
+*
+      conserved_ein_r ( i, 1) = zonebdy_conserved ( i, 1, 1)
+      conserved_ein_r ( i, 2) = zonebdy_conserved ( i, 1, 2)
+      conserved_ein_r ( i, 3) = zonebdy_conserved ( i, 1, 3)
+      conserved_ein_r ( i, 4) = zonebdy_conserved ( i, 1, 4)
+      conserved_ein_r ( i, 5) = zonebdy_conserved ( i, 1, 5)
+      conserved_ein_r ( i, 6) = zonebdy_conserved ( i, 1, 6)
+      conserved_ein_r ( i, 7) = zonebdy_conserved ( i, 1, 7)
+*
+*
+      flux_ein_l ( i, 1) = zonebdy_flux ( i, 0, 1)
+      flux_ein_l ( i, 2) = zonebdy_flux ( i, 0, 2)
+      flux_ein_l ( i, 3) = zonebdy_flux ( i, 0, 3)
+      flux_ein_l ( i, 4) = zonebdy_flux ( i, 0, 4)
+      flux_ein_l ( i, 5) = zonebdy_flux ( i, 0, 5)
+      flux_ein_l ( i, 6) = zonebdy_flux ( i, 0, 6)
+      flux_ein_l ( i, 7) = zonebdy_flux ( i, 0, 7)
+*
+      flux_ein_r ( i, 1) = zonebdy_flux ( i, 1, 1)
+      flux_ein_r ( i, 2) = zonebdy_flux ( i, 1, 2)
+      flux_ein_r ( i, 3) = zonebdy_flux ( i, 1, 3)
+      flux_ein_r ( i, 4) = zonebdy_flux ( i, 1, 4)
+      flux_ein_r ( i, 5) = zonebdy_flux ( i, 1, 5)
+      flux_ein_r ( i, 6) = zonebdy_flux ( i, 1, 6)
+      flux_ein_r ( i, 7) = zonebdy_flux ( i, 1, 7)
+*
+#if ( NFLUID >= 1)
+
+      conserved_ein_l ( i, NFIELD + 1: NFIELD + NFLUID) =
+     1         zonebdy_conserved ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+
+      conserved_ein_r ( i, NFIELD + 1: NFIELD + NFLUID) =
+     1         zonebdy_conserved ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+
+      flux_ein_l ( i, NFIELD + 1: NFIELD + NFLUID) =
+     1         zonebdy_flux ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+
+      flux_ein_r ( i, NFIELD + 1: NFIELD + NFLUID) =
+     1         zonebdy_flux ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+*
+#endif
+*
+      entropy_ein_l ( i) = prsremi ( i)
+     1        / rhoremi ( i)**( gamma_soundspeed_remi ( i) - 1.0)
+      entropy_ein_r ( i) = prsrepl ( i)
+     1        / rhorepl ( i)**( gamma_soundspeed_repl ( i) - 1.0)
+
+      entropy_flux_ein_l ( i) = entropy_ein_l ( i) * vlxremi ( i)
+      entropy_flux_ein_r ( i) = entropy_ein_r ( i) * vlxrepl ( i)
+*
+      END DO
+
+******************************************************************
+******************************************************************
+
+* Here we use Roe averaging and make only one call to the
+* eigenvector subroutine. The "eng, temperature" etc. that we make here
+* can even serve as good initial guesses for an exact EOS.
+
+
+      DO i = nriembegin, nriemend
+
+! ----------
+
+      gamma_eos ( i) = 0.5 * ( gamma_eos_remi ( i)
+     1                       + gamma_eos_repl ( i))
+      gamma_soundspeed ( i) = 0.5 * ( gamma_soundspeed_remi ( i)
+     1                              + gamma_soundspeed_repl ( i))
+      mean_mol_wt ( i) = 0.5 * ( mean_mol_wt_remi ( i)
+     1                         + mean_mol_wt_repl ( i))
+
+! ----------
+
+      temparr_01 ( i) = SQRT ( rhorepl ( i) / rhoremi ( i))
+      temparr_02 ( i) = 1.0 / ( 1.0 + temparr_01 ( i))
+
+      rhobar ( i) = SQRT ( rhoremi ( i) * rhorepl ( i))
+
+      vlxbar ( i) = ( vlxremi ( i) + vlxrepl ( i) * temparr_01 ( i))
+     1            * temparr_02 ( i)
+      vlybar ( i) = ( vlyremi ( i) + vlyrepl ( i) * temparr_01 ( i))
+     1            * temparr_02 ( i)
+      vlzbar ( i) = ( vlzremi ( i) + vlzrepl ( i) * temparr_01 ( i))
+     1            * temparr_02 ( i)
+
+      total_enthalpy_bar ( i) = ( total_enthalpy_remi ( i)
+     1  + total_enthalpy_repl ( i) * temparr_01 ( i)) * temparr_02 ( i)
+
+      bfxbar ( i) = bfxre ( i)
+      bfybar ( i) = ( bfyremi ( i) * temparr_01 ( i) + bfyrepl ( i))
+     1            * temparr_02 ( i)
+      bfzbar ( i) = ( bfzremi ( i) * temparr_01 ( i) + bfzrepl ( i))
+     1            * temparr_02 ( i)
+
+      xbar ( i) = 0.5 * ( ( bfyrepl ( i) - bfyremi ( i))**2
+     1                  + ( bfzrepl ( i) - bfzremi ( i))**2 )
+     1          / ( SQRT ( rhoremi ( i)) + SQRT ( rhorepl ( i)) )**2
+
+      prsbar ( i) = total_enthalpy_bar ( i)
+     1     - 0.5 * ( vlxbar ( i)**2 + vlybar ( i)**2 + vlzbar ( i)**2)
+     1     - ( bfxre ( i)**2 + bfybar ( i)**2 + bfzbar ( i)**2)
+     1     / ( fourpi * rhobar ( i))
+      prsbar ( i) = ( gamma_eos ( i) - 1.0) * rhobar ( i) * prsbar ( i)
+     1            / gamma_eos ( i)
+      prsbar ( i) = prsbar ( i)
+     1     - ( gamma_eos ( i) - 2.0) * rhobar ( i) * xbar ( i)
+     1     / ( fourpi * gamma_eos ( i) )
+      prsbar ( i) = AMAX1 ( prsbar ( i), prsfloor)
+
+! ----------
+
+! Give yourself the option of using arithmetic averages if needed.
+
+      IF ( ( rhobar ( i) .LE. rhofloor_plus_delta) .OR.
+     1     ( prsbar ( i) .LE. prsfloor_plus_delta) ) THEN
+
+      rhobar ( i) = 0.5 * ( rhoremi ( i) + rhorepl ( i))
+      prsbar ( i) = 0.5 * ( prsremi ( i) + prsrepl ( i))
+
+      vlxbar ( i) = 0.5 * ( vlxremi ( i) + vlxrepl ( i))
+      vlybar ( i) = 0.5 * ( vlyremi ( i) + vlyrepl ( i))
+      vlzbar ( i) = 0.5 * ( vlzremi ( i) + vlzrepl ( i))
+
+      bfxbar ( i) = bfxre ( i)
+      bfybar ( i) = 0.5 * ( bfyremi ( i) + bfyrepl ( i))
+      bfzbar ( i) = 0.5 * ( bfzremi ( i) + bfzrepl ( i))
+
+      xbar ( i) = 0.0
+
+      END IF
+
+! ----------
+
+      eng ( i) = prsbar ( i) / ( gamma_eos ( i) - 1.0)
+      temperature ( i) = prsbar ( i) * mean_mol_wt ( i)
+     1                 / ( gasconst * rhobar ( i))
+
+! ----------
+
+      END DO
+
+! ------------------------------
+
+      DO ifluid = 1, NFLUID
+
+      DO i = nriembegin, nriemend
+
+      temparr_01 ( i) = SQRT ( rhorepl ( i) / rhoremi ( i))
+      temparr_02 ( i) = 1.0 / ( 1.0 + temparr_01 ( i))
+
+      speciebar ( ifluid, i) = ( specieremi ( ifluid, i)
+     1 + specierepl ( ifluid, i) * temparr_01 ( i)) * temparr_02 ( i)
+
+      END DO
+
+      END DO
+
+! ------------------------------
+
+*********************************************************************
+*********************************************************************
+
+* Make eigenvalues for the resolved state of the riemann problem.
+* Make "eigenval_re":
+
+      DO i = nriembegin, nriemend
+
+*****************
+
+      one_by_4pi_rho ( i) = 1.0 / ( fourpi * rhobar ( i) )
+
+      va_x ( i) = bfxbar ( i)**2 * one_by_4pi_rho ( i)
+      va_x ( i) = SQRT ( va_x ( i) )
+
+      c_s ( i) = gamma_soundspeed ( i) * prsbar ( i) / rhobar ( i)
+      c_s ( i) = SQRT ( c_s ( i) )
+
+      v_a ( i) = ( bfxbar ( i)**2 + bfybar ( i)**2
+     1           + bfzbar ( i)**2) * one_by_4pi_rho ( i)
+      v_a ( i) = SQRT ( v_a ( i) )
+
+      temparr_01 ( i) = v_a ( i)**2 + c_s ( i)**2
+      temparr_02 ( i) = temparr_01 ( i)**2
+     1                - 4.0 * va_x ( i)**2 * c_s ( i)**2
+      temparr_02 ( i) = AMAX1 ( temparr_02 ( i), 0.0)
+      temparr_02 ( i) = SQRT ( temparr_02 ( i))
+
+      v_f ( i) = 0.5 * ( temparr_01 ( i) + temparr_02 ( i))
+      v_f ( i) = SQRT ( v_f ( i) )
+
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      v_s ( i) = 0.5 * ( temparr_01 ( i) - temparr_02 ( i))
+      v_s ( i) = AMAX1 ( v_s ( i), 0.0)
+      v_s ( i) = SQRT ( v_s ( i) )
+#endif
+
+*****************
+
+      eigenval_re ( i, 1) = vlxbar ( i) - v_f ( i)
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      eigenval_re ( i, 2) = vlxbar ( i) - va_x ( i)
+      eigenval_re ( i, 3) = vlxbar ( i) - v_s ( i)
+      eigenval_re ( i, 4) = vlxbar ( i)
+      eigenval_re ( i, 5) = vlxbar ( i) + v_s ( i)
+      eigenval_re ( i, 6) = vlxbar ( i) + va_x ( i)
+#endif
+      eigenval_re ( i, 7) = vlxbar ( i) + v_f ( i)
+
+*******************
+
+      END DO
+
+*******************
+
+#if ( NFLUID >= 1)
+*      DO i = nriembegin, nriemend
+
+*      eigenval_re ( i, NFIELD + 1: NFIELD + NFLUID) = vlxbar ( i)
+
+*      END DO
+#endif
+
+* End of making "eigenval_re"
+
+*********************************************************************
+*********************************************************************
+
+* And store the eigenvalues on either side of
+* the zone boundary.
+* For HLL/LLF fluxes we only need the extremal wavespeeds. Thus the others
+* are commented out. This will need to be rethought if we ever go to
+* an HLLC formulation.
+
+      DO i = nriembegin, nriemend
+
+      zonebdy_eigenval ( i, 1) = eigenval_re ( i, 1)
+      eigenval_db ( i, 0, 1) = eigenval_re ( i, 1)
+      eigenval_db ( i, 1, 1) = eigenval_re ( i, 1)
+
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      zonebdy_eigenval ( i, 2) = eigenval_re ( i, 2)
+      eigenval_db ( i, 0, 2) = eigenval_re ( i, 2)
+      eigenval_db ( i, 1, 2) = eigenval_re ( i, 2)
+
+      zonebdy_eigenval ( i, 3) = eigenval_re ( i, 3)
+      eigenval_db ( i, 0, 3) = eigenval_re ( i, 3)
+      eigenval_db ( i, 1, 3) = eigenval_re ( i, 3)
+
+      zonebdy_eigenval ( i, 4) = eigenval_re ( i, 4)
+      eigenval_db ( i, 0, 4) = eigenval_re ( i, 4)
+      eigenval_db ( i, 1, 4) = eigenval_re ( i, 4)
+
+      zonebdy_eigenval ( i, 5) = eigenval_re ( i, 5)
+      eigenval_db ( i, 0, 5) = eigenval_re ( i, 5)
+      eigenval_db ( i, 1, 5) = eigenval_re ( i, 5)
+
+      zonebdy_eigenval ( i, 6) = eigenval_re ( i, 6)
+      eigenval_db ( i, 0, 6) = eigenval_re ( i, 6)
+      eigenval_db ( i, 1, 6) = eigenval_re ( i, 6)
+#endif
+
+      zonebdy_eigenval ( i, 7) = eigenval_re ( i, 7)
+      eigenval_db ( i, 0, 7) = eigenval_re ( i, 7)
+      eigenval_db ( i, 1, 7) = eigenval_re ( i, 7)
+
+      END DO
+
+
+*      DO ifluid = 1, NFLUID
+
+*      k = NFIELD + ifluid
+
+*      DO i = nriembegin, nriemend
+
+*        zonebdy_eigenval ( i, k) = eigenval_re ( i, k)
+*        eigenval_db ( i, 0, k) = eigenval_re ( i, k)
+*        eigenval_db ( i, 1, k) = eigenval_re ( i, k)
+
+*      END DO
+
+*      END DO
+
+
+*********************************************************************
+*********************************************************************
+
+
+* Here we explicitly need to get the eigenvalues on either
+* side of the zone boundary so that we can maximize / minimize w.r.t.
+* the eigenvalues of the mean state. We reset "eigenval_db" here
+* so that "eigenval_db ( 0, ifield, i)" is the left-most eigenvalue
+* in that characteristic field and "eigenval_db ( 1, ifield, i)" is
+* the right-most.
+
+* Make "eigenval_lf":
+
+      DO i = nriembegin, nriemend
+
+*****************
+
+      one_by_4pi_rho ( i) = 1.0 / ( fourpi * rhoremi ( i) )
+
+      va_x ( i) = bfxre ( i)**2 * one_by_4pi_rho ( i)
+      va_x ( i) = SQRT ( va_x ( i) )
+
+      c_s ( i) = gamma_soundspeed_remi ( i) * prsremi ( i)
+     1         / rhoremi ( i)
+      c_s ( i) = SQRT ( c_s ( i) )
+
+      v_a ( i) = ( bfxre ( i)**2 + bfyremi ( i)**2
+     1           + bfzremi ( i)**2) * one_by_4pi_rho ( i)
+      v_a ( i) = SQRT ( v_a ( i) )
+
+      temparr_01 ( i) = v_a ( i)**2 + c_s ( i)**2
+      temparr_02 ( i) = temparr_01 ( i)**2
+     1                - 4.0 * va_x ( i)**2 * c_s ( i)**2
+      temparr_02 ( i) = AMAX1 ( temparr_02 ( i), 0.0)
+      temparr_02 ( i) = SQRT ( temparr_02 ( i))
+
+      v_f ( i) = 0.5 * ( temparr_01 ( i) + temparr_02 ( i))
+      v_f ( i) = SQRT ( v_f ( i) )
+
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      v_s ( i) = 0.5 * ( temparr_01 ( i) - temparr_02 ( i))
+      v_s ( i) = AMAX1 ( v_s ( i), 0.0)
+      v_s ( i) = SQRT ( v_s ( i) )
+#endif
+
+*****************
+
+      eigenval_lf ( i, 1) = vlxremi ( i) - v_f ( i)
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      eigenval_lf ( i, 2) = vlxremi ( i) - va_x ( i)
+      eigenval_lf ( i, 3) = vlxremi ( i) - v_s ( i)
+      eigenval_lf ( i, 4) = vlxremi ( i)
+      eigenval_lf ( i, 5) = vlxremi ( i) + v_s ( i)
+      eigenval_lf ( i, 6) = vlxremi ( i) + va_x ( i)
+#endif
+      eigenval_lf ( i, 7) = vlxremi ( i) + v_f ( i)
+
+*******************
+
+      END DO
+
+*******************
+
+#if ( NFLUID >= 1)
+*      DO i = nriembegin, nriemend
+
+*      eigenval_lf ( i, NFIELD + 1: NFIELD + NFLUID) = vlxremi ( i)
+
+*      END DO
+#endif
+
+* End of making "eigenval_lf"
+
+*********************************************************************
+*********************************************************************
+
+* And store the eigenvalues on either side of the zone boundary.
+* For HLL/LLF fluxes we only need the extremal wavespeeds. Thus the others
+* are commented out. This will need to be rethought if we ever go to
+* an HLLC formulation.
+
+      DO i = nriembegin, nriemend
+
+      eigenval_db ( i, 0, 1) =
+     1      AMIN1 ( eigenval_db ( i, 0, 1), eigenval_lf ( i, 1) )
+      eigenval_db ( i, 1, 1) =
+     1      AMAX1 ( eigenval_db ( i, 1, 1), eigenval_lf ( i, 1) )
+
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      eigenval_db ( i, 0, 2) =
+     1      AMIN1 ( eigenval_db ( i, 0, 2), eigenval_lf ( i, 2) )
+      eigenval_db ( i, 1, 2) =
+     1      AMAX1 ( eigenval_db ( i, 1, 2), eigenval_lf ( i, 2) )
+
+      eigenval_db ( i, 0, 3) =
+     1      AMIN1 ( eigenval_db ( i, 0, 3), eigenval_lf ( i, 3) )
+      eigenval_db ( i, 1, 3) =
+     1      AMAX1 ( eigenval_db ( i, 1, 3), eigenval_lf ( i, 3) )
+
+      eigenval_db ( i, 0, 4) =
+     1      AMIN1 ( eigenval_db ( i, 0, 4), eigenval_lf ( i, 4) )
+      eigenval_db ( i, 1, 4) =
+     1      AMAX1 ( eigenval_db ( i, 1, 4), eigenval_lf ( i, 4) )
+
+      eigenval_db ( i, 0, 5) =
+     1      AMIN1 ( eigenval_db ( i, 0, 5), eigenval_lf ( i, 5) )
+      eigenval_db ( i, 1, 5) =
+     1      AMAX1 ( eigenval_db ( i, 1, 5), eigenval_lf ( i, 5) )
+
+      eigenval_db ( i, 0, 6) =
+     1      AMIN1 ( eigenval_db ( i, 0, 6), eigenval_lf ( i, 6) )
+      eigenval_db ( i, 1, 6) =
+     1      AMAX1 ( eigenval_db ( i, 1, 6), eigenval_lf ( i, 6) )
+#endif
+
+      eigenval_db ( i, 0, 7) =
+     1      AMIN1 ( eigenval_db ( i, 0, 7), eigenval_lf ( i, 7) )
+      eigenval_db ( i, 1, 7) =
+     1      AMAX1 ( eigenval_db ( i, 1, 7), eigenval_lf ( i, 7) )
+
+      END DO
+
+
+*      DO ifluid = 1, NFLUID
+
+*      k = NFIELD + ifluid
+
+*      DO i = nriembegin, nriemend
+
+*        eigenval_db ( i, 0, k) =
+*     1        AMIN1 ( eigenval_db ( i, 0, k), eigenval_lf ( i, k) )
+*        eigenval_db ( i, 1, k) =
+*     1        AMAX1 ( eigenval_db ( i, 1, k), eigenval_lf ( i, k) )
+
+*      END DO
+
+*      END DO
+
+*********************************************************************
+*********************************************************************
+
+* Make "eigenval_rt":
+
+      DO i = nriembegin, nriemend
+
+*****************
+
+      one_by_4pi_rho ( i) = 1.0 / ( fourpi * rhorepl ( i) )
+
+      va_x ( i) = bfxre ( i)**2 * one_by_4pi_rho ( i)
+      va_x ( i) = SQRT ( va_x ( i) )
+
+      c_s ( i) = gamma_soundspeed_repl ( i) * prsrepl ( i)
+     1         / rhorepl ( i)
+      c_s ( i) = SQRT ( c_s ( i) )
+
+      v_a ( i) = ( bfxre ( i)**2 + bfyrepl ( i)**2
+     1           + bfzrepl ( i)**2) * one_by_4pi_rho ( i)
+      v_a ( i) = SQRT ( v_a ( i) )
+
+      temparr_01 ( i) = v_a ( i)**2 + c_s ( i)**2
+      temparr_02 ( i) = temparr_01 ( i)**2
+     1                - 4.0 * va_x ( i)**2 * c_s ( i)**2
+      temparr_02 ( i) = AMAX1 ( temparr_02 ( i), 0.0)
+      temparr_02 ( i) = SQRT ( temparr_02 ( i))
+
+      v_f ( i) = 0.5 * ( temparr_01 ( i) + temparr_02 ( i))
+      v_f ( i) = SQRT ( v_f ( i) )
+
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      v_s ( i) = 0.5 * ( temparr_01 ( i) - temparr_02 ( i))
+      v_s ( i) = AMAX1 ( v_s ( i), 0.0)
+      v_s ( i) = SQRT ( v_s ( i) )
+#endif
+
+*****************
+
+      eigenval_rt ( i, 1) = vlxrepl ( i) - v_f ( i)
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      eigenval_rt ( i, 2) = vlxrepl ( i) - va_x ( i)
+      eigenval_rt ( i, 3) = vlxrepl ( i) - v_s ( i)
+      eigenval_rt ( i, 4) = vlxrepl ( i)
+      eigenval_rt ( i, 5) = vlxrepl ( i) + v_s ( i)
+      eigenval_rt ( i, 6) = vlxrepl ( i) + va_x ( i)
+#endif
+      eigenval_rt ( i, 7) = vlxrepl ( i) + v_f ( i)
+
+*******************
+
+      END DO
+
+*******************
+
+#if ( NFLUID >= 1)
+*      DO i = nriembegin, nriemend
+
+*      eigenval_rt ( i, NFIELD + 1: NFIELD + NFLUID) = vlxrepl ( i)
+
+*      END DO
+#endif
+
+
+* End of making "eigenval_rt"
+
+*********************************************************************
+*********************************************************************
+
+* For HLL/LLF fluxes we only need the extremal wavespeeds. Thus the others
+* are commented out. This will need to be rethought if we ever go to
+* an HLLC formulation.
+
+      DO i = nriembegin, nriemend
+
+
+      eigenval_db ( i, 0, 1) =
+     1      AMIN1 ( eigenval_db ( i, 0, 1), eigenval_rt ( i, 1) )
+      eigenval_db ( i, 1, 1) =
+     1      AMAX1 ( eigenval_db ( i, 1, 1), eigenval_rt ( i, 1) )
+
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      eigenval_db ( i, 0, 2) =
+     1      AMIN1 ( eigenval_db ( i, 0, 2), eigenval_rt ( i, 2) )
+      eigenval_db ( i, 1, 2) =
+     1      AMAX1 ( eigenval_db ( i, 1, 2), eigenval_rt ( i, 2) )
+
+      eigenval_db ( i, 0, 3) =
+     1      AMIN1 ( eigenval_db ( i, 0, 3), eigenval_rt ( i, 3) )
+      eigenval_db ( i, 1, 3) =
+     1      AMAX1 ( eigenval_db ( i, 1, 3), eigenval_rt ( i, 3) )
+
+      eigenval_db ( i, 0, 4) =
+     1      AMIN1 ( eigenval_db ( i, 0, 4), eigenval_rt ( i, 4) )
+      eigenval_db ( i, 1, 4) =
+     1      AMAX1 ( eigenval_db ( i, 1, 4), eigenval_rt ( i, 4) )
+
+      eigenval_db ( i, 0, 5) =
+     1      AMIN1 ( eigenval_db ( i, 0, 5), eigenval_rt ( i, 5) )
+      eigenval_db ( i, 1, 5) =
+     1      AMAX1 ( eigenval_db ( i, 1, 5), eigenval_rt ( i, 5) )
+
+      eigenval_db ( i, 0, 6) =
+     1      AMIN1 ( eigenval_db ( i, 0, 6), eigenval_rt ( i, 6) )
+      eigenval_db ( i, 1, 6) =
+     1      AMAX1 ( eigenval_db ( i, 1, 6), eigenval_rt ( i, 6) )
+#endif
+
+      eigenval_db ( i, 0, 7) =
+     1      AMIN1 ( eigenval_db ( i, 0, 7), eigenval_rt ( i, 7) )
+      eigenval_db ( i, 1, 7) =
+     1      AMAX1 ( eigenval_db ( i, 1, 7), eigenval_rt ( i, 7) )
+
+
+      END DO
+
+
+*      DO ifluid = 1, NFLUID
+
+*      k = NFIELD + ifluid
+
+*      DO i = nriembegin, nriemend
+
+*        eigenval_db ( i, 0, k) =
+*     1        AMIN1 ( eigenval_db ( i, 0, k), eigenval_rt ( i, k) )
+*        eigenval_db ( i, 1, k) =
+*     1        AMAX1 ( eigenval_db ( i, 1, k), eigenval_rt ( i, k) )
+
+*      END DO 
+
+*      END DO 
+
+* End of making the eigenvectors and appropriate wave speeds.
+
+
+*********************************************************************
+*********************************************************************
+
+#if ( EXTRA_WAVSPEED_FIX == 0)
+* Beginning part that is only needed if "EXTRA_WAVSPEED_FIX == 0".
+
+* Ensuring that "wavespd_ein_r ( i) - vlx0 ( i)" and
+* "wavespd_ein_l ( i) - vlx0 ( i)" are non-zero later on will ensure that
+* we never have divide by zero situations when evaluating density variables.
+* We make sure that we never get there via the following step:
+
+      DO i = nriembegin, nriemend
+
+
+****************
+
+      wavespd_ein_l ( i) = eigenval_db ( i, 0, 1)
+
+      wavespd_ein_r ( i) = eigenval_db ( i, 1, 7)
+
+****************
+
+      temparr_01 ( i) = wavespd_ein_r ( i) - vlxrepl ( i)
+      temparr_02 ( i) = wavespd_ein_l ( i) - vlxremi ( i)
+      temparr_03 ( i) = 1.0 / ( temparr_01 ( i) * rhorepl ( i)
+     1                        - temparr_02 ( i) * rhoremi ( i) )
+
+      vlx0 ( i) = ( temparr_01 ( i) * zonebdy_conserved ( i, 1, 2)
+     1            - temparr_02 ( i) * zonebdy_conserved ( i, 0, 2)
+     1            - prs_tot_repl ( i) + prs_tot_remi ( i) )
+     1          * temparr_03 ( i)
+
+*****************
+
+      eigenval_re ( i, 1) = vlx0 ( i)
+     1                    + ( eigenval_re ( i, 1) - vlxbar ( i))
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      eigenval_re ( i, 2) = vlx0 ( i)
+     1                    + ( eigenval_re ( i, 2) - vlxbar ( i))
+      eigenval_re ( i, 3) = vlx0 ( i)
+     1                    + ( eigenval_re ( i, 3) - vlxbar ( i))
+      eigenval_re ( i, 4) = vlx0 ( i)
+      eigenval_re ( i, 5) = vlx0 ( i)
+     1                    + ( eigenval_re ( i, 5) - vlxbar ( i))
+      eigenval_re ( i, 6) = vlx0 ( i)
+     1                    + ( eigenval_re ( i, 6) - vlxbar ( i))
+#endif
+      eigenval_re ( i, 7) = vlx0 ( i)
+     1                    + ( eigenval_re ( i, 7) - vlxbar ( i))
+
+*******************
+
+      END DO
+
+*******************
+
+#if ( NFLUID >= 1)
+*      DO i = nriembegin, nriemend
+
+*      eigenval_re ( i, NFIELD + 1: NFIELD + NFLUID) = vlx0 ( i)
+
+*      END DO
+#endif
+
+*******************
+
+      DO i = nriembegin, nriemend
+
+      eigenval_db ( i, 0, 1) =
+     1      AMIN1 ( eigenval_db ( i, 0, 1), eigenval_re ( i, 1) )
+      eigenval_db ( i, 1, 1) =
+     1      AMAX1 ( eigenval_db ( i, 1, 1), eigenval_re ( i, 1) )
+
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      eigenval_db ( i, 0, 2) =
+     1      AMIN1 ( eigenval_db ( i, 0, 2), eigenval_re ( i, 2) )
+      eigenval_db ( i, 1, 2) =
+     1      AMAX1 ( eigenval_db ( i, 1, 2), eigenval_re ( i, 2) )
+
+      eigenval_db ( i, 0, 3) =
+     1      AMIN1 ( eigenval_db ( i, 0, 3), eigenval_re ( i, 3) )
+      eigenval_db ( i, 1, 3) =
+     1      AMAX1 ( eigenval_db ( i, 1, 3), eigenval_re ( i, 3) )
+
+      eigenval_db ( i, 0, 4) =
+     1      AMIN1 ( eigenval_db ( i, 0, 4), eigenval_re ( i, 4) )
+      eigenval_db ( i, 1, 4) =
+     1      AMAX1 ( eigenval_db ( i, 1, 4), eigenval_re ( i, 4) )
+
+      eigenval_db ( i, 0, 5) =
+     1      AMIN1 ( eigenval_db ( i, 0, 5), eigenval_re ( i, 5) )
+      eigenval_db ( i, 1, 5) =
+     1      AMAX1 ( eigenval_db ( i, 1, 5), eigenval_re ( i, 5) )
+
+      eigenval_db ( i, 0, 6) =
+     1      AMIN1 ( eigenval_db ( i, 0, 6), eigenval_re ( i, 6) )
+      eigenval_db ( i, 1, 6) =
+     1      AMAX1 ( eigenval_db ( i, 1, 6), eigenval_re ( i, 6) )
+#endif
+
+      eigenval_db ( i, 0, 7) =
+     1      AMIN1 ( eigenval_db ( i, 0, 7), eigenval_re ( i, 7) )
+      eigenval_db ( i, 1, 7) =
+     1      AMAX1 ( eigenval_db ( i, 1, 7), eigenval_re ( i, 7) )
+
+      END DO
+
+
+*      DO ifluid = 1, NFLUID
+
+*      k = NFIELD + ifluid
+
+*      DO i = nriembegin, nriemend
+
+*        eigenval_db ( i, 0, k) =
+*     1        AMIN1 ( eigenval_db ( i, 0, k), eigenval_re ( i, k) )
+*        eigenval_db ( i, 1, k) =
+*     1        AMAX1 ( eigenval_db ( i, 1, k), eigenval_re ( i, k) )
+
+*      END DO
+
+*      END DO
+
+* End of shifting away from situations where the bounding eigenvalues
+* can be "vlx0 ( i)".
+
+* End part that is only needed if "EXTRA_WAVSPEED_FIX == 0".
+#endif
+
+******************************************************************
+******************************************************************
+
+#if ( EXTRA_WAVSPEED_FIX == 1)
+
+* Here we use HLL averaging to get a mean state and use that for the
+* eigenvalue subroutine.
+* The temperature is not needed below, so it is comented out.
+
+* Note that the resolved state that we obtain from the HLL Riemann solver
+* below is valid even when "wavespd_ein_l and wavespd_ein_r" are both
+* positive or both negative.
+
+
+      DO i = nriembegin, nriemend
+
+
+      wavespd_ein_l ( i) = eigenval_db ( i, 0, 1)
+
+      wavespd_ein_r ( i) = eigenval_db ( i, 1, 7)
+
+      temparr_01 ( i) = 1.0 / ( wavespd_ein_r ( i)
+     1                        - wavespd_ein_l ( i))
+
+      temparr_02 ( i) = wavespd_ein_r ( i) * temparr_01 ( i)
+
+      temparr_03 ( i) = wavespd_ein_l ( i) * temparr_01 ( i)
+
+
+      conserved_ein ( i, 1) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 1)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 1)
+
+     1  - ( flux_ein_r ( i, 1) - flux_ein_l ( i, 1) )
+     1  * temparr_01 ( i)
+*
+      conserved_ein ( i, 2) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 2)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 2)
+
+     1  - ( flux_ein_r ( i, 2) - flux_ein_l ( i, 2) )
+     1  * temparr_01 ( i)
+*
+      conserved_ein ( i, 3) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 3)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 3)
+
+     1  - ( flux_ein_r ( i, 3) - flux_ein_l ( i, 3) )
+     1  * temparr_01 ( i)
+*
+      conserved_ein ( i, 4) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 4)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 4)
+
+     1  - ( flux_ein_r ( i, 4) - flux_ein_l ( i, 4) )
+     1  * temparr_01 ( i)
+*
+      conserved_ein ( i, 5) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 5)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 5)
+
+     1  - ( flux_ein_r ( i, 5) - flux_ein_l ( i, 5) )
+     1  * temparr_01 ( i)
+*
+      conserved_ein ( i, 6) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 6)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 6)
+
+     1  - ( flux_ein_r ( i, 6) - flux_ein_l ( i, 6) )
+     1  * temparr_01 ( i)
+*
+      conserved_ein ( i, 7) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 7)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 7)
+
+     1  - ( flux_ein_r ( i, 7) - flux_ein_l ( i, 7) )
+     1  * temparr_01 ( i)
+*
+#if ( NFLUID >= 1)
+      conserved_ein ( i, NFIELD + 1: NFIELD + NFLUID) =
+
+     1    temparr_02 ( i)
+     1  * conserved_ein_r ( i, NFIELD + 1: NFIELD + NFLUID)
+     1  - temparr_03 ( i)
+     1  * conserved_ein_l ( i, NFIELD + 1: NFIELD + NFLUID)
+
+     1  - ( flux_ein_r ( i, NFIELD + 1: NFIELD + NFLUID)
+     1    - flux_ein_l ( i, NFIELD + 1: NFIELD + NFLUID) )
+     1  * temparr_01 ( i)
+#endif
+
+
+      gamma_eos ( i) = 0.5 * ( gamma_eos_remi ( i)
+     1                       + gamma_eos_repl ( i))
+      gamma_soundspeed ( i) = 0.5 * ( gamma_soundspeed_remi ( i)
+     1                              + gamma_soundspeed_repl ( i))
+      mean_mol_wt ( i) = 0.5 * ( mean_mol_wt_remi ( i)
+     1                         + mean_mol_wt_repl ( i))
+
+
+      rhobar ( i) = conserved_ein ( i, 1)
+
+* LLF is triggered at this point. Comment out if that is not appropriate.
+* Remember that LLF may be the default, as set at the top of this subroutine.
+* For TVD schemes it helps if one does not have LLF because it produces too
+* much rarefaction.
+
+* Depressed values of density or pressure at the left or right states
+* can trigger LLF.
+
+      IF ( prsremi ( i) .LE. prsfloor_plus_delta) THEN
+      make_llf ( i) = 1
+      make_plain_hll ( i) = 1
+      END IF
+
+      IF ( rhoremi ( i) .LE. rhofloor_plus_delta) THEN
+      make_llf ( i) = 1
+      make_plain_hll ( i) = 1
+      END IF
+
+      IF ( prsrepl ( i) .LE. prsfloor_plus_delta) THEN
+      make_llf ( i) = 1
+      make_plain_hll ( i) = 1
+      END IF
+
+      IF ( rhorepl ( i) .LE. rhofloor_plus_delta) THEN
+      make_llf ( i) = 1
+      make_plain_hll ( i) = 1
+      END IF
+
+* If density is -ve, we definitely have to open the Riemann fan
+* in order to generate extra dissipation and we certainly
+* want to treat it with an LLF Riemann solver, not an HLLD Riemann solver!
+
+      IF ( rhobar ( i) .LE. rhofloor_plus_delta) THEN
+      make_llf ( i) = 1
+      make_plain_hll ( i) = 1
+      END IF
+
+      rhobar ( i) = AMAX1 ( rhobar ( i), rhofloor)
+
+      vlxbar ( i) = conserved_ein ( i, 2) / rhobar ( i)
+      vlybar ( i) = conserved_ein ( i, 3) / rhobar ( i)
+      vlzbar ( i) = conserved_ein ( i, 4) / rhobar ( i)
+
+      bfxbar ( i) = bfxre ( i)
+      bfybar ( i) = conserved_ein ( i, 6)
+      bfzbar ( i) = conserved_ein ( i, 7)
+
+
+      IF ( iprimitive .EQ. 0) THEN
+
+* Make "prsbar" using the second component of the momentum equation.
+
+      prsbar ( i) = prs_tot_repl ( i)
+     1            + rhorepl ( i)
+     1            * ( wavespd_ein_r ( i) - vlxrepl ( i))
+     1            * ( vlxbar ( i) - vlxrepl ( i))
+
+      prsbar ( i) = prsbar ( i)
+     1            - 0.5 * ( bfxre ( i)**2 + bfybar ( i)**2
+     1                    + bfzbar ( i)**2) * one_by_fourpi
+
+      prsbar ( i) = AMAX1 ( prsbar ( i), prsfloor)
+
+      ELSE
+
+      prsbar ( i) = conserved_re ( i, 5)
+     1          * rhobar ( i)**( gamma_soundspeed ( i) - 1.0)
+
+      END IF
+
+
+* LLF is triggered at this point. Comment out if that is not appropriate.
+* Remember that LLF may be the default, as set at the top of this subroutine.
+* For TVD schemes it helps if one does not have LLF because it produces too
+* much rarefaction.
+
+* If pressure is -ve, we definitely have to open the Riemann fan
+* in order to generate extra dissipation and we certainly
+* want to treat it with an LLF Riemann solver, not an HLLD Riemann solver!
+
+      IF ( prsbar ( i) .LE. prsfloor_plus_delta) THEN
+
+      make_llf ( i) = 1
+      make_plain_hll ( i) = 1
+
+      entropy_ein ( i) =
+      
+     1    temparr_02 ( i) * entropy_ein_r ( i)
+     1  - temparr_03 ( i) * entropy_ein_l ( i)
+
+     1  - ( entropy_flux_ein_r ( i) - entropy_flux_ein_l ( i) )
+     1  * temparr_01 ( i)
+
+      prsbar ( i) = entropy_ein ( i)
+     1          * rhobar ( i)**( gamma_soundspeed ( i) - 1.0)
+      prsbar ( i) = AMAX1 ( prsbar ( i), prsfloor)
+
+      END IF
+
+
+      eng ( i) = prsbar ( i) / ( gamma_eos ( i) - 1.0)
+*      temperature ( i) = prsbar ( i) * mean_mol_wt ( i)
+*     1                 / ( gasconst * rhobar ( i))
+
+
+#if ( NFLUID >= 1)
+        speciebar ( 1: NFLUID, i) =
+     1  conserved_ein ( i, NFIELD + 1: NFIELD + NFLUID) / rhobar ( i)
+#endif
+
+
+      END DO
+
+
+* Using exact EOS's here. If that is not needed, then "eng, temperature"
+* etc. have already been made above and the present call is not needed.
+
+
+*********************************************************************
+*********************************************************************
+
+* Make eigenvalues for the arithmetic averaged state of the riemann problem.
+
+* Make "eigenval_re":
+
+      DO i = nriembegin, nriemend
+
+*****************
+
+      one_by_4pi_rho ( i) = 1.0 / ( fourpi * rhobar ( i) )
+
+      va_x ( i) = bfxbar ( i)**2 * one_by_4pi_rho ( i)
+      va_x ( i) = SQRT ( va_x ( i) )
+
+      c_s ( i) = gamma_soundspeed ( i) * prsbar ( i) / rhobar ( i)
+      c_s ( i) = SQRT ( c_s ( i) )
+
+      v_a ( i) = ( bfxbar ( i)**2 + bfybar ( i)**2
+     1           + bfzbar ( i)**2) * one_by_4pi_rho ( i)
+      v_a ( i) = SQRT ( v_a ( i) )
+
+      temparr_01 ( i) = v_a ( i)**2 + c_s ( i)**2
+      temparr_02 ( i) = temparr_01 ( i)**2
+     1                - 4.0 * va_x ( i)**2 * c_s ( i)**2
+      temparr_02 ( i) = AMAX1 ( temparr_02 ( i), 0.0)
+      temparr_02 ( i) = SQRT ( temparr_02 ( i))
+
+      v_f ( i) = 0.5 * ( temparr_01 ( i) + temparr_02 ( i))
+      v_f ( i) = SQRT ( v_f ( i) )
+
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      v_s ( i) = 0.5 * ( temparr_01 ( i) - temparr_02 ( i))
+      v_s ( i) = AMAX1 ( v_s ( i), 0.0)
+      v_s ( i) = SQRT ( v_s ( i) )
+#endif
+
+*****************
+
+      eigenval_re ( i, 1) = vlxbar ( i) - v_f ( i)
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      eigenval_re ( i, 2) = vlxbar ( i) - va_x ( i)
+      eigenval_re ( i, 3) = vlxbar ( i) - v_s ( i)
+      eigenval_re ( i, 4) = vlxbar ( i)
+      eigenval_re ( i, 5) = vlxbar ( i) + v_s ( i)
+      eigenval_re ( i, 6) = vlxbar ( i) + va_x ( i)
+#endif
+      eigenval_re ( i, 7) = vlxbar ( i) + v_f ( i)
+
+*******************
+
+      END DO
+
+*******************
+
+#if ( NFLUID >= 1)
+*      DO i = nriembegin, nriemend
+
+*      eigenval_re ( i, NFIELD + 1: NFIELD + NFLUID) = vlxbar ( i)
+
+*      END DO
+#endif
+
+* End of making "eigenval_re"
+
+*********************************************************************
+*********************************************************************
+
+* And store the eigenvalues on either side of the zone boundary.
+* For HLL/LLF fluxes we only need the extremal wavespeeds. Thus the others
+* are commented out. This will need to be rethought if we ever go to
+* an HLLC formulation.
+
+      DO i = nriembegin, nriemend
+
+      zonebdy_eigenval ( i, 1) = eigenval_re ( i, 1)
+      eigenval_db ( i, 0, 1) =
+     1      AMIN1 ( eigenval_db ( i, 0, 1), eigenval_re ( i, 1) )
+      eigenval_db ( i, 1, 1) =
+     1      AMAX1 ( eigenval_db ( i, 1, 1), eigenval_re ( i, 1) )
+
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      zonebdy_eigenval ( i, 2) = eigenval_re ( i, 2)
+      eigenval_db ( i, 0, 2) =
+     1      AMIN1 ( eigenval_db ( i, 0, 2), eigenval_re ( i, 2) )
+      eigenval_db ( i, 1, 2) =
+     1      AMAX1 ( eigenval_db ( i, 1, 2), eigenval_re ( i, 2) )
+
+      zonebdy_eigenval ( i, 3) = eigenval_re ( i, 3)
+      eigenval_db ( i, 0, 3) =
+     1      AMIN1 ( eigenval_db ( i, 0, 3), eigenval_re ( i, 3) )
+      eigenval_db ( i, 1, 3) =
+     1      AMAX1 ( eigenval_db ( i, 1, 3), eigenval_re ( i, 3) )
+
+      zonebdy_eigenval ( i, 4) = eigenval_re ( i, 4)
+      eigenval_db ( i, 0, 4) =
+     1      AMIN1 ( eigenval_db ( i, 0, 4), eigenval_re ( i, 4) )
+      eigenval_db ( i, 1, 4) =
+     1      AMAX1 ( eigenval_db ( i, 1, 4), eigenval_re ( i, 4) )
+
+      zonebdy_eigenval ( i, 5) = eigenval_re ( i, 5)
+      eigenval_db ( i, 0, 5) =
+     1      AMIN1 ( eigenval_db ( i, 0, 5), eigenval_re ( i, 5) )
+      eigenval_db ( i, 1, 5) =
+     1      AMAX1 ( eigenval_db ( i, 1, 5), eigenval_re ( i, 5) )
+
+      zonebdy_eigenval ( i, 6) = eigenval_re ( i, 6)
+      eigenval_db ( i, 0, 6) =
+     1      AMIN1 ( eigenval_db ( i, 0, 6), eigenval_re ( i, 6) )
+      eigenval_db ( i, 1, 6) =
+     1      AMAX1 ( eigenval_db ( i, 1, 6), eigenval_re ( i, 6) )
+#endif
+
+      zonebdy_eigenval ( i, 7) = eigenval_re ( i, 7)
+      eigenval_db ( i, 0, 7) =
+     1      AMIN1 ( eigenval_db ( i, 0, 7), eigenval_re ( i, 7) )
+      eigenval_db ( i, 1, 7) =
+     1      AMAX1 ( eigenval_db ( i, 1, 7), eigenval_re ( i, 7) )
+
+      END DO
+
+
+*      DO ifluid = 1, NFLUID
+
+*      k = NFIELD + ifluid
+
+*      DO i = nriembegin, nriemend
+
+*        zonebdy_eigenval ( i, k) = eigenval_re ( i, k)
+*        eigenval_db ( i, 0, k) =
+*     1        AMIN1 ( eigenval_db ( i, 0, k), eigenval_re ( i, k) )
+*        eigenval_db ( i, 1, k) =
+*     1        AMAX1 ( eigenval_db ( i, 1, k), eigenval_re ( i, k) )
+
+*      END DO
+
+*      END DO
+
+#endif
+! End of making extra wavespeed fix, i.e. "EXTRA_WAVSPEED_FIX  == 1" part.
+
+*********************************************************************
+*********************************************************************
+*
+* The bounding eigenvalues are those produced from the
+* Roe solver ( actually an arithmetic average here).
+*
+* Here we either make the final state if the flow is supersonic to the
+* left or right. Otherwise, we make the states that abut the
+* Riemann fan. The latter states are given by eqs. (38) to (48)
+* of MK.
+
+      DO i = nriembegin, nriemend
+
+****************
+
+      wavespd_ein_l ( i) = eigenval_db ( i, 0, 1)
+
+      wavespd_ein_r ( i) = eigenval_db ( i, 1, 7)
+
+*********************************************************************
+
+* The lines below make the flux into an LLF flux which is more stabilizing.
+* "USE_LF == 1" turns them on. If "EXTRA_WAVSPEED_FIX == 1" then the
+* existence of a negative density or pressure in the resolved state will
+* turn it on too.
+
+      IF ( make_llf ( i) .EQ. 1) THEN
+
+      temparr_01 ( i) = AMAX1 ( ABS ( eigenval_db ( i, 0, 1)),
+     1                          ABS ( eigenval_db ( i, 1, 7)))
+      wavespd_ein_l ( i) = - 1.0 * temparr_01 ( i)
+      wavespd_ein_r ( i) = 1.0 * temparr_01 ( i)
+
+      END IF
+ 
+********************************
+
+      IF ( ( wavespd_ein_l ( i) .GT. 0.0) .AND.
+     1     ( wavespd_ein_r ( i) .GT. 0.0) ) THEN
+
+* Supersonic to the right.
+
+********************************
+
+      rho0 ( i) = rhoremi ( i)
+      prs0 ( i) = prsremi ( i)
+      eng0 ( i) = zonebdy_conserved ( i, 0, 5)
+
+      vlx0 ( i) = vlxremi ( i)
+      vly0 ( i) = vlyremi ( i)
+      vlz0 ( i) = vlzremi ( i)
+
+      bfy0 ( i) = bfyremi ( i)
+      bfz0 ( i) = bfzremi ( i)
+
+#if ( NFLUID >= 1)
+      specie0 ( 1: NFLUID, i) = specieremi ( 1: NFLUID, i)
+#endif
+
+
+      conserved_re ( i, 1: NFIELD + NFLUID) =
+     1             zonebdy_conserved ( i, 0, 1: NFIELD + NFLUID)
+
+
+      flux_re ( i, 1: NFIELD) = zonebdy_flux ( i, 0, 1: NFIELD)
+
+      flux_re ( i, 8) = 0.0
+
+#if ( NFLUID >= 1)
+      flux_re ( i, NFIELD + 2: NFIELD + NFLUID + 1) =
+     1        zonebdy_flux ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+#endif
+
+      im_done ( i) = 1
+      open_fan ( i) = 0
+      iwave_entropy_fix ( i) = 0
+
+********************************
+
+      ELSE IF ( ( wavespd_ein_l ( i) .LT. 0.0) .AND.
+     1          ( wavespd_ein_r ( i) .LT. 0.0) ) THEN
+
+* Supersonic to the left.
+
+********************************
+
+      rho0 ( i) = rhorepl ( i)
+      prs0 ( i) = prsrepl ( i)
+      eng0 ( i) = zonebdy_conserved ( i, 1, 5)
+
+      vlx0 ( i) = vlxrepl ( i)
+      vly0 ( i) = vlyrepl ( i)
+      vlz0 ( i) = vlzrepl ( i)
+
+      bfy0 ( i) = bfyrepl ( i)
+      bfz0 ( i) = bfzrepl ( i)
+
+#if ( NFLUID >= 1)
+      specie0 ( 1: NFLUID, i) = specierepl ( 1: NFLUID, i)
+#endif
+
+
+      conserved_re ( i, 1: NFIELD + NFLUID) =
+     1             zonebdy_conserved ( i, 1, 1: NFIELD + NFLUID)
+
+
+      flux_re ( i, 1: NFIELD) = zonebdy_flux ( i, 1, 1: NFIELD)
+
+      flux_re ( i, 8) = 0.0
+
+#if ( NFLUID >= 1)
+      flux_re ( i, NFIELD + 2: NFIELD + NFLUID + 1) =
+     1        zonebdy_flux ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+#endif
+
+      im_done ( i) = 1
+      open_fan ( i) = 0
+      iwave_entropy_fix ( i) = 0
+
+********************************
+
+      ELSE
+
+* Getting here means that the Riemann fan is open. Down the road
+* we will need to make a consistency check to make sure that the
+* HLLD waves can be used to represent such a fan.
+
+********************************
+
+      open_fan ( i) = 1
+
+****************
+
+* Make the "star" states that abut the right and left states using
+* eqns. (38) to (51) of MK.
+* "temparr_01,3,5,7" pertain to the right state;
+* "temparr_02,4,6,8" to the left.
+
+* Eq. (38), make normal velocity that holds across the Riemann fan.
+
+      temparr_01 ( i) = wavespd_ein_r ( i) - vlxrepl ( i)
+      temparr_02 ( i) = wavespd_ein_l ( i) - vlxremi ( i)
+      temparr_03 ( i) = 1.0 / ( temparr_01 ( i) * rhorepl ( i)
+     1                        - temparr_02 ( i) * rhoremi ( i) )
+
+      vlx0 ( i) = ( temparr_01 ( i) * zonebdy_conserved ( i, 1, 2)
+     1            - temparr_02 ( i) * zonebdy_conserved ( i, 0, 2)
+     1            - prs_tot_repl ( i) + prs_tot_remi ( i) )
+     1          * temparr_03 ( i)
+
+* Eq. (41) (or equivalently eq. (23) which is simpler),
+* make total (gas+magnetic) pressure across the Riemann fan.
+
+*      prs_tot_0 ( i) =
+*     1        ( temparr_01 ( i) * rhorepl ( i) * prs_tot_remi ( i)
+*     1        - temparr_02 ( i) * rhoremi ( i) * prs_tot_repl ( i)
+*     1        + rhoremi ( i) * rhorepl ( i) * temparr_01 ( i)
+*     1        * temparr_02 ( i) * ( vlxrepl ( i) - vlxremi ( i)) )
+*     1      * temparr_03 ( i)
+
+      prs_tot_0 ( i) = prs_tot_repl ( i)
+     1               + rhorepl ( i) * temparr_01 ( i)
+     1               * ( vlx0 ( i) - vlxrepl ( i))
+      prs_tot_0 ( i) = AMAX1 ( prs_tot_0 ( i), prsfloor)
+
+      prs_tot_min ( i) = AMIN1 ( ABS ( prs_tot_0 ( i)), 
+     1                   prs_tot_remi ( i), prs_tot_repl ( i) )
+
+* Eq. (43) for the densities.
+
+      temparr_03 ( i) = 1.0 / ( wavespd_ein_r ( i) - vlx0 ( i))
+      temparr_04 ( i) = 1.0 / ( wavespd_ein_l ( i) - vlx0 ( i))
+
+      rho_r_star ( i) = rhorepl ( i)
+     1                * temparr_01 ( i) * temparr_03 ( i)
+      rho_r_star ( i) = AMAX1 ( rho_r_star ( i), rhofloor)
+
+      rho_l_star ( i) = rhoremi ( i)
+     1                * temparr_02 ( i) * temparr_04 ( i)
+      rho_l_star ( i) = AMAX1 ( rho_l_star ( i), rhofloor)
+
+* Eq. (44) for the y-velocities.
+* Take care to shift away from divide by zero situations and use HLL instead.
+
+      temparr_05 ( i) = rhorepl ( i) * temparr_01 ( i)
+     1                * ( wavespd_ein_r ( i) - vlx0 ( i))
+     1                - one_by_fourpi * bfxre ( i)**2
+
+      temparr_06 ( i) = rhoremi ( i) * temparr_02 ( i)
+     1                * ( wavespd_ein_l ( i) - vlx0 ( i))
+     1                - one_by_fourpi * bfxre ( i)**2
+
+      IF ( ABS ( temparr_05 ( i)) .LT.
+     1     denominator_too_small_fac * prs_tot_min ( i) ) THEN
+      temparr_05 ( i) = smallnum
+      make_plain_hll ( i) = 1
+      END IF
+
+      IF ( ABS ( temparr_06 ( i)) .LT.
+     1     denominator_too_small_fac * prs_tot_min ( i) ) THEN
+      temparr_06 ( i) = smallnum
+      make_plain_hll ( i) = 1
+      END IF
+
+      temparr_05 ( i) = 1.0 / temparr_05 ( i)
+      temparr_06 ( i) = 1.0 / temparr_06 ( i)
+
+      temparr_07 ( i) = bfxre ( i) * one_by_fourpi
+     1                * ( vlx0 ( i) - vlxrepl ( i)) * temparr_05 ( i)
+
+      temparr_08 ( i) = bfxre ( i) * one_by_fourpi
+     1                * ( vlx0 ( i) - vlxremi ( i)) * temparr_06 ( i)
+
+      vly_r_star ( i) = vlyrepl ( i)
+     1                - bfyrepl ( i) * temparr_07 ( i)
+
+      vly_l_star ( i) = vlyremi ( i)
+     1                - bfyremi ( i) * temparr_08 ( i)
+
+* Eq. (46) for the z-velocities.
+
+      vlz_r_star ( i) = vlzrepl ( i)
+     1                - bfzrepl ( i) * temparr_07 ( i)
+
+      vlz_l_star ( i) = vlzremi ( i)
+     1                - bfzremi ( i) * temparr_08 ( i)
+
+* Eq. (45) for the y-fields.
+
+      temparr_07 ( i) = ( rhorepl ( i) * temparr_01 ( i)**2
+     1                  - one_by_fourpi * bfxre ( i)**2)
+     1                * temparr_05 ( i)
+
+      temparr_08 ( i) = ( rhoremi ( i) * temparr_02 ( i)**2
+     1                  - one_by_fourpi * bfxre ( i)**2)
+     1                * temparr_06 ( i)
+
+      bfy_r_star ( i) = bfyrepl ( i) * temparr_07 ( i)
+
+      bfy_l_star ( i) = bfyremi ( i) * temparr_08 ( i)
+
+* Eq. (47) for the z-fields.
+
+      bfz_r_star ( i) = bfzrepl ( i) * temparr_07 ( i)
+
+      bfz_l_star ( i) = bfzremi ( i) * temparr_08 ( i)
+
+* Eq. (48) for the total energy densities.
+
+      eng_r_star ( i) =
+     1      ( temparr_01 ( i) * zonebdy_conserved ( i, 1, 5)
+     1      - prs_tot_repl ( i) * vlxrepl ( i)
+     1      + prs_tot_0 ( i) * vlx0 ( i)
+     1      + bfxre ( i) * one_by_fourpi
+     1      * ( bfxre ( i) * vlxrepl ( i)
+     1        + bfyrepl ( i) * vlyrepl ( i)
+     1        + bfzrepl ( i) * vlzrepl ( i)
+     1        - bfxre ( i) * vlx0 ( i)
+     1        - bfy_r_star ( i) * vly_r_star ( i)
+     1        - bfz_r_star ( i) * vlz_r_star ( i)) )
+     1      * temparr_03 ( i)
+
+      eng_l_star ( i) =
+     1      ( temparr_02 ( i) * zonebdy_conserved ( i, 0, 5)
+     1      - prs_tot_remi ( i) * vlxremi ( i)
+     1      + prs_tot_0 ( i) * vlx0 ( i)
+     1      + bfxre ( i) * one_by_fourpi
+     1      * ( bfxre ( i) * vlxremi ( i)
+     1        + bfyremi ( i) * vlyremi ( i)
+     1        + bfzremi ( i) * vlzremi ( i)
+     1        - bfxre ( i) * vlx0 ( i)
+     1        - bfy_l_star ( i) * vly_l_star ( i)
+     1        - bfz_l_star ( i) * vlz_l_star ( i)) ) 
+     1      * temparr_04 ( i)
+
+* Eq. (51) for the left and right-going Alfven waves in the "star" states.
+
+      alfven_r_star ( i) = vlx0 ( i)
+     1 + ABS ( bfxre ( i)) / SQRT ( fourpi * rho_r_star ( i))
+
+      alfven_l_star ( i) = vlx0 ( i)
+     1 - ABS ( bfxre ( i)) / SQRT ( fourpi * rho_l_star ( i))
+
+* Make a small fraction of the signal speed in the resolved state.
+* This is useful for gauging whether linearly degenerate waves get an
+* entropy fix or not.
+
+      small_signal_speed ( i) = AMAX1 ( prs_tot_0 ( i), prsfloor)
+     1      / AMAX1 ( rho_l_star ( i), rho_r_star ( i), rhofloor)
+      small_signal_speed ( i) = 1.0e-6 * SQRT ( small_signal_speed ( i))
+
+* Find the actual difference in the pressure, calculated from the
+* total energy density and the velocities. If the putative contact
+* discontinuity is indeed a true contact discontinuity then the
+* jump in the thermal pressure across it should be small compared
+* to "prs_tot_0 ( i)".
+
+* Comment out the following two lines if one wants pure HLLD Riemann solver
+* (2 places, here and below).
+
+*      del_prs_thermal ( i) =
+
+*     1   ( eng_r_star ( i)
+*     1   - 0.5 * rho_r_star ( i) * ( vlx0 ( i)**2
+*     1         + vly_r_star ( i)**2 + vlz_r_star ( i)**2)
+*     1   - 0.5 * ( bfxre ( i)**2 + bfy_r_star ( i)**2
+*     1           + bfz_r_star ( i)**2) * one_by_fourpi )
+*     1 * ( gamma_eos_repl ( i) - 1.0)
+
+*     1 - ( eng_l_star ( i)
+*     1   - 0.5 * rho_l_star ( i) * ( vlx0 ( i)**2
+*     1         + vly_l_star ( i)**2 + vlz_l_star ( i)**2)
+*     1   - 0.5 * ( bfxre ( i)**2 + bfy_l_star ( i)**2
+*     1           + bfz_l_star ( i)**2) * one_by_fourpi )
+*     1 * ( gamma_eos_remi ( i) - 1.0)
+
+*      IF ( ABS ( del_prs_thermal ( i)) .GT.
+*     1             prs_jump_too_large_fac * prs_tot_0 ( i) )
+*     1   make_plain_hll ( i) = 1
+
+****************
+
+* Add in contributions to "eigenval_db ( i, 0/1, 2/4/6)" and tag the
+* wave family that needs to be opened up in "iwave_entropy_fix".
+
+      iwave_entropy_fix ( i) = 0
+
+#if ( ENTROPY_FIX_LIN_DEG >= 1)
+      eigenval_db ( i, 0, 2) =
+     1      AMIN1 ( eigenval_db ( i, 0, 2), alfven_l_star ( i) )
+      eigenval_db ( i, 1, 2) =
+     1      AMAX1 ( eigenval_db ( i, 1, 2), alfven_l_star ( i) )
+
+      eigenval_db ( i, 0, 4) =
+     1      AMIN1 ( eigenval_db ( i, 0, 4), vlx0 ( i) )
+      eigenval_db ( i, 1, 4) =
+     1      AMAX1 ( eigenval_db ( i, 1, 4), vlx0 ( i) )
+
+      eigenval_db ( i, 0, 6) =
+     1      AMIN1 ( eigenval_db ( i, 0, 6), alfven_r_star ( i) )
+      eigenval_db ( i, 1, 6) =
+     1      AMAX1 ( eigenval_db ( i, 1, 6), alfven_r_star ( i) )
+
+
+      IF ( ( eigenval_db ( i, 0, 2) .LT.
+     1                                 - small_signal_speed ( i)) .AND.
+     1     ( eigenval_db ( i, 1, 2) .GT. small_signal_speed ( i)) )
+     1                       iwave_entropy_fix ( i) = 2
+
+      IF ( ( eigenval_db ( i, 0, 6) .LT.
+     1                                 - small_signal_speed ( i)) .AND.
+     1     ( eigenval_db ( i, 1, 6) .GT. small_signal_speed ( i)) )
+     1                       iwave_entropy_fix ( i) = 6
+
+      IF ( ( eigenval_db ( i, 0, 4) .LT.
+     1                                 - small_signal_speed ( i)) .AND.
+     1     ( eigenval_db ( i, 1, 4) .GT. small_signal_speed ( i)) )
+     1                       iwave_entropy_fix ( i) = 4
+#endif
+
+****************
+
+      END IF
+* End of either picking supersonic states as the resolved states or of
+* constructing the "star" states that abut them.
+
+*********************************************************************
+
+* While we're at it, let us also obtain the entropy flux using an
+* HLL construction. Also hand back best possible values for
+* molecular weight and gas "gamma" at the resolved state.
+
+* This way of obtaining the entropy flux ensures that even during a
+* normal call to the Riemann solver we get an HLL-based entropy
+* flux with which to enforce pressure positivity.
+
+      temparr_01 ( i) = 1.0 / ( wavespd_ein_r ( i)
+     1                        - wavespd_ein_l ( i))
+
+      temparr_02 ( i) = wavespd_ein_r ( i) * temparr_01 ( i)
+
+      temparr_03 ( i) = wavespd_ein_l ( i) * temparr_01 ( i)
+
+      temparr_04 ( i) = wavespd_ein_r ( i) * wavespd_ein_l ( i)
+     1                * temparr_01 ( i)
+
+      entropy_ein ( i) = 
+
+     1    temparr_02 ( i) * entropy_ein_r ( i)
+     1  - temparr_03 ( i) * entropy_ein_l ( i)
+
+     1  - ( entropy_flux_ein_r ( i) - entropy_flux_ein_l ( i) )
+     1  * temparr_01 ( i)
+
+      entropy_flux_ein ( i) = 
+
+     1       temparr_02 ( i) * entropy_flux_ein_l ( i)
+     1     - temparr_03 ( i) * entropy_flux_ein_r ( i)
+
+     1     + ( entropy_ein_r ( i) - entropy_ein_l ( i) )
+     1     * temparr_04 ( i)
+
+        IF ( wavespd_ein_l ( i) .GT. 0.0) THEN
+
+          entropy_flux_re ( i) = entropy_flux_ein_l ( i)
+
+          mean_mol_wt_re ( i) = mean_mol_wt_remi ( i)
+          gamma_eos_re ( i) = gamma_eos_remi ( i)
+          gamma_soundspeed_re ( i) = gamma_soundspeed_remi ( i)
+
+        ELSE IF ( wavespd_ein_r ( i) .LT. 0.0) THEN
+
+          entropy_flux_re ( i) = entropy_flux_ein_r ( i)
+
+          mean_mol_wt_re ( i) = mean_mol_wt_repl ( i)
+          gamma_eos_re ( i) = gamma_eos_repl ( i)
+          gamma_soundspeed_re ( i) = gamma_soundspeed_repl ( i)
+
+        ELSE
+
+          entropy_flux_re ( i) = entropy_flux_ein ( i)
+
+          mean_mol_wt_re ( i) = mean_mol_wt ( i)
+          gamma_eos_re ( i) = gamma_eos ( i)
+          gamma_soundspeed_re ( i) = gamma_soundspeed ( i)
+
+        END IF
+
+* End of entropy flux and gas "gamma" evaluation at the resolved state.
+
+*********************************************************************
+
+      END DO
+* End of either accepting supersonic states as the resolved states
+* or of evaluating the primitive variables in the "star" states
+* that abut the right and left states.
+
+*********************************************************************
+*********************************************************************
+
+* When we have an open Riemann fan, we do some more work on the states.
+
+* Now we go after the Double star states, "l/r_dblstar", using eqns.
+* (49) and (59) to (63) of MK. Because our choice of resolved state is
+* down to either the state to the left or right of the contact
+* discontinuity, we directly assign the values to the
+* "rho0, vly0, vlz0, bfy0, bfz0, eng0, specie0" variables.
+* We only do this part if we haven't already picked out a resolved state.
+
+* If the resolved state is the "l_star" or "r_star" state then we can
+* directly build the flux from those primitive variables because those
+* states are consistent with a shock jump condition.
+
+* If the resolved state is the "l_dblstar" or "r_dblstar" state then
+* we use eq. (65) of MK to build the flux.
+
+      DO i = nriembegin, nriemend
+
+*********************************************************************
+
+* Beginning of building the "dblstar" state for an open Riemann fan.
+      IF ( open_fan ( i) .EQ. 1) THEN
+
+****************
+
+* Eq. (49) for the densities.
+
+      rho_r_dblstar ( i) = rho_r_star ( i)
+      rho_l_dblstar ( i) = rho_l_star ( i)
+
+* Eqns. (59) to (62) for variables that do not change across the
+* contact discontinuity.
+
+      temparr_01 ( i) = SQRT ( rho_r_dblstar ( i))
+      temparr_02 ( i) = SQRT ( rho_l_dblstar ( i))
+      temparr_03 ( i) = SIGN ( 1.0, bfxre ( i))
+      temparr_04 ( i) = 1.0 / ( temparr_01 ( i) + temparr_02 ( i))
+
+* Eq. (59) for the y-velocity.
+
+      vly_r_dblstar ( i) = ( temparr_02 ( i) * vly_l_star ( i)
+     1            + temparr_01 ( i) * vly_r_star ( i)
+     1            + ( bfy_r_star ( i) - bfy_l_star ( i))
+     1            * one_by_sqrt_fourpi
+     1            * temparr_03 ( i) ) * temparr_04 ( i)
+      vly_l_dblstar ( i) = vly_r_dblstar ( i)
+
+* Eq. (60) for the z-velocity.
+
+      vlz_r_dblstar ( i) = ( temparr_02 ( i) * vlz_l_star ( i)
+     1            + temparr_01 ( i) * vlz_r_star ( i)
+     1            + ( bfz_r_star ( i) - bfz_l_star ( i))
+     1            * one_by_sqrt_fourpi
+     1            * temparr_03 ( i) ) * temparr_04 ( i)
+      vlz_l_dblstar ( i) = vlz_r_dblstar ( i)
+
+* Eq. (61) for the y-field.
+
+      bfy_r_dblstar ( i) = ( temparr_02 ( i) * bfy_r_star ( i)
+     1            + temparr_01 ( i) * bfy_l_star ( i)
+     1            + temparr_01 ( i) * temparr_02 ( i)
+     1            * ( vly_r_star ( i) - vly_l_star ( i))
+     1            * sqrt_fourpi
+     1            * temparr_03 ( i) ) * temparr_04 ( i)
+      bfy_l_dblstar ( i) = bfy_r_dblstar ( i)
+
+* Eq. (62) for the z-field.
+
+      bfz_r_dblstar ( i) = ( temparr_02 ( i) * bfz_r_star ( i)
+     1            + temparr_01 ( i) * bfz_l_star ( i)
+     1            + temparr_01 ( i) * temparr_02 ( i)
+     1            * ( vlz_r_star ( i) - vlz_l_star ( i))
+     1            * sqrt_fourpi
+     1            * temparr_03 ( i) ) * temparr_04 ( i)
+      bfz_l_dblstar ( i) = bfz_r_dblstar ( i)
+
+* Eq. (63) for the total energy density.
+
+      eng_r_dblstar ( i) = eng_r_star ( i)
+     1          + temparr_01 ( i) * temparr_03 ( i)
+     1          * ( vly_r_star ( i) * bfy_r_star ( i)
+     1            + vlz_r_star ( i) * bfz_r_star ( i)
+     1            - vly_r_dblstar ( i) * bfy_r_dblstar ( i)
+     1            - vlz_r_dblstar ( i) * bfz_r_dblstar ( i) )
+     1          * one_by_sqrt_fourpi
+
+      eng_l_dblstar ( i) = eng_l_star ( i)
+     1          - temparr_02 ( i) * temparr_03 ( i)
+     1          * ( vly_l_star ( i) * bfy_l_star ( i)
+     1            + vlz_l_star ( i) * bfz_l_star ( i)
+     1            - vly_l_dblstar ( i) * bfy_l_dblstar ( i)
+     1            - vlz_l_dblstar ( i) * bfz_l_dblstar ( i) )
+     1          * one_by_sqrt_fourpi
+
+* Find the actual difference in the pressure, calculated from the
+* total energy density and the velocities. If the putative contact
+* discontinuity is indeed a true contact discontinuity then the
+* jump in the thermal pressure across it should be small compared
+* to "prs_tot_0 ( i)".
+
+* Comment out the following two lines if one wants pure HLLD Riemann solver
+* (2 places, here and above).
+
+*      del_prs_thermal ( i) =
+
+*     1   ( eng_r_dblstar ( i)
+*     1   - 0.5 * rho_r_dblstar ( i) * ( vlx0 ( i)**2
+*     1         + vly_r_dblstar ( i)**2 + vlz_r_dblstar ( i)**2)
+*     1   - 0.5 * ( bfxre ( i)**2 + bfy_r_dblstar ( i)**2
+*     1           + bfz_r_dblstar ( i)**2) * one_by_fourpi )
+*     1 * ( gamma_eos_repl ( i) - 1.0)
+
+*     1 - ( eng_l_dblstar ( i)
+*     1   - 0.5 * rho_l_dblstar ( i) * ( vlx0 ( i)**2 
+*     1         + vly_l_dblstar ( i)**2 + vlz_l_dblstar ( i)**2)
+*     1   - 0.5 * ( bfxre ( i)**2 + bfy_l_dblstar ( i)**2
+*     1           + bfz_l_dblstar ( i)**2) * one_by_fourpi )
+*     1 * ( gamma_eos_remi ( i) - 1.0)
+
+*      IF ( ABS ( del_prs_thermal ( i)) .GT.
+*     1             prs_jump_too_large_fac * prs_tot_0 ( i) )
+*     1   make_plain_hll ( i) = 1
+
+****************
+
+      END IF
+* End of building the "dblstar" state for an open Riemann fan.
+
+*********************************************************************
+
+* Picking HLLD type states as the resolved state of the Riemann problem
+* when the Riemann problem has an open fan. Thus if the Riemann problem
+* has a supersonic solution or if the pressure jump across the contact is
+* too large then we don't go through the next IF condition.
+
+* If we are going to do an entropy fix for a linearly degenerate wave
+* (as shown by a non-zero value for "iwave_entropy_fix") then too
+* we refrain from doing this part.
+
+      IF ( ( open_fan ( i) .EQ. 1) .AND.
+     1     ( make_plain_hll ( i) .EQ. 0) .AND.
+     1     ( iwave_entropy_fix ( i) .EQ. 0) ) THEN
+
+* If we are to proceed with using the HLLD formulation then we get here.
+
+********************************
+
+* Examine whether the "star" states can be taken as the resolved states.
+* The logic below automatically picks up cases where "bfxre" is zero
+* because in that case "alfven_l_star ( i) = alfven_r_star ( i) = vlx0 ( i)".
+* Since we only get here if there are open Riemann fans, the next two
+* IF conditions degenerate to whether "vlx0 ( i) .GE. 0.0"
+* or "vlx0 ( i) .LE. 0.0".
+
+      IF ( ( wavespd_ein_l ( i) .LE. 0.0) .AND.
+     1     ( alfven_l_star ( i) .GE. 0.0) ) THEN
+
+********************************
+
+* "star" state to the left is a resolved state of the Riemann problem.
+* "prs0" is the thermal pressure of the gas;
+* "eng0" is the gas+kinetic+magnetic energy density.
+
+      bfy0 ( i) = bfy_l_star ( i)
+      bfz0 ( i) = bfz_l_star ( i)
+
+      rho0 ( i) = rho_l_star ( i)
+      prs0 ( i) = prs_tot_0 ( i)
+     1          - 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2
+     1                  + bfz0 ( i)**2) * one_by_fourpi
+      prs0 ( i) = AMAX1 ( prs0 ( i), prsfloor)
+      eng0 ( i) = eng_l_star ( i)
+
+      vly0 ( i) = vly_l_star ( i)
+      vlz0 ( i) = vlz_l_star ( i)
+
+#if ( NFLUID >= 1)
+      specie0 ( 1: NFLUID, i) = specieremi ( 1: NFLUID, i)
+#endif
+
+**********
+
+* Use the "l_star" variables to construct conserved variables.
+
+      zone_star_conserved ( i, 0, 1) = rho_l_star ( i)
+
+      zone_star_conserved ( i, 0, 2) = rho_l_star ( i) * vlx0 ( i)
+      zone_star_conserved ( i, 0, 3) = rho_l_star ( i) * vly_l_star ( i)
+      zone_star_conserved ( i, 0, 4) = rho_l_star ( i) * vlz_l_star ( i)
+
+      zone_star_conserved ( i, 0, 5) = eng_l_star ( i)
+
+      zone_star_conserved ( i, 0, 6) = bfy_l_star ( i)
+      zone_star_conserved ( i, 0, 7) = bfz_l_star ( i)
+
+#if ( NFLUID >= 1)
+      zone_star_conserved ( i, 0, NFIELD + 1: NFIELD + NFLUID) =
+     1     rho_l_star ( i) * specieremi ( 1: NFLUID, i)
+#endif
+
+**********
+
+* Now make conserved variables from the resolved state.
+
+      conserved_re ( i, 1: NFIELD + NFLUID) =
+     1             zone_star_conserved ( i, 0, 1: NFIELD + NFLUID)
+
+**********
+
+* Now make flux variables from the resolved state.
+
+      flux_re ( i, 1) = rho_l_star ( i) * vlx0 ( i)
+
+      flux_re ( i, 2) = rho_l_star ( i) * vlx0 ( i)**2
+     1                + prs_tot_0 ( i)
+     1                - one_by_fourpi * bfxre ( i)**2
+      flux_re ( i, 3) = rho_l_star ( i) * vlx0 ( i)
+     1                                  * vly_l_star ( i)
+     1                - bfxre ( i) * bfy_l_star ( i)
+     1                * one_by_fourpi
+      flux_re ( i, 4) = rho_l_star ( i) * vlx0 ( i)
+     1                                  * vlz_l_star ( i)
+     1                - bfxre ( i) * bfz_l_star ( i)
+     1                * one_by_fourpi
+
+      flux_re ( i, 5) = ( eng_l_star ( i) + prs_tot_0 ( i)) * vlx0 ( i)
+     1                - bfxre ( i) * one_by_fourpi
+     1                * ( vlx0 ( i) * bfxre ( i)
+     1                  + vly_l_star ( i) * bfy_l_star ( i)
+     1                  + vlz_l_star ( i) * bfz_l_star ( i))
+
+      flux_re ( i, 6) = bfy_l_star ( i) * vlx0 ( i)
+     1                - bfxre ( i) * vly_l_star ( i)
+      flux_re ( i, 7) = bfz_l_star ( i) * vlx0 ( i)            
+     1                - bfxre ( i) * vlz_l_star ( i)
+
+      flux_re ( i, 8) = 0.0
+
+#if ( NFLUID >= 1)
+      flux_re ( i, NFIELD + 2: NFIELD + NFLUID + 1) = 
+     1        rho_l_star ( i) * vlx0 ( i) * specieremi ( 1: NFLUID, i)
+#endif
+
+
+      im_done ( i) = 1
+
+********************************
+
+      ELSE IF ( ( alfven_r_star ( i) .LE. 0.0) .AND.
+     1          ( wavespd_ein_r ( i) .GE. 0.0) ) THEN
+
+********************************
+
+* "star" state to the right is a resolved state of the Riemann problem.
+* "prs0" is the thermal pressure of the gas;
+* "eng0" is the gas+kinetic+magnetic energy density.
+
+      bfy0 ( i) = bfy_r_star ( i)
+      bfz0 ( i) = bfz_r_star ( i)
+
+      rho0 ( i) = rho_r_star ( i)
+      prs0 ( i) = prs_tot_0 ( i)
+     1          - 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2
+     1                  + bfz0 ( i)**2) * one_by_fourpi
+      prs0 ( i) = AMAX1 ( prs0 ( i), prsfloor)
+      eng0 ( i) = eng_r_star ( i)
+
+      vly0 ( i) = vly_r_star ( i)
+      vlz0 ( i) = vlz_r_star ( i)
+
+#if ( NFLUID >= 1)
+      specie0 ( 1: NFLUID, i) = specierepl ( 1: NFLUID, i)
+#endif
+
+**********
+
+* Use the "r_star" variables to construct conserved variables.
+
+      zone_star_conserved ( i, 1, 1) = rho_r_star ( i)
+
+      zone_star_conserved ( i, 1, 2) = rho_r_star ( i) * vlx0 ( i)
+      zone_star_conserved ( i, 1, 3) = rho_r_star ( i) * vly_r_star ( i)
+      zone_star_conserved ( i, 1, 4) = rho_r_star ( i) * vlz_r_star ( i)
+
+      zone_star_conserved ( i, 1, 5) = eng_r_star ( i)
+
+      zone_star_conserved ( i, 1, 6) = bfy_r_star ( i)
+      zone_star_conserved ( i, 1, 7) = bfz_r_star ( i)
+
+#if ( NFLUID >= 1)
+      zone_star_conserved ( i, 1, NFIELD + 1: NFIELD + NFLUID) =
+     1     rho_r_star ( i) * specierepl ( 1: NFLUID, i)
+#endif
+
+**********
+
+* Now make conserved variables from the resolved state.
+
+      conserved_re ( i, 1: NFIELD + NFLUID) =
+     1             zone_star_conserved ( i, 1, 1: NFIELD + NFLUID)
+
+**********
+
+* Now make flux variables from the resolved state.
+
+      flux_re ( i, 1) = rho_r_star ( i) * vlx0 ( i)
+
+      flux_re ( i, 2) = rho_r_star ( i) * vlx0 ( i)**2
+     1                + prs_tot_0 ( i)
+     1                - one_by_fourpi * bfxre ( i)**2
+      flux_re ( i, 3) = rho_r_star ( i) * vlx0 ( i)
+     1                                  * vly_r_star ( i)
+     1                - bfxre ( i) * bfy_r_star ( i)
+     1                * one_by_fourpi
+      flux_re ( i, 4) = rho_r_star ( i) * vlx0 ( i)
+     1                                  * vlz_r_star ( i)
+     1                - bfxre ( i) * bfz_r_star ( i)
+     1                * one_by_fourpi
+
+      flux_re ( i, 5) = ( eng_r_star ( i) + prs_tot_0 ( i)) * vlx0 ( i)
+     1                - bfxre ( i) * one_by_fourpi
+     1                * ( vlx0 ( i) * bfxre ( i)
+     1                  + vly_r_star ( i) * bfy_r_star ( i)
+     1                  + vlz_r_star ( i) * bfz_r_star ( i))
+
+      flux_re ( i, 6) = bfy_r_star ( i) * vlx0 ( i)
+     1                - bfxre ( i) * vly_r_star ( i)
+      flux_re ( i, 7) = bfz_r_star ( i) * vlx0 ( i)            
+     1                - bfxre ( i) * vlz_r_star ( i)
+
+      flux_re ( i, 8) = 0.0
+
+#if ( NFLUID >= 1)
+      flux_re ( i, NFIELD + 2: NFIELD + NFLUID + 1) = 
+     1        rho_r_star ( i) * vlx0 ( i) * specierepl ( 1: NFLUID, i)
+#endif
+
+
+      im_done ( i) = 1
+
+********************************
+
+* End of taking one of the "star" states as the resolved state.
+
+      ELSE IF ( vlx0 ( i) .GE. 0.0) THEN
+
+* We now consider the state that is left of the contact discontinuity.
+
+********************************
+
+      bfy0 ( i) = bfy_l_dblstar ( i)
+      bfz0 ( i) = bfz_l_dblstar ( i)
+
+      rho0 ( i) = rho_l_dblstar ( i)
+      eng0 ( i) = eng_l_dblstar ( i)
+      prs0 ( i) = prs_tot_0 ( i)
+     1          - 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2
+     1                  + bfz0 ( i)**2) * one_by_fourpi
+      prs0 ( i) = AMAX1 ( prs0 ( i), prsfloor)
+
+      vly0 ( i) = vly_l_dblstar ( i)
+      vlz0 ( i) = vlz_l_dblstar ( i)
+
+#if ( NFLUID >= 1)
+      specie0 ( 1: NFLUID, i) = specieremi ( 1: NFLUID, i)
+#endif
+
+**********
+
+* Use the "l_star" variables to construct conserved variables.
+
+      zone_star_conserved ( i, 0, 1) = rho_l_star ( i)
+
+      zone_star_conserved ( i, 0, 2) = rho_l_star ( i) * vlx0 ( i)
+      zone_star_conserved ( i, 0, 3) = rho_l_star ( i) * vly_l_star ( i)
+      zone_star_conserved ( i, 0, 4) = rho_l_star ( i) * vlz_l_star ( i)
+
+      zone_star_conserved ( i, 0, 5) = eng_l_star ( i)
+
+      zone_star_conserved ( i, 0, 6) = bfy_l_star ( i)
+      zone_star_conserved ( i, 0, 7) = bfz_l_star ( i)
+
+#if ( NFLUID >= 1)
+      zone_star_conserved ( i, 0, NFIELD + 1: NFIELD + NFLUID) =
+     1     rho_l_star ( i) * specieremi ( 1: NFLUID, i)
+#endif
+
+**********
+
+* Now make conserved variables from the resolved state.
+
+      conserved_re ( i, 1) = rho0 ( i)
+
+      conserved_re ( i, 2) = rho0 ( i) * vlx0 ( i)
+      conserved_re ( i, 3) = rho0 ( i) * vly0 ( i)
+      conserved_re ( i, 4) = rho0 ( i) * vlz0 ( i)
+
+      conserved_re ( i, 5) = eng0 ( i)
+
+      conserved_re ( i, 6) = bfy0 ( i)
+      conserved_re ( i, 7) = bfz0 ( i)
+
+#if ( NFLUID >= 1)
+      conserved_re ( i, NFIELD + 1: NFIELD + NFLUID) =
+     1     rho0 ( i) * specie0 ( 1: NFLUID, i)
+#endif
+
+**********
+
+* Now make fluxes from the resolved state.
+* Eq. (65) and its analogue are needed to ensure that the flux is conservative.
+
+      temparr_06 ( i) = alfven_l_star ( i) - wavespd_ein_l ( i)
+
+      flux_re ( i, 1) = zonebdy_flux ( i, 0, 1)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 1)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 1)
+     1               + alfven_l_star ( i)
+     1                * conserved_re ( i, 1) 
+
+      flux_re ( i, 2) = zonebdy_flux ( i, 0, 2)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 2)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 2)
+     1               + alfven_l_star ( i)
+     1                * conserved_re ( i, 2)
+
+      flux_re ( i, 3) = zonebdy_flux ( i, 0, 3)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 3)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 3)
+     1               + alfven_l_star ( i)
+     1                * conserved_re ( i, 3)
+
+      flux_re ( i, 4) = zonebdy_flux ( i, 0, 4)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 4)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 4)
+     1               + alfven_l_star ( i)
+     1                * conserved_re ( i, 4)
+
+      flux_re ( i, 5) = zonebdy_flux ( i, 0, 5)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 5)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 5)
+     1               + alfven_l_star ( i)
+     1                * conserved_re ( i, 5)
+
+      flux_re ( i, 6) = zonebdy_flux ( i, 0, 6)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 6)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 6)
+     1               + alfven_l_star ( i)
+     1                * conserved_re ( i, 6)
+
+      flux_re ( i, 7) = zonebdy_flux ( i, 0, 7)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 7)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 7)
+     1               + alfven_l_star ( i)
+     1                * conserved_re ( i, 7)
+
+      flux_re ( i, 8) = 0.0
+
+#if ( NFLUID >= 1)
+      flux_re ( i, NFIELD + 2: NFIELD + NFLUID + 1) =
+     1                zonebdy_flux ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1             - wavespd_ein_l ( i)
+     1         * zonebdy_conserved ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1                - temparr_06 ( i)
+     1        * zone_star_conserved ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1             + alfven_l_star ( i)
+     1              * conserved_re ( i, NFIELD + 1: NFIELD + NFLUID)
+#endif
+
+
+      im_done ( i) = 1
+
+********************************
+
+* End of considering the state that is left of the contact discontinuity.
+
+      ELSE
+
+* We now consider the state that is right of the contact discontinuity.
+
+********************************
+
+      bfy0 ( i) = bfy_r_dblstar ( i)
+      bfz0 ( i) = bfz_r_dblstar ( i)
+
+      rho0 ( i) = rho_r_dblstar ( i)
+      eng0 ( i) = eng_r_dblstar ( i)
+      prs0 ( i) = prs_tot_0 ( i)
+     1          - 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2
+     1                  + bfz0 ( i)**2) * one_by_fourpi
+      prs0 ( i) = AMAX1 ( prs0 ( i), prsfloor)
+
+      vly0 ( i) = vly_r_dblstar ( i)
+      vlz0 ( i) = vlz_r_dblstar ( i)
+
+#if ( NFLUID >= 1)
+      specie0 ( 1: NFLUID, i) = specierepl ( 1: NFLUID, i)
+#endif
+
+**********
+
+* Use the "r_star" variables to construct conserved variables.
+
+      zone_star_conserved ( i, 1, 1) = rho_r_star ( i)
+
+      zone_star_conserved ( i, 1, 2) = rho_r_star ( i) * vlx0 ( i)
+      zone_star_conserved ( i, 1, 3) = rho_r_star ( i) * vly_r_star ( i)
+      zone_star_conserved ( i, 1, 4) = rho_r_star ( i) * vlz_r_star ( i)
+
+      zone_star_conserved ( i, 1, 5) = eng_r_star ( i)
+
+      zone_star_conserved ( i, 1, 6) = bfy_r_star ( i)
+      zone_star_conserved ( i, 1, 7) = bfz_r_star ( i)
+
+#if ( NFLUID >= 1)
+      zone_star_conserved ( i, 1, NFIELD + 1: NFIELD + NFLUID) =
+     1     rho_r_star ( i) * specierepl ( 1: NFLUID, i)
+#endif
+
+**********
+
+* Now make conserved variables from the resolved state.
+
+      conserved_re ( i, 1) = rho0 ( i)
+
+      conserved_re ( i, 2) = rho0 ( i) * vlx0 ( i)
+      conserved_re ( i, 3) = rho0 ( i) * vly0 ( i)
+      conserved_re ( i, 4) = rho0 ( i) * vlz0 ( i)
+
+      conserved_re ( i, 5) = eng0 ( i)
+
+      conserved_re ( i, 6) = bfy0 ( i)
+      conserved_re ( i, 7) = bfz0 ( i)
+
+#if ( NFLUID >= 1)
+      conserved_re ( i, NFIELD + 1: NFIELD + NFLUID) =
+     1     rho0 ( i) * specie0 ( 1: NFLUID, i)
+#endif
+
+**********
+
+* Now make fluxes from the resolved state.
+* Eq. (65) and its analogue are needed to ensure that the flux is conservative.
+
+
+      temparr_05 ( i) = alfven_r_star ( i) - wavespd_ein_r ( i)
+
+      flux_re ( i, 1) = zonebdy_flux ( i, 1, 1)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 1)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 1)
+     1               + alfven_r_star ( i)
+     1                * conserved_re ( i, 1)
+
+      flux_re ( i, 2) = zonebdy_flux ( i, 1, 2)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 2)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 2)
+     1               + alfven_r_star ( i)
+     1                * conserved_re ( i, 2)
+
+      flux_re ( i, 3) = zonebdy_flux ( i, 1, 3)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 3)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 3)
+     1               + alfven_r_star ( i)
+     1                * conserved_re ( i, 3)
+
+      flux_re ( i, 4) = zonebdy_flux ( i, 1, 4)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 4)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 4)
+     1               + alfven_r_star ( i)
+     1                * conserved_re ( i, 4)
+
+      flux_re ( i, 5) = zonebdy_flux ( i, 1, 5)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 5)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 5)
+     1               + alfven_r_star ( i)
+     1                * conserved_re ( i, 5)
+
+      flux_re ( i, 6) = zonebdy_flux ( i, 1, 6)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 6)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 6)
+     1               + alfven_r_star ( i)
+     1                * conserved_re ( i, 6)
+
+      flux_re ( i, 7) = zonebdy_flux ( i, 1, 7)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 7)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 7)
+     1               + alfven_r_star ( i)
+     1                * conserved_re ( i, 7)
+
+      flux_re ( i, 8) = 0.0
+
+#if ( NFLUID >= 1)
+      flux_re ( i, NFIELD + 2: NFIELD + NFLUID + 1) =
+     1                zonebdy_flux ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1             - wavespd_ein_r ( i)
+     1         * zonebdy_conserved ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1                - temparr_05 ( i)
+     1        * zone_star_conserved ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1             + alfven_r_star ( i)
+     1              * conserved_re ( i, NFIELD + 1: NFIELD + NFLUID)
+#endif
+
+
+      im_done ( i) = 1
+
+****************
+
+* End of considering the state that is right of the contact discontinuity.
+
+      END IF
+
+*********************************************************************
+
+      END IF
+* End of picking HLLD type states as the resolved state of the Riemann problem.
+
+*********************************************************************
+
+      END DO
+* End of evaluating a "dblstar" state on either side of the Riemann problem
+* and using it to evaluate the flux of the resolved state.
+
+*********************************************************************
+*********************************************************************
+
+* If entropy fixes are desired for the linearly degenerate wave families
+* in certain zones then those zones will need a lot more extra work.
+* We do that work here, restricting attention to just the zones that need
+* such a fix.
+
+#if ( ENTROPY_FIX_LIN_DEG == 1)
+
+      DO i = nriembegin, nriemend
+
+*********************************************************************
+
+      IF ( ( open_fan ( i) .EQ. 1) .AND.
+     1     ( make_plain_hll ( i) .EQ. 0) .AND.
+     1     ( iwave_entropy_fix ( i) .NE. 0) ) THEN
+
+****************
+      IF ( ( iwave_entropy_fix ( i) .EQ. 2) .OR.
+     1     ( iwave_entropy_fix ( i) .EQ. 4) ) THEN
+****************
+
+* Use the "l_star" variables to construct conserved variables and fluxes.
+
+      zone_star_conserved ( i, 0, 1) = rho_l_star ( i)
+
+      zone_star_conserved ( i, 0, 2) = rho_l_star ( i) * vlx0 ( i)
+      zone_star_conserved ( i, 0, 3) = rho_l_star ( i) * vly_l_star ( i)
+      zone_star_conserved ( i, 0, 4) = rho_l_star ( i) * vlz_l_star ( i)
+
+      zone_star_conserved ( i, 0, 5) = eng_l_star ( i)
+
+      zone_star_conserved ( i, 0, 6) = bfy_l_star ( i)
+      zone_star_conserved ( i, 0, 7) = bfz_l_star ( i)
+
+#if ( NFLUID >= 1)
+      zone_star_conserved ( i, 0, NFIELD + 1: NFIELD + NFLUID) =
+     1     rho_l_star ( i) * specieremi ( 1: NFLUID, i)
+#endif
+
+      zone_star_flux ( i, 0, 1) = rho_l_star ( i) * vlx0 ( i)
+
+      zone_star_flux ( i, 0, 2) = rho_l_star ( i) * vlx0 ( i)**2
+     1                + prs_tot_0 ( i)
+     1                - one_by_fourpi * bfxre ( i)**2
+      zone_star_flux ( i, 0, 3) = rho_l_star ( i) * vlx0 ( i)
+     1                                  * vly_l_star ( i)
+     1                - bfxre ( i) * bfy_l_star ( i)
+     1                * one_by_fourpi
+      zone_star_flux ( i, 0, 4) = rho_l_star ( i) * vlx0 ( i)
+     1                                  * vlz_l_star ( i)
+     1                - bfxre ( i) * bfz_l_star ( i)
+     1                * one_by_fourpi
+
+      zone_star_flux ( i, 0, 5) =
+     1                ( eng_l_star ( i) + prs_tot_0 ( i)) * vlx0 ( i)
+     1                - bfxre ( i) * one_by_fourpi
+     1                * ( vlx0 ( i) * bfxre ( i)
+     1                  + vly_l_star ( i) * bfy_l_star ( i)
+     1                  + vlz_l_star ( i) * bfz_l_star ( i))
+
+      zone_star_flux ( i, 0, 6) = bfy_l_star ( i) * vlx0 ( i)
+     1                - bfxre ( i) * vly_l_star ( i)
+      zone_star_flux ( i, 0, 7) = bfz_l_star ( i) * vlx0 ( i)
+     1                - bfxre ( i) * vlz_l_star ( i)
+
+#if ( NFLUID >= 1)
+      zone_star_flux ( i, 0, NFIELD + 1: NFIELD + NFLUID) =
+     1        rho_l_star ( i) * vlx0 ( i) * specieremi ( 1: NFLUID, i)
+#endif
+
+**********
+
+* Use the "l_dblstar" variables to construct conserved variables and fluxes.
+
+      zone_dblstar_conserved ( i, 0, 1) = rho_l_dblstar ( i)
+
+      zone_dblstar_conserved ( i, 0, 2) = rho_l_dblstar ( i)
+     1                                  * vlx0 ( i)
+      zone_dblstar_conserved ( i, 0, 3) = rho_l_dblstar ( i)
+     1                                  * vly_l_dblstar ( i)
+      zone_dblstar_conserved ( i, 0, 4) = rho_l_dblstar ( i)
+     1                                  * vlz_l_dblstar ( i)
+
+      zone_dblstar_conserved ( i, 0, 5) = eng_l_dblstar ( i)
+
+      zone_dblstar_conserved ( i, 0, 6) = bfy_l_dblstar ( i)
+      zone_dblstar_conserved ( i, 0, 7) = bfz_l_dblstar ( i)
+
+#if ( NFLUID >= 1)
+      zone_dblstar_conserved ( i, 0, NFIELD + 1: NFIELD + NFLUID) =
+     1     rho_l_dblstar ( i) * specieremi ( 1: NFLUID, i)
+#endif
+
+
+      temparr_06 ( i) = alfven_l_star ( i) - wavespd_ein_l ( i)
+
+      zone_dblstar_flux ( i, 0, 1) = zonebdy_flux ( i, 0, 1)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 1)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 1)
+     1               + alfven_l_star ( i)
+     1                * zone_dblstar_conserved ( i, 0, 1) 
+
+      zone_dblstar_flux ( i, 0, 2) = zonebdy_flux ( i, 0, 2)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 2)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 2)
+     1               + alfven_l_star ( i)
+     1                * zone_dblstar_conserved ( i, 0, 2)
+
+      zone_dblstar_flux ( i, 0, 3) = zonebdy_flux ( i, 0, 3)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 3)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 3)
+     1               + alfven_l_star ( i)
+     1                * zone_dblstar_conserved ( i, 0, 3)
+
+      zone_dblstar_flux ( i, 0, 4) = zonebdy_flux ( i, 0, 4)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 4)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 4)
+     1               + alfven_l_star ( i)
+     1                * zone_dblstar_conserved ( i, 0, 4)
+
+      zone_dblstar_flux ( i, 0, 5) = zonebdy_flux ( i, 0, 5)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 5)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 5)
+     1               + alfven_l_star ( i)
+     1                * zone_dblstar_conserved ( i, 0, 5)
+
+      zone_dblstar_flux ( i, 0, 6) = zonebdy_flux ( i, 0, 6)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 6)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 6)
+     1               + alfven_l_star ( i)
+     1                * zone_dblstar_conserved ( i, 0, 6)
+
+      zone_dblstar_flux ( i, 0, 7) = zonebdy_flux ( i, 0, 7)
+     1               - wavespd_ein_l ( i)
+     1           * zonebdy_conserved ( i, 0, 7)
+     1                  - temparr_06 ( i)
+     1          * zone_star_conserved ( i, 0, 7)
+     1               + alfven_l_star ( i)
+     1                * zone_dblstar_conserved ( i, 0, 7)
+
+#if ( NFLUID >= 1)
+      zone_dblstar_flux ( i, 0, NFIELD + 1: NFIELD + NFLUID) =
+     1                zonebdy_flux ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1             - wavespd_ein_l ( i)
+     1         * zonebdy_conserved ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1                - temparr_06 ( i)
+     1        * zone_star_conserved ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1             + alfven_l_star ( i)
+     1              * zone_dblstar_conserved
+     1                ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+#endif
+
+
+********************
+      END IF
+
+      IF ( ( iwave_entropy_fix ( i) .EQ. 6) .OR.
+     1     ( iwave_entropy_fix ( i) .EQ. 4) ) THEN
+********************
+
+* Use the "r_star" variables to construct conserved variables and fluxes.
+
+      zone_star_conserved ( i, 1, 1) = rho_r_star ( i)
+
+      zone_star_conserved ( i, 1, 2) = rho_r_star ( i) * vlx0 ( i)
+      zone_star_conserved ( i, 1, 3) = rho_r_star ( i) * vly_r_star ( i)
+      zone_star_conserved ( i, 1, 4) = rho_r_star ( i) * vlz_r_star ( i)
+
+      zone_star_conserved ( i, 1, 5) = eng_r_star ( i)
+
+      zone_star_conserved ( i, 1, 6) = bfy_r_star ( i)
+      zone_star_conserved ( i, 1, 7) = bfz_r_star ( i)
+
+#if ( NFLUID >= 1)
+      zone_star_conserved ( i, 1, NFIELD + 1: NFIELD + NFLUID) =
+     1     rho_r_star ( i) * specierepl ( 1: NFLUID, i)
+#endif
+
+      zone_star_flux ( i, 1, 1) = rho_r_star ( i) * vlx0 ( i)
+
+      zone_star_flux ( i, 1, 2) = rho_r_star ( i) * vlx0 ( i)**2
+     1                + prs_tot_0 ( i)
+     1                - one_by_fourpi * bfxre ( i)**2
+      zone_star_flux ( i, 1, 3) = rho_r_star ( i) * vlx0 ( i)
+     1                                  * vly_r_star ( i)
+     1                - bfxre ( i) * bfy_r_star ( i)
+     1                * one_by_fourpi
+      zone_star_flux ( i, 1, 4) = rho_r_star ( i) * vlx0 ( i)
+     1                                  * vlz_r_star ( i)
+     1                - bfxre ( i) * bfz_r_star ( i)
+     1                * one_by_fourpi
+
+      zone_star_flux ( i, 1, 5) = 
+     1                ( eng_r_star ( i) + prs_tot_0 ( i)) * vlx0 ( i)
+     1                - bfxre ( i) * one_by_fourpi
+     1                * ( vlx0 ( i) * bfxre ( i)
+     1                  + vly_r_star ( i) * bfy_r_star ( i)
+     1                  + vlz_r_star ( i) * bfz_r_star ( i))
+
+      zone_star_flux ( i, 1, 6) = bfy_r_star ( i) * vlx0 ( i)
+     1                - bfxre ( i) * vly_r_star ( i)
+      zone_star_flux ( i, 1, 7) = bfz_r_star ( i) * vlx0 ( i)
+     1                - bfxre ( i) * vlz_r_star ( i)
+
+#if ( NFLUID >= 1)
+      zone_star_flux ( i, 1, NFIELD + 1: NFIELD + NFLUID) =
+     1        rho_r_star ( i) * vlx0 ( i) * specierepl ( 1: NFLUID, i)
+#endif
+
+**********
+
+* Use the "r_dblstar" variables to construct conserved variables and fluxes.
+
+      zone_dblstar_conserved ( i, 1, 1) = rho_r_dblstar ( i)
+
+      zone_dblstar_conserved ( i, 1, 2) = rho_r_dblstar ( i)
+     1                                  * vlx0 ( i)
+      zone_dblstar_conserved ( i, 1, 3) = rho_r_dblstar ( i)
+     1                                  * vly_r_dblstar ( i)
+      zone_dblstar_conserved ( i, 1, 4) = rho_r_dblstar ( i)
+     1                                  * vlz_r_dblstar ( i)
+
+      zone_dblstar_conserved ( i, 1, 5) = eng_r_dblstar ( i)
+
+      zone_dblstar_conserved ( i, 1, 6) = bfy_r_dblstar ( i)
+      zone_dblstar_conserved ( i, 1, 7) = bfz_r_dblstar ( i)
+
+#if ( NFLUID >= 1)
+      zone_dblstar_conserved ( i, 1, NFIELD + 1: NFIELD + NFLUID) =
+     1     rho_r_dblstar ( i) * specierepl ( 1: NFLUID, i)
+#endif
+
+
+      temparr_05 ( i) = alfven_r_star ( i) - wavespd_ein_r ( i)
+
+      zone_dblstar_flux ( i, 1, 1) = zonebdy_flux ( i, 1, 1)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 1)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 1)
+     1               + alfven_r_star ( i)
+     1                * zone_dblstar_conserved ( i, 1, 1)
+
+      zone_dblstar_flux ( i, 1, 2) = zonebdy_flux ( i, 1, 2)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 2)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 2)
+     1               + alfven_r_star ( i)
+     1                * zone_dblstar_conserved ( i, 1, 2)
+
+      zone_dblstar_flux ( i, 1, 3) = zonebdy_flux ( i, 1, 3)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 3)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 3)
+     1               + alfven_r_star ( i)
+     1                * zone_dblstar_conserved ( i, 1, 3)
+
+      zone_dblstar_flux ( i, 1, 4) = zonebdy_flux ( i, 1, 4)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 4)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 4)
+     1               + alfven_r_star ( i)
+     1                * zone_dblstar_conserved ( i, 1, 4)
+
+      zone_dblstar_flux ( i, 1, 5) = zonebdy_flux ( i, 1, 5)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 5)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 5)
+     1               + alfven_r_star ( i)
+     1                * zone_dblstar_conserved ( i, 1, 5)
+
+      zone_dblstar_flux ( i, 1, 6) = zonebdy_flux ( i, 1, 6)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 6)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 6)
+     1               + alfven_r_star ( i)
+     1                * zone_dblstar_conserved ( i, 1, 6)
+
+      zone_dblstar_flux ( i, 1, 7) = zonebdy_flux ( i, 1, 7)
+     1               - wavespd_ein_r ( i)
+     1           * zonebdy_conserved ( i, 1, 7)
+     1                  - temparr_05 ( i)
+     1          * zone_star_conserved ( i, 1, 7)
+     1               + alfven_r_star ( i)
+     1                * zone_dblstar_conserved ( i, 1, 7)
+
+#if ( NFLUID >= 1)
+      zone_dblstar_flux ( i, 1, NFIELD + 1: NFIELD + NFLUID) =
+     1                zonebdy_flux ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1             - wavespd_ein_r ( i)
+     1         * zonebdy_conserved ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1                - temparr_05 ( i)
+     1        * zone_star_conserved ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1             + alfven_r_star ( i)
+     1              * zone_dblstar_conserved
+     1                ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+#endif
+
+********************
+      END IF
+********************
+
+* Make entropy fix for left-going Alfven wave by using left and right states:
+* "zone_star_conserved ( i, 0, ?), zone_star_flux ( i, 0, ?), 
+*  zone_dblstar_conserved ( i, 0, ?), zone_dblstar_flux ( i, 0, ?)"respectively.
+
+      IF ( iwave_entropy_fix ( i) .EQ. 2) THEN
+
+      temparr_01 ( i) = eigenval_db ( i, 0, 2)
+      temparr_02 ( i) = eigenval_db ( i, 1, 2)
+      temparr_03 ( i) = temparr_01 ( i) * temparr_02 ( i)
+      temparr_04 ( i) = 1.0 / ( temparr_02 ( i) - temparr_01 ( i))
+
+* Make the conserved variables.
+
+      conserved_re ( i, 1) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 0, 1)
+     1        - temparr_01 ( i) * zone_star_conserved ( i, 0, 1)
+     1        - zone_dblstar_flux ( i, 0, 1)
+     1        + zone_star_flux ( i, 0, 1)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 2) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 0, 2)
+     1        - temparr_01 ( i) * zone_star_conserved ( i, 0, 2)
+     1        - zone_dblstar_flux ( i, 0, 2)
+     1        + zone_star_flux ( i, 0, 2)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 3) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 0, 3)
+     1        - temparr_01 ( i) * zone_star_conserved ( i, 0, 3)
+     1        - zone_dblstar_flux ( i, 0, 3)
+     1        + zone_star_flux ( i, 0, 3)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 4) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 0, 4)
+     1        - temparr_01 ( i) * zone_star_conserved ( i, 0, 4)
+     1        - zone_dblstar_flux ( i, 0, 4)
+     1        + zone_star_flux ( i, 0, 4)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 5) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 0, 5)
+     1        - temparr_01 ( i) * zone_star_conserved ( i, 0, 5)
+     1        - zone_dblstar_flux ( i, 0, 5)
+     1        + zone_star_flux ( i, 0, 5)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 6) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 0, 6)
+     1        - temparr_01 ( i) * zone_star_conserved ( i, 0, 6)
+     1        - zone_dblstar_flux ( i, 0, 6)
+     1        + zone_star_flux ( i, 0, 6)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 7) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 0, 7)
+     1        - temparr_01 ( i) * zone_star_conserved ( i, 0, 7)
+     1        - zone_dblstar_flux ( i, 0, 7)
+     1        + zone_star_flux ( i, 0, 7)
+     1        ) * temparr_04 ( i)
+
+#if ( NFLUID >= 1)
+      conserved_re ( i, NFIELD + 1: NFIELD + NFLUID) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved
+     1                            ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1        - temparr_01 ( i) * zone_star_conserved
+     1                            ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1        - zone_dblstar_flux ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1        + zone_star_flux ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1        ) * temparr_04 ( i)
+#endif
+
+* Now make primitive variables from the conserved variables.
+
+      rho0 ( i) = AMAX1 ( conserved_re ( i, 1), rhofloor)
+
+      temparr_05 ( i) = 1.0 / rho0 ( i)
+
+      vlx0 ( i) = conserved_re ( i, 2) * temparr_05 ( i)
+      vly0 ( i) = conserved_re ( i, 3) * temparr_05 ( i)
+      vlz0 ( i) = conserved_re ( i, 4) * temparr_05 ( i)
+
+      bfy0 ( i) = conserved_re ( i, 6)
+      bfz0 ( i) = conserved_re ( i, 7)
+
+      prs0 ( i) = conserved_re ( i, 5)
+     1 - 0.5 * rho0 ( i) * ( vlx0 ( i)**2 + vly0 ( i)**2
+     1                     + vlz0 ( i)**2)
+     1 - 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2 + bfz0 ( i)**2)
+     1 * one_by_fourpi
+      prs0 ( i) = prs0 ( i) * ( gamma_eos ( i) - 1.0)
+      prs0 ( i) = AMAX1 ( prs0 ( i), prsfloor)
+
+#if ( NFLUID >= 1)
+      specie0 ( 1: NFLUID, i) = temparr_05 ( i)
+     1      * conserved_re ( i, NFIELD + 1: NFIELD + NFLUID)
+#endif
+
+* Make the fluxes.
+
+      flux_re ( i, 1) =
+     1        ( temparr_02 ( i) * zone_star_flux ( i, 0, 1)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 0, 1)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 0, 1)
+     1                            - zone_star_conserved ( i, 0, 1))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 2) =
+     1        ( temparr_02 ( i) * zone_star_flux ( i, 0, 2)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 0, 2)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 0, 2)
+     1                            - zone_star_conserved ( i, 0, 2)) 
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 3) =
+     1        ( temparr_02 ( i) * zone_star_flux ( i, 0, 3)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 0, 3)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 0, 3)
+     1                            - zone_star_conserved ( i, 0, 3)) 
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 4) =
+     1        ( temparr_02 ( i) * zone_star_flux ( i, 0, 4)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 0, 4)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 0, 4)
+     1                            - zone_star_conserved ( i, 0, 4)) 
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 5) =
+     1        ( temparr_02 ( i) * zone_star_flux ( i, 0, 5)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 0, 5)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 0, 5)
+     1                            - zone_star_conserved ( i, 0, 5)) 
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 6) =
+     1        ( temparr_02 ( i) * zone_star_flux ( i, 0, 6)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 0, 6)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 0, 6)
+     1                            - zone_star_conserved ( i, 0, 6)) 
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 7) =
+     1        ( temparr_02 ( i) * zone_star_flux ( i, 0, 7)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 0, 7)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 0, 7)
+     1                            - zone_star_conserved ( i, 0, 7)) 
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 8) = 0.0
+
+#if ( NFLUID >= 1)
+      flux_re ( i, NFIELD + 2: NFIELD + NFLUID + 1) =
+     1        ( temparr_02 ( i) * zone_star_flux
+     1                            ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1        - temparr_01 ( i) * zone_dblstar_flux
+     1                            ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved
+     1                            ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1                            - zone_star_conserved
+     1                            ( i, 0, NFIELD + 1: NFIELD + NFLUID))
+     1        ) * temparr_04 ( i)
+#endif
+
+      im_done ( i) = 1
+
+      END IF
+! End of entropy fix for left-going Alfven wave.
+
+********************
+
+* Make entropy fix for right-going Alfven wave by using left and right states:
+* "zone_dblstar_conserved ( i, 1, ?), zone_dblstar_flux ( i, 1, ?),
+*  zone_star_conserved ( i, 1, ?), zone_star_flux ( i, 1, ?)" respectively.
+
+      IF ( iwave_entropy_fix ( i) .EQ. 6) THEN
+
+      temparr_01 ( i) = eigenval_db ( i, 0, 6)
+      temparr_02 ( i) = eigenval_db ( i, 1, 6)
+      temparr_03 ( i) = temparr_01 ( i) * temparr_02 ( i)
+      temparr_04 ( i) = 1.0 / ( temparr_02 ( i) - temparr_01 ( i))
+
+* Make the conserved variables.
+
+      conserved_re ( i, 1) =
+     1        ( temparr_02 ( i) * zone_star_conserved ( i, 1, 1)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 1, 1)
+     1        - zone_star_flux ( i, 1, 1)
+     1        + zone_dblstar_flux ( i, 1, 1)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 2) =
+     1        ( temparr_02 ( i) * zone_star_conserved ( i, 1, 2)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 1, 2)
+     1        - zone_star_flux ( i, 1, 2)
+     1        + zone_dblstar_flux ( i, 1, 2)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 3) =
+     1        ( temparr_02 ( i) * zone_star_conserved ( i, 1, 3)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 1, 3)
+     1        - zone_star_flux ( i, 1, 3)
+     1        + zone_dblstar_flux ( i, 1, 3)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 4) =
+     1        ( temparr_02 ( i) * zone_star_conserved ( i, 1, 4)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 1, 4)
+     1        - zone_star_flux ( i, 1, 4)
+     1        + zone_dblstar_flux ( i, 1, 4)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 5) =
+     1        ( temparr_02 ( i) * zone_star_conserved ( i, 1, 5)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 1, 5)
+     1        - zone_star_flux ( i, 1, 5)
+     1        + zone_dblstar_flux ( i, 1, 5)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 6) =
+     1        ( temparr_02 ( i) * zone_star_conserved ( i, 1, 6)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 1, 6)
+     1        - zone_star_flux ( i, 1, 6)
+     1        + zone_dblstar_flux ( i, 1, 6)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 7) =
+     1        ( temparr_02 ( i) * zone_star_conserved ( i, 1, 7)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 1, 7)
+     1        - zone_star_flux ( i, 1, 7)
+     1        + zone_dblstar_flux ( i, 1, 7)
+     1        ) * temparr_04 ( i)
+
+#if ( NFLUID >= 1)
+      conserved_re ( i, NFIELD + 1: NFIELD + NFLUID) =
+     1        ( temparr_02 ( i) * zone_star_conserved
+     1                            ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1        - temparr_01 ( i) * zone_dblstar_conserved
+     1                            ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1        - zone_star_flux ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1        + zone_dblstar_flux ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1        ) * temparr_04 ( i)
+#endif
+
+* Now make primitive variables from the conserved variables.
+
+      rho0 ( i) = AMAX1 ( conserved_re ( i, 1), rhofloor)
+
+      temparr_05 ( i) = 1.0 / rho0 ( i)
+
+      vlx0 ( i) = conserved_re ( i, 2) * temparr_05 ( i)
+      vly0 ( i) = conserved_re ( i, 3) * temparr_05 ( i)
+      vlz0 ( i) = conserved_re ( i, 4) * temparr_05 ( i)
+
+      bfy0 ( i) = conserved_re ( i, 6)
+      bfz0 ( i) = conserved_re ( i, 7)
+
+      prs0 ( i) = conserved_re ( i, 5)
+     1 - 0.5 * rho0 ( i) * ( vlx0 ( i)**2 + vly0 ( i)**2
+     1                     + vlz0 ( i)**2)
+     1 - 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2 + bfz0 ( i)**2)
+     1 * one_by_fourpi
+      prs0 ( i) = prs0 ( i) * ( gamma_eos ( i) - 1.0)
+      prs0 ( i) = AMAX1 ( prs0 ( i), prsfloor)
+
+#if ( NFLUID >= 1)
+      specie0 ( 1: NFLUID, i) = temparr_05 ( i)
+     1      * conserved_re ( i, NFIELD + 1: NFIELD + NFLUID)
+#endif
+
+* Make the fluxes.
+
+      flux_re ( i, 1) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 1, 1)
+     1        - temparr_01 ( i) * zone_star_flux ( i, 1, 1)
+     1        + temparr_03 ( i) * ( zone_star_conserved ( i, 1, 1)
+     1                            - zone_dblstar_conserved ( i, 1, 1))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 2) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 1, 2)
+     1        - temparr_01 ( i) * zone_star_flux ( i, 1, 2)
+     1        + temparr_03 ( i) * ( zone_star_conserved ( i, 1, 2)
+     1                            - zone_dblstar_conserved ( i, 1, 2))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 3) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 1, 3)
+     1        - temparr_01 ( i) * zone_star_flux ( i, 1, 3)
+     1        + temparr_03 ( i) * ( zone_star_conserved ( i, 1, 3)
+     1                            - zone_dblstar_conserved ( i, 1, 3))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 4) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 1, 4)
+     1        - temparr_01 ( i) * zone_star_flux ( i, 1, 4)
+     1        + temparr_03 ( i) * ( zone_star_conserved ( i, 1, 4)
+     1                            - zone_dblstar_conserved ( i, 1, 4))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 5) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 1, 5)
+     1        - temparr_01 ( i) * zone_star_flux ( i, 1, 5)
+     1        + temparr_03 ( i) * ( zone_star_conserved ( i, 1, 5)
+     1                            - zone_dblstar_conserved ( i, 1, 5))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 6) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 1, 6)
+     1        - temparr_01 ( i) * zone_star_flux ( i, 1, 6)
+     1        + temparr_03 ( i) * ( zone_star_conserved ( i, 1, 6)
+     1                            - zone_dblstar_conserved ( i, 1, 6))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 7) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 1, 7)
+     1        - temparr_01 ( i) * zone_star_flux ( i, 1, 7)
+     1        + temparr_03 ( i) * ( zone_star_conserved ( i, 1, 7)
+     1                            - zone_dblstar_conserved ( i, 1, 7))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 8) = 0.0
+
+#if ( NFLUID >= 1)
+      flux_re ( i, NFIELD + 2: NFIELD + NFLUID + 1) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux
+     1                            ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1        - temparr_01 ( i) * zone_star_flux
+     1                            ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1        + temparr_03 ( i) * ( zone_star_conserved
+     1                            ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1                            - zone_dblstar_conserved
+     1                            ( i, 1, NFIELD + 1: NFIELD + NFLUID))
+     1        ) * temparr_04 ( i)
+
+#endif
+
+      im_done ( i) = 1
+
+      END IF
+! End of entropy fix for right-going Alfven wave.
+
+********************
+
+* Make entropy fix for contact discontinuity by using left and right states:
+* "zone_dblstar_conserved ( i, 0, ?), zone_dblstar_flux ( i, 0, ?),
+*  zone_dblstar_conserved ( i, 1, ?), zone_dblstar_flux ( i, 1, ?)"respectively.
+
+      IF ( iwave_entropy_fix ( i) .EQ. 4) THEN
+
+      temparr_01 ( i) = eigenval_db ( i, 0, 4)
+      temparr_02 ( i) = eigenval_db ( i, 1, 4)
+      temparr_03 ( i) = temparr_01 ( i) * temparr_02 ( i)
+      temparr_04 ( i) = 1.0 / ( temparr_02 ( i) - temparr_01 ( i))
+
+* Make the conserved variables.
+
+      conserved_re ( i, 1) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 1, 1)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 0, 1)
+     1        - zone_dblstar_flux ( i, 1, 1)
+     1        + zone_dblstar_flux ( i, 0, 1)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 2) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 1, 2)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 0, 2)
+     1        - zone_dblstar_flux ( i, 1, 2)
+     1        + zone_dblstar_flux ( i, 0, 2)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 3) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 1, 3)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 0, 3)
+     1        - zone_dblstar_flux ( i, 1, 3)
+     1        + zone_dblstar_flux ( i, 0, 3)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 4) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 1, 4)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 0, 4)
+     1        - zone_dblstar_flux ( i, 1, 4)
+     1        + zone_dblstar_flux ( i, 0, 4)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 5) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 1, 5)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 0, 5)
+     1        - zone_dblstar_flux ( i, 1, 5)
+     1        + zone_dblstar_flux ( i, 0, 5)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 6) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 1, 6)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 0, 6)
+     1        - zone_dblstar_flux ( i, 1, 6)
+     1        + zone_dblstar_flux ( i, 0, 6)
+     1        ) * temparr_04 ( i)
+
+      conserved_re ( i, 7) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved ( i, 1, 7)
+     1        - temparr_01 ( i) * zone_dblstar_conserved ( i, 0, 7)
+     1        - zone_dblstar_flux ( i, 1, 7)
+     1        + zone_dblstar_flux ( i, 0, 7)
+     1        ) * temparr_04 ( i)
+
+#if ( NFLUID >= 1)
+      conserved_re ( i, NFIELD + 1: NFIELD + NFLUID) =
+     1        ( temparr_02 ( i) * zone_dblstar_conserved
+     1                            ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1        - temparr_01 ( i) * zone_dblstar_conserved
+     1                            ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1        - zone_dblstar_flux ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1        + zone_dblstar_flux ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1        ) * temparr_04 ( i)
+#endif
+
+* Now make primitive variables from the conserved variables.
+
+      rho0 ( i) = AMAX1 ( conserved_re ( i, 1), rhofloor)
+
+      temparr_05 ( i) = 1.0 / rho0 ( i)
+
+      vlx0 ( i) = conserved_re ( i, 2) * temparr_05 ( i)
+      vly0 ( i) = conserved_re ( i, 3) * temparr_05 ( i)
+      vlz0 ( i) = conserved_re ( i, 4) * temparr_05 ( i)
+
+      bfy0 ( i) = conserved_re ( i, 6)
+      bfz0 ( i) = conserved_re ( i, 7)
+
+      prs0 ( i) = conserved_re ( i, 5)
+     1 - 0.5 * rho0 ( i) * ( vlx0 ( i)**2 + vly0 ( i)**2
+     1                     + vlz0 ( i)**2)
+     1 - 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2 + bfz0 ( i)**2)
+     1 * one_by_fourpi
+      prs0 ( i) = prs0 ( i) * ( gamma_eos ( i) - 1.0)
+      prs0 ( i) = AMAX1 ( prs0 ( i), prsfloor)
+
+#if ( NFLUID >= 1)
+      specie0 ( 1: NFLUID, i) = temparr_05 ( i)
+     1      * conserved_re ( i, NFIELD + 1: NFIELD + NFLUID)
+#endif
+
+* Make the fluxes.
+
+      flux_re ( i, 1) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 0, 1)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 1, 1)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 1, 1)
+     1                            - zone_dblstar_conserved ( i, 0, 1))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 2) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 0, 2)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 1, 2)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 1, 2)
+     1                            - zone_dblstar_conserved ( i, 0, 2))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 3) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 0, 3)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 1, 3)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 1, 3)
+     1                            - zone_dblstar_conserved ( i, 0, 3))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 4) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 0, 4)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 1, 4)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 1, 4)
+     1                            - zone_dblstar_conserved ( i, 0, 4))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 5) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 0, 5)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 1, 5)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 1, 5)
+     1                            - zone_dblstar_conserved ( i, 0, 5))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 6) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 0, 6)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 1, 6)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 1, 6)
+     1                            - zone_dblstar_conserved ( i, 0, 6))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 7) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux ( i, 0, 7)
+     1        - temparr_01 ( i) * zone_dblstar_flux ( i, 1, 7)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved ( i, 1, 7)
+     1                            - zone_dblstar_conserved ( i, 0, 7))
+     1        ) * temparr_04 ( i)
+
+      flux_re ( i, 8) = 0.0
+
+#if ( NFLUID >= 1)
+      flux_re ( i, NFIELD + 2: NFIELD + NFLUID + 1) =
+     1        ( temparr_02 ( i) * zone_dblstar_flux
+     1                            ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+     1        - temparr_01 ( i) * zone_dblstar_flux
+     1                            ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1        + temparr_03 ( i) * ( zone_dblstar_conserved
+     1                             ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+     1                            - zone_dblstar_conserved
+     1                            ( i, 0, NFIELD + 1: NFIELD + NFLUID))
+     1        ) * temparr_04 ( i)
+#endif
+
+      im_done ( i) = 1
+
+      END IF
+! End of entropy fix for contact discontinuity.
+
+********************
+
+      END IF
+
+*********************************************************************
+
+      END DO
+#endif
+! End of "ENTROPY_FIX_LIN_DEG == 1" part.
+
+* End of applying entropy fixes to linearly degenerate wave families.
+
+*********************************************************************
+*********************************************************************
+
+* Now process states from an open Riemann problem that need just the
+* HLL formulation without the HLLD variant.
+
+********************************
+
+* We can also make checks on the density and pressure variables in all the
+* resolved states. The supersonic cases always return pressure-positive
+* states if the subroutine was entered with pressure-positive states.
+
+* We are assuming that up to this point, HLLD has made all the resolved
+* states for all open Riemann problems.
+
+      DO i = nriembegin, nriemend
+
+********************
+
+      IF ( open_fan ( i) .EQ. 1) THEN
+
+********************
+
+* Testing "remi" state for pressure & density positivity.
+
+      IF ( ( prsremi ( i) .LE. prsfloor_plus_delta) .OR.
+     1     ( rhoremi ( i) .LE. rhofloor_plus_delta) ) THEN
+      make_plain_hll ( i) = 1
+      make_llf ( i) = 1
+      END IF
+
+**********
+
+* Testing "repl" state for pressure & density positivity.
+
+      IF ( ( prsrepl ( i) .LE. prsfloor_plus_delta) .OR.
+     1     ( rhorepl ( i) .LE. rhofloor_plus_delta) ) THEN
+      make_plain_hll ( i) = 1
+      make_llf ( i) = 1
+      END IF
+
+**********
+
+* Testing "r_star" state for pressure & density positivity.
+
+      temparr_01 ( i) = 0.5 * ( bfxre ( i)**2 + bfy_r_star ( i)**2
+     1                        + bfz_r_star ( i)**2) * one_by_fourpi
+
+      temparr_02 ( i) = 0.5 * rho_r_star ( i) * ( vlx0 ( i)**2
+     1         + vly_r_star ( i)**2 + vlz_r_star ( i)**2)
+
+      temparr_03 ( i) = prs_tot_0 ( i) - temparr_01 ( i)
+
+      temparr_04 ( i) = ( eng_r_star ( i) - temparr_01 ( i)
+     1                  - temparr_02 ( i))
+     1                * ( gamma_eos_repl ( i) - 1.0)
+
+      IF ( ( temparr_03 ( i) .LE. prsfloor_plus_delta) .OR.
+     1     ( temparr_04 ( i) .LE. prsfloor_plus_delta) .OR.
+     1     ( rho_r_star ( i) .LE. rhofloor_plus_delta) ) THEN
+      make_plain_hll ( i) = 1
+      make_llf ( i) = 1
+      END IF
+
+**********
+
+* Testing "l_star" state for pressure & density positivity.
+
+      temparr_01 ( i) = 0.5 * ( bfxre ( i)**2 + bfy_l_star ( i)**2
+     1                        + bfz_l_star ( i)**2) * one_by_fourpi
+
+      temparr_02 ( i) = 0.5 * rho_l_star ( i) * ( vlx0 ( i)**2
+     1         + vly_l_star ( i)**2 + vlz_l_star ( i)**2)
+
+      temparr_03 ( i) = prs_tot_0 ( i) - temparr_01 ( i)
+
+      temparr_04 ( i) = ( eng_l_star ( i) - temparr_01 ( i)
+     1                  - temparr_02 ( i))
+     1                * ( gamma_eos_remi ( i) - 1.0)
+
+      IF ( ( temparr_03 ( i) .LE. prsfloor_plus_delta) .OR.
+     1     ( temparr_04 ( i) .LE. prsfloor_plus_delta) .OR.
+     1     ( rho_l_star ( i) .LE. rhofloor_plus_delta) ) THEN
+      make_plain_hll ( i) = 1
+      make_llf ( i) = 1
+      END IF
+
+**********
+
+* Testing "r_dblstar" state for pressure & density positivity.
+
+      temparr_01 ( i) = 0.5 * ( bfxre ( i)**2 + bfy_r_dblstar ( i)**2
+     1                        + bfz_r_dblstar ( i)**2) * one_by_fourpi
+
+      temparr_02 ( i) = 0.5 * rho_r_dblstar ( i) * ( vlx0 ( i)**2
+     1         + vly_r_dblstar ( i)**2 + vlz_r_dblstar ( i)**2)
+
+      temparr_03 ( i) = prs_tot_0 ( i) - temparr_01 ( i)
+
+      temparr_04 ( i) = ( eng_r_dblstar ( i) - temparr_01 ( i)
+     1                  - temparr_02 ( i))
+     1                * ( gamma_eos_repl ( i) - 1.0)
+
+      IF ( ( temparr_03 ( i) .LE. prsfloor_plus_delta) .OR.
+     1     ( temparr_04 ( i) .LE. prsfloor_plus_delta) .OR.
+     1     ( rho_r_dblstar ( i) .LE. rhofloor_plus_delta) ) THEN
+      make_plain_hll ( i) = 1
+      make_llf ( i) = 1
+      END IF
+
+**********
+
+* Testing "l_dblstar" state for pressure & density positivity.
+
+      temparr_01 ( i) = 0.5 * ( bfxre ( i)**2 + bfy_l_dblstar ( i)**2
+     1                        + bfz_l_dblstar ( i)**2) * one_by_fourpi
+
+      temparr_02 ( i) = 0.5 * rho_l_dblstar ( i) * ( vlx0 ( i)**2
+     1         + vly_l_dblstar ( i)**2 + vlz_l_dblstar ( i)**2)
+
+      temparr_03 ( i) = prs_tot_0 ( i) - temparr_01 ( i)
+
+      temparr_04 ( i) = ( eng_l_dblstar ( i) - temparr_01 ( i)
+     1                  - temparr_02 ( i))
+     1                * ( gamma_eos_remi ( i) - 1.0)
+
+      IF ( ( temparr_03 ( i) .LE. prsfloor_plus_delta) .OR.
+     1     ( temparr_04 ( i) .LE. prsfloor_plus_delta) .OR.
+     1     ( rho_l_dblstar ( i) .LE. rhofloor_plus_delta) ) THEN
+      make_plain_hll ( i) = 1
+      make_llf ( i) = 1
+      END IF
+
+********************
+
+      END IF
+
+********************
+
+      END DO
+* End of testing resolved states for loss of pressure positivity.
+
+*********************************************************************
+*********************************************************************
+
+* Doing HLL with one mean, conserved flux. Usually we get here because
+* the HLLD solution came out with unphysical pressure (or density though
+* that is v.improbable). For HLLD we only need to take care of trnasonic cases.
+* Because of previous explanation, this is just the open fan part of HLL.
+
+      DO i = nriembegin, nriemend
+
+* Start doing HLL as a touch-up.
+      IF ( make_plain_hll ( i) .EQ. 1) THEN
+
+*********************************************************************
+
+      wavespd_ein_l ( i) = eigenval_db ( i, 0, 1)
+
+      wavespd_ein_r ( i) = eigenval_db ( i, 1, 7)
+
+
+      IF ( make_llf ( i) .EQ. 1) THEN
+
+      temparr_01 ( i) = AMAX1 ( ABS ( eigenval_db ( i, 0, 1)),
+     1                          ABS ( eigenval_db ( i, 1, 7)))
+      wavespd_ein_l ( i) = - 1.0 * temparr_01 ( i)
+      wavespd_ein_r ( i) = 1.0 * temparr_01 ( i)
+
+      END IF
+
+********************************
+
+      IF ( ( wavespd_ein_l ( i) .GT. 0.0) .AND.
+     1     ( wavespd_ein_r ( i) .GT. 0.0) ) THEN
+
+* Supersonic to the right.
+
+********************************
+
+      rho0 ( i) = rhoremi ( i)
+      prs0 ( i) = prsremi ( i)
+      eng0 ( i) = zonebdy_conserved ( i, 0, 5)
+
+      vlx0 ( i) = vlxremi ( i)
+      vly0 ( i) = vlyremi ( i)
+      vlz0 ( i) = vlzremi ( i)
+
+      bfy0 ( i) = bfyremi ( i)
+      bfz0 ( i) = bfzremi ( i)
+
+#if ( NFLUID >= 1)
+      specie0 ( 1: NFLUID, i) = specieremi ( 1: NFLUID, i)
+#endif
+
+
+      conserved_re ( i, 1: NFIELD + NFLUID) =
+     1             zonebdy_conserved ( i, 0, 1: NFIELD + NFLUID)
+
+
+      flux_re ( i, 1: NFIELD) = zonebdy_flux ( i, 0, 1: NFIELD)
+
+      flux_re ( i, 8) = 0.0
+
+#if ( NFLUID >= 1)
+      flux_re ( i, NFIELD + 2: NFIELD + NFLUID + 1) =
+     1        zonebdy_flux ( i, 0, NFIELD + 1: NFIELD + NFLUID)
+#endif
+
+      im_done ( i) = 1
+
+********************************
+
+      ELSE IF ( ( wavespd_ein_l ( i) .LT. 0.0) .AND.
+     1          ( wavespd_ein_r ( i) .LT. 0.0) ) THEN
+
+* Supersonic to the left.
+
+********************************
+
+      rho0 ( i) = rhorepl ( i)
+      prs0 ( i) = prsrepl ( i)
+      eng0 ( i) = zonebdy_conserved ( i, 1, 5)
+
+      vlx0 ( i) = vlxrepl ( i)
+      vly0 ( i) = vlyrepl ( i)
+      vlz0 ( i) = vlzrepl ( i)
+
+      bfy0 ( i) = bfyrepl ( i)
+      bfz0 ( i) = bfzrepl ( i)
+
+#if ( NFLUID >= 1)
+      specie0 ( 1: NFLUID, i) = specierepl ( 1: NFLUID, i)
+#endif
+
+
+      conserved_re ( i, 1: NFIELD + NFLUID) =
+     1             zonebdy_conserved ( i, 1, 1: NFIELD + NFLUID)
+
+
+      flux_re ( i, 1: NFIELD) = zonebdy_flux ( i, 1, 1: NFIELD)
+
+      flux_re ( i, 8) = 0.0
+
+#if ( NFLUID >= 1)
+      flux_re ( i, NFIELD + 2: NFIELD + NFLUID + 1) =
+     1        zonebdy_flux ( i, 1, NFIELD + 1: NFIELD + NFLUID)
+#endif
+
+      im_done ( i) = 1
+
+********************************
+
+      ELSE
+
+* Getting here means that the Riemann fan is open.
+
+********************************
+
+      temparr_01 ( i) = 1.0 / ( wavespd_ein_r ( i)
+     1                        - wavespd_ein_l ( i))
+
+      temparr_02 ( i) = wavespd_ein_r ( i) * temparr_01 ( i)
+
+      temparr_03 ( i) = wavespd_ein_l ( i) * temparr_01 ( i)
+
+      temparr_04 ( i) = wavespd_ein_r ( i) * wavespd_ein_l ( i)
+     1                * temparr_01 ( i)
+*
+      flux_re ( i, 1) =
+
+     1       temparr_02 ( i) * flux_ein_l ( i, 1)
+     1     - temparr_03 ( i) * flux_ein_r ( i, 1)
+
+     1     + ( conserved_ein_r ( i, 1) - conserved_ein_l ( i, 1) )
+     1     * temparr_04 ( i)
+*
+      flux_re ( i, 2) =
+
+     1       temparr_02 ( i) * flux_ein_l ( i, 2)
+     1     - temparr_03 ( i) * flux_ein_r ( i, 2)
+
+     1     + ( conserved_ein_r ( i, 2) - conserved_ein_l ( i, 2) )
+     1     * temparr_04 ( i)
+*
+      flux_re ( i, 3) =
+
+     1       temparr_02 ( i) * flux_ein_l ( i, 3)
+     1     - temparr_03 ( i) * flux_ein_r ( i, 3)
+
+     1     + ( conserved_ein_r ( i, 3) - conserved_ein_l ( i, 3) )
+     1     * temparr_04 ( i)
+*
+      flux_re ( i, 4) =
+
+     1       temparr_02 ( i) * flux_ein_l ( i, 4)
+     1     - temparr_03 ( i) * flux_ein_r ( i, 4)
+
+     1     + ( conserved_ein_r ( i, 4) - conserved_ein_l ( i, 4) )
+     1     * temparr_04 ( i)
+*
+      flux_re ( i, 5) =
+
+     1       temparr_02 ( i) * flux_ein_l ( i, 5)
+     1     - temparr_03 ( i) * flux_ein_r ( i, 5)
+
+     1     + ( conserved_ein_r ( i, 5) - conserved_ein_l ( i, 5) )
+     1     * temparr_04 ( i)
+*
+      flux_re ( i, 6) =
+
+     1       temparr_02 ( i) * flux_ein_l ( i, 6)
+     1     - temparr_03 ( i) * flux_ein_r ( i, 6)
+
+     1     + ( conserved_ein_r ( i, 6) - conserved_ein_l ( i, 6) )
+     1     * temparr_04 ( i)
+*
+      flux_re ( i, 7) =
+
+     1       temparr_02 ( i) * flux_ein_l ( i, 7)
+     1     - temparr_03 ( i) * flux_ein_r ( i, 7)
+
+     1     + ( conserved_ein_r ( i, 7) - conserved_ein_l ( i, 7) )
+     1     * temparr_04 ( i)
+
+      flux_re ( i, 8) = 0.0
+*
+#if ( NFLUID >= 1)
+      flux_re ( i, NFIELD + 2: NFIELD + NFLUID + 1) =
+
+     1       temparr_02 ( i)
+     1     * flux_ein_l ( i, NFIELD + 1: NFIELD + NFLUID)
+     1     - temparr_03 ( i)
+     1     * flux_ein_r ( i, NFIELD + 1: NFIELD + NFLUID)
+
+     1     + ( conserved_ein_r ( i, NFIELD + 1: NFIELD + NFLUID)
+     1       - conserved_ein_l ( i, NFIELD + 1: NFIELD + NFLUID) )
+     1     * temparr_04 ( i)
+#endif
+
+
+* Make the conserved variables in a single-state Riemann solver.
+
+      conserved_re ( i, 1) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 1)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 1)
+
+     1  - ( flux_ein_r ( i, 1) - flux_ein_l ( i, 1) )
+     1  * temparr_01 ( i)
+*
+      conserved_re ( i, 2) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 2)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 2)
+
+     1  - ( flux_ein_r ( i, 2) - flux_ein_l ( i, 2) )
+     1  * temparr_01 ( i)
+*
+      conserved_re ( i, 3) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 3)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 3)
+
+     1  - ( flux_ein_r ( i, 3) - flux_ein_l ( i, 3) )
+     1  * temparr_01 ( i)
+*
+      conserved_re ( i, 4) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 4)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 4)
+
+     1  - ( flux_ein_r ( i, 4) - flux_ein_l ( i, 4) )
+     1  * temparr_01 ( i)
+*
+      conserved_re ( i, 5) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 5)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 5)
+
+     1  - ( flux_ein_r ( i, 5) - flux_ein_l ( i, 5) )
+     1  * temparr_01 ( i)
+*
+      conserved_re ( i, 6) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 6)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 6)
+
+     1  - ( flux_ein_r ( i, 6) - flux_ein_l ( i, 6) )
+     1  * temparr_01 ( i)
+*
+      conserved_re ( i, 7) =
+
+     1    temparr_02 ( i) * conserved_ein_r ( i, 7)
+     1  - temparr_03 ( i) * conserved_ein_l ( i, 7)
+
+     1  - ( flux_ein_r ( i, 7) - flux_ein_l ( i, 7) )
+     1  * temparr_01 ( i)
+*
+#if ( NFLUID >= 1)
+      conserved_re ( i, NFIELD + 1: NFIELD + NFLUID) =
+
+     1    temparr_02 ( i)
+     1  * conserved_ein_r ( i, NFIELD + 1: NFIELD + NFLUID)
+     1  - temparr_03 ( i)
+     1  * conserved_ein_l ( i, NFIELD + 1: NFIELD + NFLUID)
+
+     1  - ( flux_ein_r ( i, NFIELD + 1: NFIELD + NFLUID)
+     1    - flux_ein_l ( i, NFIELD + 1: NFIELD + NFLUID) )
+     1  * temparr_01 ( i)
+#endif
+*
+
+* Now make primitive variables from the conserved variables.
+
+      rho0 ( i) = AMAX1 ( conserved_re ( i, 1), rhofloor)
+
+      temparr_05 ( i) = 1.0 / rho0 ( i)
+
+      vlx0 ( i) = conserved_re ( i, 2) * temparr_05 ( i)
+      vly0 ( i) = conserved_re ( i, 3) * temparr_05 ( i)
+      vlz0 ( i) = conserved_re ( i, 4) * temparr_05 ( i)
+
+      bfy0 ( i) = conserved_re ( i, 6)
+      bfz0 ( i) = conserved_re ( i, 7)
+
+      prs0 ( i) = conserved_re ( i, 5)
+     1 - 0.5 * rho0 ( i) * ( vlx0 ( i)**2 + vly0 ( i)**2
+     1                     + vlz0 ( i)**2)
+     1 - 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2 + bfz0 ( i)**2)
+     1 * one_by_fourpi
+      prs0 ( i) = prs0 ( i) * ( gamma_eos ( i) - 1.0)
+      prs0 ( i) = AMAX1 ( prs0 ( i), prsfloor)
+
+#if ( NFLUID >= 1)
+      specie0 ( 1: NFLUID, i) = temparr_05 ( i)
+     1      * conserved_re ( i, NFIELD + 1: NFIELD + NFLUID)
+#endif
+
+      im_done ( i) = 1
+
+      END IF
+
+*********************************************************************
+
+      END IF
+* End of doing HLL as a touch-up.
+
+      END DO
+* End of processing states from an open Riemann problem that need just the
+* HLL formulation without the HLLD variant.
+
+**********************************************************************
+**********************************************************************
+
+! It may be useful to double the dissipation of the magnetic fields,
+! not that it has ever produced wrong answers. For some problems like
+! turbulence, increasing B-field dissipation is especially counter-productive.
+
+! It is also inadvisable for fully supersonic flow, where the one-sided
+! fluxes are indeed just right.
+
+      IF ( double_dissipate_efz .EQ. 1) THEN
+
+      DO i = nriembegin, nriemend
+
+        IF ( ( eigenval_db ( i, 0, 1) .LT. 0.0) .AND.
+     1       ( eigenval_db ( i, 1, 7) .GT. 0.0) ) THEN
+
+        flux_re ( i, 6) = 2.0 * flux_re ( i, 6)
+     1             - 0.5 * ( zonebdy_flux ( i, 0, 6)
+     1                     + zonebdy_flux ( i, 1, 6) )
+
+        END IF
+
+      END DO
+
+      END IF
+
+
+      IF ( double_dissipate_efy .EQ. 1) THEN
+
+      DO i = nriembegin, nriemend
+
+        IF ( ( eigenval_db ( i, 0, 1) .LT. 0.0) .AND.
+     1       ( eigenval_db ( i, 1, 7) .GT. 0.0) ) THEN
+
+        flux_re ( i, 7) = 2.0 * flux_re ( i, 7)
+     1             - 0.5 * ( zonebdy_flux ( i, 0, 7)
+     1                     + zonebdy_flux ( i, 1, 7) )
+
+        END IF
+
+      END DO
+
+      END IF
+
+**********************************************************************
+**********************************************************************
+*
+* Remove the gas + magnetic
+* pressure terms from the momentum flux and store them separately.
+* This somewhat costly computation can be avoided entirely if we don't
+* want or need to split the x-momentum flux into advected and pressure parts.
+
+      IF ( split_prsflux_re .GE. 1) THEN
+
+      DO i = nriembegin, nriemend
+
+      flux_re ( i, 8) = prs0 ( i)
+     1   + 0.5 * ( bfxre ( i)**2 + bfy0 ( i)**2
+     1           + bfz0 ( i)**2) * one_by_fourpi
+
+      flux_re ( i, 2) = flux_re ( i, 2) - flux_re ( i, 8)
+
+      END DO
+* End of do loop for splitting off pressure part of momentum flux.
+
+      END IF
+* End of "split_prsflux_re .EQ. 1" part.
+
+*********************************************************************
+
+* In a continuous system, the electric field is transverse to the B-field.
+* We incorporate this condition at the discrete level here.
+* We take E = - V X B.
+
+      IF ( split_prsflux_re .GE. 2) THEN
+
+      DO i = nriembegin, nriemend
+
+      temparr_01 ( i) = SQRT ( bfxre ( i)**2 + bfy0 ( i)**2
+     1                       + bfz0 ( i)**2)
+
+      IF ( temparr_01 ( i) .GT. smallnum) THEN
+
+      temparr_01 ( i) = 1.0 / temparr_01 ( i)
+
+      n_bx0 ( i) = bfxre ( i) * temparr_01 ( i)
+      n_by0 ( i) = bfy0 ( i) * temparr_01 ( i)
+      n_bz0 ( i) = bfz0 ( i) * temparr_01 ( i)
+
+      efx0 ( i) = vlz0 ( i) * bfy0 ( i) - vly0 ( i) * bfz0 ( i)
+      efy0 ( i) = flux_re ( i, 7)
+      efz0 ( i) = - flux_re ( i, 6)
+
+      temparr_02 ( i) = n_bx0 ( i) * efx0 ( i)
+     1                + n_by0 ( i) * efy0 ( i)
+     1                + n_bz0 ( i) * efz0 ( i)
+
+      efx0 ( i) = efx0 ( i) - temparr_02 ( i) * n_bx0 ( i)
+      efy0 ( i) = efy0 ( i) - temparr_02 ( i) * n_by0 ( i)
+      efz0 ( i) = efz0 ( i) - temparr_02 ( i) * n_bz0 ( i)
+
+      flux_re ( i, 6) = - efz0 ( i)
+      flux_re ( i, 7) = efy0 ( i)
+
+      END IF
+
+      END DO
+* End of do loop for projecting the electric field transverse to the B-field.
+
+      END IF
+* End of "split_prsflux_re .EQ. 2" part.
+
+*********************************************************************
+
+* Check to make sure that all the zones have been done.
+
+      DO i = nriembegin, nriemend
+
+      IF ( im_done ( i) .NE. 1) THEN
+!      WRITE ( 6, *)"MHD_RIEM_HLLD : im_done .NE. 1 at i=",i
+      debug_stop = 1
+      RETURN
+      END IF
+
+      END DO
+
+******************************************************************
+******************************************************************
+
+      RETURN
+
+      END SUBROUTINE MHD_RIEM_HLLD
+
+******************************************************************
+******************************************************************
+
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+      SUBROUTINE MHD_RIEM_HLLEM_PTWISE
+
+     1     ( gamma, smallnum, prsfloor, rhofloor, pi,
+     1     use_approx_eos, split_prsflux_re, iHLLEM_choice,
+
+     1     gasconst,
+     1     cp_specie, molewt_specie, heat_of_formation,
+
+     1        rho_L, rho_R,
+     1        prs_L, prs_R,
+     1        vlx_L, vlx_R,
+     1        vly_L, vly_R,
+     1        vlz_L, vlz_R,
+     1        bfxre,
+     1        bfy_L, bfy_R,
+     1        bfz_L, bfz_R,
+     1        specie_L, specie_R,
+
+     1        gamma_eos_L, gamma_eos_R,
+     1        gamma_soundspeed_L, gamma_soundspeed_R,
+     1        mean_mol_wt_L, mean_mol_wt_R,
+
+     1        blend_HLL,
+
+     1        S_L, S_R, 
+     1        F_L, F_R, U_HLL, F_HLL,
+     1        U_HLLEM, F_HLLEM, dU_HLLEM, dU_HLLEM_Min, dF_HLLEM, 
+
+     1        flux_re, entropy_flux_re)
+
+! ----------------------------------------------------------------------
+
+! Written by : Dinshaw Balsara
+
+! Builds a 1D HLLEM Riemann solver for MHD based on the work of
+! Dumbser & Balsara (2016) JCP and Balsara et al. (2016) JCP.
+
+! Exact preservation of stationary intermediate waves is achieved.
+! This includes contact discontinuities and also Alfven waves.
+
+! ----------------------------------------------------------------------
+
+! Implements the Dumbser and Balsara (2016) JCP paper (DB16) and the
+! Balsara et al (2016) JCP paper (Betal16).
+
+! Inputs :-
+
+! "iHLLEM_choice = 1" gives original Dumbser-Balsara HLLEM; it has
+! slighly less dissipation for fast-moving waves. "iHLLEM_choice = 2" gives
+! Balsara et al HLLEM; it is more stable for strong shocks.
+! Both will capture stationary intermediate waves. "iHLLEM_choice = 0" gives
+! HLL.
+
+! split_prsflux_re : Splits the momentum flux into a pressure part and an
+!                advected part if set to 1. Useful in certain geometries.
+
+! gasconst, cp_specie, molewt_specie, heat_of_formation : Thermodynamic inputs.
+! rho_L, rho_R : left and right state densities, all other flow variables are
+!                similarly also inputs.
+! gamma_eos_L, gamma_eos_R : left and right state ratio of specific heats.
+!                Similarly for other variables.
+! blend_HLL : Gives the amount of blend_HLLing, i.e. reduction in
+!                "dU_HLLEM, dF_HLLEM" required to stabilize strong shocks.
+!                "blend_HLL = 0" means we get full HLLEM flux;
+!                "blend_HLL = 1" means we get HLL flux.
+
+! Outputs :-
+
+! S_L, S_R : Extremal speeds of the HLL Riemann solver.
+! F_L, F_R : Left and right fluxes, used as input for HLL RS.
+! U_HLL, F_HLL : State and flux coming out of HLL RS.
+! U_HLLEM, F_HLLEM : Final HLLEM state and flux that overlies the time axis
+!            in the Riemann fan.
+! dU_HLLEM, dF_HLLEM : These are the terms that have tobe suitably added
+!            to the HLL state and flux in order to get the HLLEM state and flux.
+! dU_HLLEM_Min : "dU_HLLEM" has a compression built in. But we cannot use that
+!            to build the linear profile in the multid RS (because it would be
+!            a double counting of the slope. "dU_HLLEM_Min" removes the
+!            compression which would have doubled the steepening of the slopes.
+! flux_re : Seven component flux, with pressure split, specific to certain
+!            my MHD code.
+! entropy_flux_re : Flux for entropy variable.
+
+! ----------------------------------------------------------------------
+
+      IMPLICIT NONE
+
+      INTEGER use_approx_eos, split_prsflux_re, iHLLEM_choice
+
+      REAL gamma, smallnum, prsfloor, rhofloor, pi, gasconst,
+
+     1     cp_specie ( 0 : NFLUID), molewt_specie ( 0 : NFLUID),
+     1     heat_of_formation ( 0 : NFLUID),
+
+     1     rho_L, rho_R, prs_L, prs_R,
+     1     vlx_L, vlx_R, vly_L, vly_R, vlz_L, vlz_R,
+
+     1     bfxre, bfy_L, bfy_R, bfz_L, bfz_R,
+
+     1     mean_mol_wt_L, gamma_eos_L, gamma_soundspeed_L,
+     1     mean_mol_wt_R, gamma_eos_R, gamma_soundspeed_R,
+
+     1     blend_HLL, S_L, S_R, entropy_flux_re
+
+      REAL, DIMENSION ( 0: NFLUID) :: specie_L, specie_R
+
+      REAL, DIMENSION ( NFIELD + 1 + NFLUID) :: flux_re,
+     1     F_L, F_R, U_HLL, F_HLL,
+     1     U_HLLEM, F_HLLEM, dU_HLLEM, dU_HLLEM_Min, dF_HLLEM
+
+! ----------------------------------------------------------------------
+
+! Variables past this point are not used in the subroutine interface.
+
+      INTEGER i, j, iprim, idirection, debug_stop
+
+      REAL fourpi, ob_4pi, ob_8pi,
+     1     rhofloor_plus_delta, prsfloor_plus_delta,
+
+     1     eng_L, eng_R, v2_L, v2_R, b2_L, b2_R, vdb_L, vdb_R,
+     1     total_enthalpy_L, total_enthalpy_R,
+
+     1     entropy_L, entropy_R, entropy_flux_L, entropy_flux_R,
+
+     1     gamma_eos, gamma_soundspeed, mean_mol_wt,
+     1     temp_01, temp_02, temp_03,
+     1     rhobar, prsbar, vlxbar, vlybar, vlzbar, total_enthalpybar,
+     1     bfxbar, bfybar, bfzbar, xbar, eng, temperature,
+
+     1     ob_4pi_rho, va_x, c_s, v_a, v_f, v_s
+
+      REAL, DIMENSION ( 0: NFLUID) :: speciebar
+
+      REAL, DIMENSION ( NFIELD + 1 + NFLUID) :: U_L, U_R,
+     1     Del_U, eigenval, delta, eigenwt
+
+      REAL, DIMENSION ( NFIELD + 1 + NFLUID, NFIELD + 1 + NFLUID) ::
+     1     lf_eigenvec, rt_eigenvec
+
+! ----------------------------------------------------------------------
+
+      fourpi = 4.0 * pi
+      ob_4pi = 1.0 / fourpi
+      ob_8pi = 0.5 * ob_4pi
+
+      IF ( NFIELD .NE. 7) THEN
+      WRITE ( 6, *)"MHD_RIEM_HLLEM_PTWISE : NFIELD .NE. 7", NFIELD, 7
+      STOP
+      END IF
+
+! ----------
+! Because floor values of density and pressure have already been taken,
+! we set a bottom value that is a little above that floor.
+
+      rhofloor_plus_delta = 1.000001 * rhofloor
+      prsfloor_plus_delta = 1.000001 * prsfloor
+
+      rho_L = AMAX1 ( rho_L, rhofloor)
+      rho_R = AMAX1 ( rho_R, rhofloor)
+
+      prs_L = AMAX1 ( prs_L, prsfloor)
+      prs_R = AMAX1 ( prs_R, prsfloor)
+
+! ----------
+! Relying on approximate EOS's here to make thermal energy density.
+
+      eng_L = prs_L / ( gamma_eos_L - 1.0)
+      eng_R = prs_R / ( gamma_eos_R - 1.0)
+
+! ----------
+! Make "total_enthalpy_L" and "total_enthalpy_R". These are
+! useful in making Roe-averages.
+
+      v2_L = vlx_L**2 + vly_L**2 + vlz_L**2
+      b2_L = bfxre**2 + bfy_L**2 + bfz_L**2
+      vdb_L = vlx_L * bfxre + vly_L * bfy_L + vlz_L * bfz_L
+
+      total_enthalpy_L = ( eng_L + prs_L
+     1    + 0.5 * rho_L * v2_L + ob_4pi * b2_L ) / rho_L
+
+! -----
+
+      v2_R = vlx_R**2 + vly_R**2 + vlz_R**2
+      b2_R = bfxre**2 + bfy_R**2 + bfz_R**2
+      vdb_R = vlx_R * bfxre + vly_R * bfy_R + vlz_R * bfz_R
+
+      total_enthalpy_R = ( eng_R + prs_R
+     1    + 0.5 * rho_R * v2_R + ob_4pi * b2_R ) / rho_R
+
+! ------------------------------
+! Make "U_L, U_R".
+
+      U_L ( 1) = rho_L
+      U_L ( 2) = rho_L * vlx_L
+      U_L ( 3) = rho_L * vly_L
+      U_L ( 4) = rho_L * vlz_L
+      U_L ( 5) = eng_L + 0.5 * ( rho_L * v2_L + ob_4pi * b2_L )
+      U_L ( 6) = bfxre
+      U_L ( 7) = bfy_L
+      U_L ( 8) = bfz_L
+#if ( NFLUID >= 1)
+      U_L ( 9: NFIELD + 1 + NFLUID) = rho_L * specie_L ( 1:  NFLUID)
+#endif
+
+! ----------
+
+      U_R ( 1) = rho_R
+      U_R ( 2) = rho_R * vlx_R
+      U_R ( 3) = rho_R * vly_R
+      U_R ( 4) = rho_R * vlz_R
+      U_R ( 5) = eng_R + 0.5 * ( rho_R * v2_R + ob_4pi * b2_R )
+      U_R ( 6) = bfxre
+      U_R ( 7) = bfy_R
+      U_R ( 8) = bfz_R
+#if ( NFLUID >= 1)
+      U_R ( 9: NFIELD + 1 + NFLUID) = rho_R * specie_R ( 1:  NFLUID)
+#endif
+
+! ------------------------------
+! Make "F_L, F_R".
+
+      F_L ( :) = vlx_L * U_L ( :)
+
+
+      F_L ( 2) = F_L ( 2) + prs_L
+     1         + 0.5 * ( - bfxre**2 + bfy_L**2 + bfz_L**2) * ob_4pi
+
+      F_L ( 3) = F_L ( 3) - bfxre * bfy_L * ob_4pi
+
+      F_L ( 4) = F_L ( 4) - bfxre * bfz_L * ob_4pi
+
+      F_L ( 5) = F_L ( 5) + vlx_L * ( prs_L + 0.5 * b2_L * ob_4pi )
+     1         - bfxre * vdb_L * ob_4pi
+
+      F_L ( 6) = 0.0
+
+      F_L ( 7) = F_L ( 7) - bfxre * vly_L
+
+      F_L ( 8) = F_L ( 8) - bfxre * vlz_L
+
+! ----------
+
+      F_R ( :) = vlx_R * U_R ( :)
+
+
+      F_R ( 2) = F_R ( 2) + prs_R
+     1         + 0.5 * ( - bfxre**2 + bfy_R**2 + bfz_R**2) * ob_4pi
+
+      F_R ( 3) = F_R ( 3) - bfxre * bfy_R * ob_4pi
+
+      F_R ( 4) = F_R ( 4) - bfxre * bfz_R * ob_4pi
+
+      F_R ( 5) = F_R ( 5) + vlx_R * ( prs_R + 0.5 * b2_R * ob_4pi )
+     1         - bfxre * vdb_R * ob_4pi
+
+      F_R ( 6) = 0.0
+
+      F_R ( 7) = F_R ( 7) - bfxre * vly_R
+
+      F_R ( 8) = F_R ( 8) - bfxre * vlz_R
+
+! ------------------------------
+! Make variables that are used for obtaining an entropy flux.
+
+      entropy_L = prs_L / rho_L**( gamma_soundspeed_L - 1.0)
+
+      entropy_R = prs_R / rho_R**( gamma_soundspeed_R - 1.0)
+
+      entropy_flux_L = entropy_L * vlx_L
+
+      entropy_flux_R = entropy_R * vlx_R
+
+! ----------------------------------------------------------------------
+! Here we use Roe averaging and make only one call to the
+! eigenvector subroutine. The "eng, temperature" etc. that we make here
+! can even serve as good initial guesses for an exact EOS.
+
+      gamma_eos = 0.5 * ( gamma_eos_L + gamma_eos_R)
+      gamma_soundspeed = 0.5 * ( gamma_soundspeed_L
+     1                         + gamma_soundspeed_R)
+      mean_mol_wt = 0.5 * ( mean_mol_wt_L + mean_mol_wt_R)
+
+! ----------
+
+      temp_01 = SQRT ( rho_R / rho_L)
+      temp_02 = 1.0 / ( 1.0 + temp_01)
+
+      rhobar = SQRT ( rho_L * rho_R)
+
+      vlxbar = ( vlx_L + vlx_R * temp_01) * temp_02
+      vlybar = ( vly_L + vly_R * temp_01) * temp_02
+      vlzbar = ( vlz_L + vlz_R * temp_01) * temp_02
+
+      total_enthalpybar = ( total_enthalpy_L
+     1                    + total_enthalpy_R * temp_01) * temp_02
+
+      bfxbar = bfxre
+      bfybar = ( bfy_L * temp_01 + bfy_R) * temp_02
+      bfzbar = ( bfz_L * temp_01 + bfz_R) * temp_02
+
+      xbar = 0.5 * ( ( bfy_R - bfy_L)**2 + ( bfz_R - bfz_L)**2)
+     1     / ( SQRT ( rho_L) + SQRT ( rho_R) )**2
+
+      prsbar = total_enthalpybar
+     1       - 0.5 * ( vlxbar**2 + vlybar**2 + vlzbar**2)
+     1       - ( bfxre**2 + bfybar**2 + bfzbar**2) / ( fourpi * rhobar)
+      prsbar = ( gamma_eos - 1.0) * rhobar * prsbar / gamma_eos
+      prsbar = prsbar - ( gamma_eos - 2.0) * rhobar * xbar
+     1                / ( fourpi * gamma_eos )
+      prsbar = AMAX1 ( prsbar, prsfloor)
+
+! ----------
+! Use the option of using arithmetic averages if needed.
+
+      IF ( ( rhobar .LE. rhofloor_plus_delta) .OR.
+     1     ( prsbar .LE. prsfloor_plus_delta) ) THEN
+
+      rhobar = 0.5 * ( rho_L + rho_R)
+      prsbar = 0.5 * ( prs_L + prs_R)
+
+      vlxbar = 0.5 * ( vlx_L + vlx_R)
+      vlybar = 0.5 * ( vly_L + vly_R)
+      vlzbar = 0.5 * ( vlz_L + vlz_R)
+
+      bfxbar = bfxre
+      bfybar = 0.5 * ( bfy_L + bfy_R)
+      bfzbar = 0.5 * ( bfz_L + bfz_R)
+
+      xbar = 0.0
+
+      END IF
+
+      eng = prsbar / ( gamma_eos - 1.0)
+      temperature = prsbar * mean_mol_wt / ( gasconst * rhobar)
+
+! ----------
+
+#if ( NFLUID >= 1)
+      temp_01 = SQRT ( rho_R / rho_L)
+      temp_02 = 1.0 / ( 1.0 + temp_01)
+
+      speciebar ( 1: NFLUID) = temp_02 * ( specie_L ( 1: NFLUID)
+     1                       + specie_R ( 1: NFLUID) * temp_01)
+#endif
+
+! ----------------------------------------------------------------------
+! Make extremal speeds, "S_L, S_R", using the Roe averaged state.
+
+      ob_4pi_rho = 1.0 / ( fourpi * rhobar )
+
+      va_x = bfxre**2 * ob_4pi_rho
+      va_x = SQRT ( va_x )
+
+      c_s = gamma_soundspeed * prsbar / rhobar
+      c_s = SQRT ( c_s )
+
+      v_a = ( bfxre**2 + bfybar**2 + bfzbar**2) * ob_4pi_rho
+      v_a = SQRT ( v_a )
+
+      temp_01 = v_a**2 + c_s**2
+      temp_02 = temp_01**2 - 4.0 * va_x**2 * c_s**2
+      temp_02 = AMAX1 ( temp_02, 0.0)
+      temp_02 = SQRT ( temp_02)
+
+      v_f = 0.5 * ( temp_01 + temp_02)
+      v_f = SQRT ( v_f )
+
+!      v_s = 0.5 * ( temp_01 - temp_02)
+!      v_s = AMAX1 ( v_s, 0.0)
+!      v_s = SQRT ( v_s )
+
+! ----------
+
+      S_L = vlxbar - v_f
+      S_R = vlxbar + v_f
+
+! ----------------------------------------------------------------------
+! Expand the extremal speeds, "S_L, S_R", using "rho_L" etc.
+
+      ob_4pi_rho = 1.0 / ( fourpi * rho_L )
+
+      va_x = bfxre**2 * ob_4pi_rho
+      va_x = SQRT ( va_x )
+
+      c_s = gamma_soundspeed_L * prs_L / rho_L
+      c_s = SQRT ( c_s )
+
+      v_a = ( bfxre**2 + bfy_L**2 + bfz_L**2) * ob_4pi_rho
+      v_a = SQRT ( v_a )
+
+      temp_01 = v_a**2 + c_s**2
+      temp_02 = temp_01**2 - 4.0 * va_x**2 * c_s**2
+      temp_02 = AMAX1 ( temp_02, 0.0)
+      temp_02 = SQRT ( temp_02)
+
+      v_f = 0.5 * ( temp_01 + temp_02)
+      v_f = SQRT ( v_f )
+
+!      v_s = 0.5 * ( temp_01 - temp_02)
+!      v_s = AMAX1 ( v_s, 0.0)
+!      v_s = SQRT ( v_s )
+
+! ----------
+
+      S_L = AMIN1 ( S_L, vlx_L - v_f)
+! While it is ok to uncomment the next line, in principle, the left state
+! does not contribute to "S_R".
+!      S_R = AMAX1 ( S_R, vlx_L + v_f)
+
+! ----------------------------------------------------------------------
+! Expand the extremal speeds, "S_L, S_R", using "rho_R" etc.
+
+      ob_4pi_rho = 1.0 / ( fourpi * rho_R )
+
+      va_x = bfxre**2 * ob_4pi_rho
+      va_x = SQRT ( va_x )
+
+      c_s = gamma_soundspeed_R * prs_R / rho_R
+      c_s = SQRT ( c_s )
+
+      v_a = ( bfxre**2 + bfy_R**2 + bfz_R**2) * ob_4pi_rho
+      v_a = SQRT ( v_a )
+
+      temp_01 = v_a**2 + c_s**2
+      temp_02 = temp_01**2 - 4.0 * va_x**2 * c_s**2
+      temp_02 = AMAX1 ( temp_02, 0.0)
+      temp_02 = SQRT ( temp_02)
+
+      v_f = 0.5 * ( temp_01 + temp_02)
+      v_f = SQRT ( v_f )
+
+!      v_s = 0.5 * ( temp_01 - temp_02)
+!      v_s = AMAX1 ( v_s, 0.0)
+!      v_s = SQRT ( v_s )
+
+! ----------
+
+! While it is ok to uncomment the next line, in principle, the right state
+! does not contribute to "S_L".
+!      S_L = AMIN1 ( S_L, vlx_R - v_f)
+      S_R = AMAX1 ( S_R, vlx_R + v_f)
+
+! ----------------------------------------------------------------------
+! Now that "S_L, S_R" and "U_L, U_R, F_L, F_R" are built, we
+! can build the HLL state and flux "U_HLL, F_HLL". Do similarly for
+! entropy flux. The entropy flux does not take HLLEM-based contributions,
+! so it is fully evaluated here.
+
+! "U_HLLEM, F_HLLEM", and everything that contributes to them, are also
+! set up here for the supersonic cases. For the subsonic cases, we
+! do that later.
+
+      IF ( S_L >= 0.0) THEN
+
+        U_HLL ( :) = U_L ( :)
+        F_HLL ( :) = F_L ( :)
+        entropy_flux_re = entropy_flux_L
+
+        U_HLLEM ( :) = U_L ( :)
+        F_HLLEM ( :) = F_L ( :)
+
+        dU_HLLEM ( :) = 0.0
+        dU_HLLEM_Min ( :) = 0.0
+        dF_HLLEM ( :) = 0.0
+
+        delta ( :) = 0.0
+        eigenwt ( :) = 0.0
+
+      ELSE IF ( S_R <= 0.0) THEN
+
+        U_HLL ( :) = U_R ( :)
+        F_HLL ( :) = F_R ( :)
+        entropy_flux_re = entropy_flux_R
+
+        U_HLLEM ( :) = U_R ( :)
+        F_HLLEM ( :) = F_R ( :)
+
+        dU_HLLEM ( :) = 0.0
+        dU_HLLEM_Min ( :) = 0.0
+        dF_HLLEM ( :) = 0.0
+
+        delta ( :) = 0.0
+        eigenwt ( :) = 0.0
+
+      ELSE
+
+        temp_01 = 1.0 / ( S_R - S_L)
+        temp_02 = S_R * S_L * temp_01
+
+        U_HLL ( :) = ( S_R * U_R ( :) - S_L * U_L ( :)) * temp_01
+     1             - ( F_R ( :) - F_L ( :)) * temp_01
+
+        F_HLL ( :) = ( S_R * F_L ( :) - S_L * F_R ( :)) * temp_01
+     1             + ( U_R ( :) - U_L ( :)) * temp_02
+
+        entropy_flux_re = ( S_R * entropy_flux_L
+     1                    - S_L * entropy_flux_R) * temp_01
+     1                  + ( entropy_R - entropy_L) * temp_02
+
+        U_HLLEM ( :) = U_HLL ( :)  ! Ensure that "U_HLLEM ( :)" always initialized.
+        F_HLLEM ( :) = F_HLL ( :)  ! Ensure that "F_HLLEM ( :)" always initialized.
+
+        dU_HLLEM ( :) = 0.0
+        dU_HLLEM_Min ( :) = 0.0
+        dF_HLLEM ( :) = 0.0
+
+        delta ( :) = 0.0
+        eigenwt ( :) = 0.0
+
+      END IF
+
+! ----------------------------------------------------------------------
+! Add the HLLEM parts to the pre-existing HLL RS. Do this only for
+! the subsonic case.
+
+      IF ( ( S_L < 0.0) .AND. ( S_R > 0.0) .AND.
+     1     ( iHLLEM_choice > 0) ) THEN
+
+! ------------------------------------------------------------
+! First call "EIGENVECMHD_PTWISE_LINDEG". Load up "eigenval,
+! lf_eigenvec, rt_eigenvec".
+
+      iprim = 0  ! Need eigenvectors in conserved variables
+      idirection = 1  ! in the x-direction.
+      debug_stop = 0
+
+#if ( COMPLETE_EIGENSYSTEM == 0)
+      CALL EIGENVECMHD_PTWISE_LINDEG
+#else
+      CALL EIGENVECMHD_PTWISE_8
+#endif
+
+     1             ( iprim, idirection,
+
+     1               gamma, smallnum, prsfloor, rhofloor, pi,
+     1               debug_stop,
+
+     1               gasconst,
+
+     1               rhobar, prsbar,
+     1               vlxbar, vlybar, vlzbar,
+     1               bfxbar, bfybar, bfzbar, xbar,
+     1               speciebar,
+
+     1               eigenval,
+     1               lf_eigenvec, rt_eigenvec )
+
+! ------------------------------------------------------------
+! Now build "delta, eigenwt" for each of the waves of interest.
+! The contributions from other waves are zeroed.
+
+      delta ( :) = 0.0
+      eigenwt ( :) = 0.0
+
+      Del_U ( :) = U_R ( :) - U_L ( :)
+
+! ------------------------------
+
+      DO j = 1, NFIELD + 1 + NFLUID
+
+! ----------
+
+#if ( COMPLETE_EIGENSYSTEM == 0)
+
+! Entropy wave and Alfven waves only.
+        IF ( ( j == 2) .OR. ( j == 4) .OR. ( j == 6) ) THEN
+
+#elif ( COMPLETE_EIGENSYSTEM == 1)
+
+! Entropy wave, Alfven waves and slow magnetosonic waves.
+! The Alfven + slow msonics carry most of the shear in the flow.
+        IF ( ( j >= 2) .AND. ( j <= 6) ) THEN
+
+#else
+
+! Fast magnetosonic waves also included. The fast msonics carry most of the
+! pressure jump.
+        IF ( ( j >= 1) .AND. ( j <= 7) ) THEN
+
+#endif
+
+! ----------
+
+        eigenval ( j) = AMIN1 ( AMAX1 ( eigenval ( j), S_L), S_R)
+
+        IF ( iHLLEM_choice == 1) THEN
+
+! Eqn. (28) of DB16.
+
+          delta ( j) = 1.0
+     1               - AMIN1 ( eigenval ( j), 0.0) / ( S_L - smallnum)
+     1               - AMAX1 ( eigenval ( j), 0.0) / ( S_R + smallnum)
+
+        ELSE
+
+! Eqn. (2.11) of Betal16.
+
+          temp_01 = - 3.0 * S_R * S_L / ( S_R - S_L)**2
+
+          temp_02 = ( S_R - S_L)**2 / 3.0 - eigenval ( j) * ( S_R + S_L)
+
+          temp_03 = S_R * AMIN1 ( eigenval ( j), 0.0)
+     1            + S_L * AMAX1 ( eigenval ( j), 0.0) - S_R * S_L
+
+          delta ( j) = temp_01
+
+          IF ( temp_02 > 1.0e-6 * ( S_R - S_L)**2 ) delta ( j) =
+     1         AMAX1 ( 0.0, AMIN1 ( delta ( j), temp_03 / temp_02) )
+
+        END IF
+
+        delta ( j) = delta ( j) * ( 1.0 - blend_HLL)
+
+! ----------
+
+        DO i = 1, NFIELD + 1 + NFLUID
+
+        eigenwt ( j) = eigenwt ( j)
+     1               + lf_eigenvec ( j, i) * Del_U ( i)
+
+        END DO  ! End of "DO i = 1, NFIELD + 1 + NFLUID" loop.
+
+! ----------
+
+        END IF  ! End of "IF ( ( j == 2) .OR. ( j == 4) .OR. ( j == 6) )".
+
+      END DO  ! End of "DO j = 1, NFIELD + 1 + NFLUID" loop.
+
+! ------------------------------------------------------------
+! Lastly, build "dU_HLLEM, dF_HLLEM". If the linear profile from "dU_HLLEM"
+! gives physical states, add in the contributions to the fluxes.
+
+      dU_HLLEM ( :) = 0.0
+      dU_HLLEM_Min ( :) = 0.0
+      dF_HLLEM ( :) = 0.0
+
+! ------------------------------
+
+      DO j = 1, NFIELD + 1 + NFLUID
+
+! ----------
+
+#if ( COMPLETE_EIGENSYSTEM == 0)
+
+! Entropy wave and Alfven waves only.
+        IF ( ( j == 2) .OR. ( j == 4) .OR. ( j == 6) ) THEN
+
+#elif ( COMPLETE_EIGENSYSTEM == 1)
+
+! Entropy wave, Alfven waves and slow magnetosonic waves. The Alfven + slow msonics
+! cary most of the shear in the flow.
+        IF ( ( j >= 2) .AND. ( j <= 6) ) THEN
+
+#else
+
+! Fast magnetosonic waves also included. The fast msonics carry most of the
+! pressure jump.
+        IF ( ( j >= 1) .AND. ( j <= 7) ) THEN
+
+#endif
+
+! ----------
+
+! Eqn. (2.8) of Betal16.
+        temp_01 = 2.0 * delta ( j) * eigenwt ( j)
+
+        IF ( iHLLEM_choice == 1) THEN
+
+! Eqn. (30) of DB16.
+          temp_02 = - eigenwt ( j) * delta ( j) * S_R * S_L
+     1            / ( S_R - S_L)
+
+! "dU_HLLEM_Min" gets a contribution that is bounded by unity times "eigenwt".
+
+          temp_03 = eigenwt ( j) * delta ( j)
+
+! Another option is "eigenwt" itself. This is the steepest profile that will be physical
+! when it comes to evaluating transverse fluxes.  With this profile the multid HLLEM
+! will, in principle, revert to the 1D HLLEM for mesh-aligned flows.
+
+!          temp_03 = eigenwt ( j)
+
+        ELSE
+
+! Eqn. (2.9b) of Betal16.
+          temp_02 = 2.0 * eigenwt ( j) * delta ( j) * eigenval ( j)
+
+! "dU_HLLEM_Min" gets a contribution that is bounded by unity times "eigenwt".
+
+          temp_03 = eigenwt ( j) * 4.0 * delta ( j) / 3.0
+
+! Another option is "eigenwt" itself. This is the steepest profile that will be physical
+! when it comes to evaluating transverse fluxes.  With this profile the multid HLLEM
+! will, in principle, revert to the 1D HLLEM for mesh-aligned flows.
+
+!          temp_03 = eigenwt ( j)
+
+        END IF
+
+! ----------
+
+        dU_HLLEM ( :) = dU_HLLEM ( :) + temp_01 * rt_eigenvec ( :, j)
+
+        dU_HLLEM_Min ( :) = dU_HLLEM_Min ( :)
+     1                                + temp_03 * rt_eigenvec ( :, j)
+
+        dF_HLLEM ( :) = dF_HLLEM ( :) + temp_02 * rt_eigenvec ( :, j)
+
+! ----------
+
+        END IF  ! End of "IF ( ( j == 2) .OR. ( j == 4) .OR. ( j == 6) )".
+
+      END DO  ! End of "DO j = 1, NFIELD + 1 + NFLUID" loop.
+
+! ------------------------------------------------------------
+
+! Density and pressure from HLL state should be bounded by densities and
+! pressures from either side.
+
+      rhobar = AMAX1 ( U_HLL ( 1), rhofloor)
+      temp_01 = 1.0 / rhobar
+
+      vlxbar = U_HLL ( 2) * temp_01
+      vlybar = U_HLL ( 3) * temp_01
+      vlzbar = U_HLL ( 4) * temp_01
+
+      bfxbar = U_HLL ( 6)
+      bfybar = U_HLL ( 7)
+      bfzbar = U_HLL ( 8)
+
+      prsbar = U_HLL ( 5)
+     1       - 0.5 * rhobar * ( vlxbar**2 + vlybar**2 + vlzbar**2)
+     1             - ob_8pi * ( bfxbar**2 + bfybar**2 + bfzbar**2)
+
+      prsbar = AMAX1 ( prsbar * ( gamma_eos - 1.0), prsfloor)
+
+      IF ( ( rhobar < 0.9 * AMIN1 ( rho_L, rho_R) ) .OR.
+     1     ( rhobar > 1.1 * AMAX1 ( rho_L, rho_R) ) .OR.
+     1     ( prsbar < 0.9 * AMIN1 ( prs_L, prs_R) ) .OR.
+     1     ( prsbar > 1.1 * AMAX1 ( prs_L, prs_R) ) ) THEN
+
+        dU_HLLEM ( :) = 0.0
+        dF_HLLEM ( :) = 0.0
+
+      END IF
+
+! ------------------------------
+! Examine right state within the Riemann fan for positivity.
+
+      Del_U ( :) = U_HLL ( :) + 0.5 * dU_HLLEM ( :)
+
+
+      rhobar = AMAX1 ( Del_U ( 1), rhofloor)
+      temp_01 = 1.0 / rhobar
+
+      vlxbar = Del_U ( 2) * temp_01
+      vlybar = Del_U ( 3) * temp_01
+      vlzbar = Del_U ( 4) * temp_01
+
+      bfxbar = Del_U ( 6)
+      bfybar = Del_U ( 7)
+      bfzbar = Del_U ( 8)
+
+      prsbar = Del_U ( 5)
+     1       - 0.5 * rhobar * ( vlxbar**2 + vlybar**2 + vlzbar**2)
+     1             - ob_8pi * ( bfxbar**2 + bfybar**2 + bfzbar**2)
+
+      prsbar = AMAX1 ( prsbar * ( gamma_eos - 1.0), prsfloor)
+
+      IF ( ( rhobar <= rhofloor_plus_delta) .OR.
+     1     ( prsbar <= prsfloor_plus_delta) ) THEN
+
+        dU_HLLEM ( :) = 0.0
+        dF_HLLEM ( :) = 0.0
+
+      END IF
+
+! ------------------------------
+! Examine left state within the Riemann fan for positivity.
+
+      Del_U ( :) = U_HLL ( :) - 0.5 * dU_HLLEM ( :)
+
+
+      rhobar = AMAX1 ( Del_U ( 1), rhofloor)
+      temp_01 = 1.0 / rhobar
+
+      vlxbar = Del_U ( 2) * temp_01
+      vlybar = Del_U ( 3) * temp_01
+      vlzbar = Del_U ( 4) * temp_01
+
+      bfxbar = Del_U ( 6)
+      bfybar = Del_U ( 7)
+      bfzbar = Del_U ( 8)
+
+      prsbar = Del_U ( 5)
+     1       - 0.5 * rhobar * ( vlxbar**2 + vlybar**2 + vlzbar**2)
+     1             - ob_8pi * ( bfxbar**2 + bfybar**2 + bfzbar**2)
+
+      prsbar = AMAX1 ( prsbar * ( gamma_eos - 1.0), prsfloor)
+
+      IF ( ( rhobar <= rhofloor_plus_delta) .OR.
+     1     ( prsbar <= prsfloor_plus_delta) ) THEN
+
+        dU_HLLEM ( :) = 0.0
+        dF_HLLEM ( :) = 0.0
+
+      END IF
+
+! ------------------------------
+! Add in contributions from "dU_HLLEM" and "dF_HLLEM" to the state
+! and fluxes. This gives us "U_HLLEM, F_HLLEM".
+
+        temp_01 = - 0.5 * ( S_R + S_L) / ( S_R - S_L)
+
+! Eqns. (2.1) and (2.3) of Betal16.
+        U_HLLEM ( :) = U_HLL ( :) + temp_01 * dU_HLLEM ( :)
+
+! ----------
+
+        IF ( iHLLEM_choice == 1) THEN
+
+! Eqn. (30) of DB16.
+          F_HLLEM ( :) = F_HLL ( :) + dF_HLLEM ( :)
+
+        ELSE
+
+! Eqn. (2.9b) of Betal16.
+          temp_02 = ( S_R - S_L) / 6.0
+
+          F_HLLEM ( :) = F_HLL ( :) + temp_02 * dU_HLLEM ( :)
+     1                 + temp_01 * dF_HLLEM ( :)
+
+        END IF
+
+! ------------------------------------------------------------
+
+      END IF  ! End of "IF ( ( S_L < 0.0) .AND. ( S_R > 0.0) )" loop.
+
+! ----------------------------------------------------------------------
+! Wrap up and exit subroutine.
+
+      flux_re ( :) = F_HLLEM ( :)
+
+      flux_re ( 6) = F_HLLEM ( 7)
+      flux_re ( 7) = F_HLLEM ( 8)
+      flux_re ( 8) = 0.0
+
+! ----------
+! Also split the momentum flux_re into advected and pressure parts and
+! store the pressure part separately. Do this only if it is called for.
+
+      IF ( split_prsflux_re .EQ. 1) THEN
+
+      rhobar = AMAX1 ( U_HLLEM ( 1), rhofloor)
+      temp_01 = 1.0 / rhobar
+
+      vlxbar = U_HLLEM ( 2) * temp_01
+      vlybar = U_HLLEM ( 3) * temp_01
+      vlzbar = U_HLLEM ( 4) * temp_01
+
+      bfxbar = U_HLLEM ( 6)
+      bfybar = U_HLLEM ( 7)
+      bfzbar = U_HLLEM ( 8)
+
+      prsbar = U_HLLEM ( 5)
+     1       - 0.5 * rhobar * ( vlxbar**2 + vlybar**2 + vlzbar**2)
+     1             - ob_8pi * ( bfxbar**2 + bfybar**2 + bfzbar**2)
+
+      prsbar = AMAX1 ( prsbar * ( gamma_eos - 1.0), prsfloor)
+
+! This is the part of the x-momentum flux that acts like a pressure.
+      flux_re ( 8) = flux_re ( 2) - rhobar * vlxbar**2
+     1             + ob_4pi * bfxre**2
+
+      flux_re ( 2) = flux_re ( 2) - flux_re ( 8)
+
+      END IF
+
+! ----------------------------------------------------------------------
+
+      END SUBROUTINE MHD_RIEM_HLLEM_PTWISE
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+      SUBROUTINE MHD_RIEM_HLLEM_DB
+
+     1   ( nriembegin, nriemend,
+
+     1     double_dissipate_efz, double_dissipate_efy,
+
+     1     gamma, smallnum, prsfloor, rhofloor, pi, fracdiff,
+     1     ientropyfix, iprimitive, use_approx_eos,
+     1     split_prsflux_re, divratio_einfeldt_rs, debug_stop,
+
+     1     gasconst,
+     1     cp_specie, molewt_specie, heat_of_formation,
+
+     1        rhoremi, rhorepl,
+     1        prsremi, prsrepl,
+     1        vlxremi, vlxrepl,
+     1        vlyremi, vlyrepl,
+     1        vlzremi, vlzrepl,
+     1        bfxre,
+     1        bfyremi, bfyrepl,
+     1        bfzremi, bfzrepl,
+     1        specieremi, specierepl,
+
+     1        gamma_eos_remi, gamma_eos_repl,
+     1        gamma_soundspeed_remi, gamma_soundspeed_repl,
+     1        mean_mol_wt_remi, mean_mol_wt_repl,
+
+     1        msonic_arr, divvel_arr,
+
+     1        zonebdy_conserved, zonebdy_flux,
+
+     1     eigenval_re, lf_eigenvec_re, rt_eigenvec_re, eigenwt_re,
+     1     conserved_re, flux_re, entropy_flux_re,
+
+     1     rho0, prs0, vlx0, vly0, vlz0, bfy0, bfz0, specie0,
+     1     do_ein )
+
+! ----------------------------------------------------------------------
+
+! Written by : Dinshaw S. Balsara
+
+! Packages the pointwise HLLEM RS in a form that works with the
+! dimension-by-dimension Riemann solver's interface. This is just
+! useful for testing.
+
+! ----------------------------------------------------------------------
+
+      IMPLICIT NONE
+
+      EXTERNAL RHO_PRS_IN_ENG_T_GAMA_OUT
+
+! ----------------------------------------------------------------------
+
+      INTEGER :: nriembegin, nriemend, 
+     1        double_dissipate_efz, double_dissipate_efy,
+     1        ientropyfix, iprimitive, use_approx_eos,
+     1        split_prsflux_re
+
+      INTEGER :: debug_stop
+
+      REAL :: gamma, smallnum, prsfloor, rhofloor, 
+     1     pi, fracdiff, gasconst, divratio_einfeldt_rs
+
+      REAL, DIMENSION ( 0 : NFLUID) ::
+     1      cp_specie, molewt_specie, heat_of_formation
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     rhoremi, rhorepl, prsremi, prsrepl,
+
+     1     vlxremi, vlxrepl, vlyremi, vlyrepl,
+     1     vlzremi, vlzrepl,
+
+     1     bfxre, bfyremi, bfyrepl, bfzremi, bfzrepl,
+
+     1     mean_mol_wt_remi, gamma_eos_remi, gamma_soundspeed_remi,
+     1     mean_mol_wt_repl, gamma_eos_repl, gamma_soundspeed_repl,
+
+     1     msonic_arr, divvel_arr
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     specieremi, specierepl
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1      NFIELD + NFLUID, NFIELD + NFLUID) ::
+     1    lf_eigenvec_re, rt_eigenvec_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1      NFIELD + NFLUID) ::
+     1     eigenval_re, eigenwt_re, conserved_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                 NFIELD + NFLUID + 1) ::
+     1     flux_re
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND,
+     1                  0 : 1, NFIELD + NFLUID) ::
+     1      zonebdy_flux, zonebdy_conserved
+
+      REAL, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1     rho0, prs0, vlx0, vly0, vlz0, bfy0, bfz0,
+     1     entropy_flux_re
+
+      REAL, DIMENSION ( 0: NFLUID, ONEDFLUIDBEGIN : ONEDFLUIDEND) ::
+     1      specie0
+
+      INTEGER, DIMENSION ( ONEDFLUIDBEGIN : ONEDFLUIDEND) :: do_ein
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+! Past this point we only declare variables that are internal to the
+! subroutine.
+
+      INTEGER i, iHLLEM_choice
+
+      REAL rho_L, rho_R, prs_L, prs_R,
+     1     vlx_L, vlx_R, vly_L, vly_R, vlz_L, vlz_R,
+
+     1     bfxpt, bfy_L, bfy_R, bfz_L, bfz_R,
+
+     1     mean_mol_wt_L, gamma_eos_L, gamma_soundspeed_L,
+     1     mean_mol_wt_R, gamma_eos_R, gamma_soundspeed_R,
+
+     1     blend_HLL, S_L, S_R, entropy_flux_pt
+
+      REAL, DIMENSION ( 0: NFLUID) :: specie_L, specie_R
+
+      REAL, DIMENSION ( NFIELD + 1 + NFLUID) :: flux_pt,
+     1     F_L, F_R, U_HLL, F_HLL,
+     1     U_HLLEM, F_HLLEM, dU_HLLEM, dU_HLLEM_Min, dF_HLLEM
+
+! ----------------------------------------------------------------------
+
+      blend_HLL = 0.0
+
+      iHLLEM_choice = 1
+
+      DO i = nriembegin, nriemend
+
+! ------------------------------
+
+      rho_L = rhoremi ( i)
+      prs_L = prsremi ( i)
+
+      vlx_L = vlxremi ( i)
+      vly_L = vlyremi ( i)
+      vlz_L = vlzremi ( i)
+
+      bfy_L = bfyremi ( i)
+      bfz_L = bfzremi ( i)
+
+      mean_mol_wt_L = mean_mol_wt_remi ( i)
+      gamma_eos_L = gamma_eos_remi ( i)
+      gamma_soundspeed_L = gamma_soundspeed_remi ( i)
+
+
+      bfxpt = bfxre ( i)
+
+
+      rho_R = rhorepl ( i)
+      prs_R = prsrepl ( i)
+
+      vlx_R = vlxrepl ( i)
+      vly_R = vlyrepl ( i)
+      vlz_R = vlzrepl ( i)
+
+      bfy_R = bfyrepl ( i)
+      bfz_R = bfzrepl ( i)
+
+      mean_mol_wt_R = mean_mol_wt_repl ( i)
+      gamma_eos_R = gamma_eos_repl ( i)
+      gamma_soundspeed_R = gamma_soundspeed_repl ( i)
+
+! ------------------------------
+
+      CALL MHD_RIEM_HLLEM_PTWISE
+
+     1     ( gamma, smallnum, prsfloor, rhofloor, pi,
+     1     use_approx_eos, split_prsflux_re, iHLLEM_choice,
+
+     1     gasconst,
+     1     cp_specie, molewt_specie, heat_of_formation,
+
+     1        rho_L, rho_R,
+     1        prs_L, prs_R,
+     1        vlx_L, vlx_R,
+     1        vly_L, vly_R,
+     1        vlz_L, vlz_R,
+     1        bfxpt,
+     1        bfy_L, bfy_R,
+     1        bfz_L, bfz_R,
+     1        specie_L, specie_R,
+
+     1        gamma_eos_L, gamma_eos_R,
+     1        gamma_soundspeed_L, gamma_soundspeed_R,
+     1        mean_mol_wt_L, mean_mol_wt_R,
+
+     1        blend_HLL,
+
+     1        S_L, S_R,
+     1        F_L, F_R, U_HLL, F_HLL,
+     1        U_HLLEM, F_HLLEM, dU_HLLEM, dU_HLLEM_Min, dF_HLLEM,
+
+     1        flux_pt, entropy_flux_pt)
+
+! ------------------------------
+
+      entropy_flux_re ( i) = entropy_flux_pt
+      flux_re ( i, :) = flux_pt ( :)
+
+! ------------------------------
+
+      END DO
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+      RETURN
+
+      END SUBROUTINE MHD_RIEM_HLLEM_DB
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+      SUBROUTINE EIGENVECMHD_PTWISE_8
+
+     1             ( iprimitive, idirection,
+
+     1               gamma, smallnum, prsfloor, rhofloor, pi, 
+     1               debug_stop,
+
+     1               gasconst,
+
+     1               rhobar, prsbar,
+     1               vlxbar, vlybar, vlzbar,
+     1               bfxbar, bfybar, bfzbar, xbar,
+     1               speciebar,
+
+     1               eigenval,
+     1               lf_eigenvec, rt_eigenvec )
+
+! ----------------------------------------------------------------------
+
+! Written by : Dinshaw S. Balsara
+
+! Returns normalized left and right eigenvectors for a specified set
+! of mean states for adiabatic MHD. 
+
+! When "iprimitive == 1" the eigenvectors expressed in terms of primitive
+! variables are returned.
+
+! When "iprimitive == 0" the eigenvectors in terms of conserved variables
+! are returned.
+
+! When "idirection = 1,2,3" we build eigenvectors in the x,y,z-directions.
+! Velocity and magnetic field directions are permuted going in.
+! The permutation is reversed in the eigenvector components, velocities
+! and magnetic fields when leaving the subroutine.
+
+! When primitive variables are used, the vector of variables inside this
+! subroutine is in the order given by
+! ( rho, vlx,y,z, prs, bfx,y,z, species_fractions)^T.
+
+! When conserved variables are used, the vector of variables inside this
+! subroutine is in the order given by
+! ( rho, momx,y,z, eng, bfx,y,z, species_concentration)^T.
+
+! Suitable permutations of the eigenvector components is done before exit
+! when "idirection = 2, 3".
+
+! Properly normalized eigenvectors as given in Roe and Balsara (1996)
+! are generated.
+
+! Ideal, non-reactive gas is assumed.
+
+! ----------------------------------------------------------------------
+
+      IMPLICIT NONE
+
+! ----------------------------------------------------------------------
+
+      INTEGER, INTENT ( IN) :: iprimitive, idirection
+
+      INTEGER, INTENT ( INOUT) :: debug_stop
+
+      REAL, INTENT ( IN) :: gamma, smallnum, prsfloor, rhofloor,
+     1      pi, gasconst
+
+      REAL, INTENT ( INOUT) ::
+     1     rhobar, prsbar, vlxbar, vlybar, vlzbar,
+     1     bfxbar, bfybar, bfzbar, xbar
+
+      REAL, DIMENSION ( 0: NFLUID), INTENT ( INOUT) :: speciebar
+
+      REAL, DIMENSION ( NFIELD + NFLUID + 1), INTENT ( INOUT) ::
+     1     eigenval
+
+      REAL, DIMENSION ( NFIELD + NFLUID + 1, NFIELD + NFLUID + 1),
+     1      INTENT ( INOUT) ::
+     1     lf_eigenvec, rt_eigenvec
+
+! ----------------------------------------------------------------------
+
+      INTEGER j, k, l
+
+      REAL fourpi, small_speed
+
+
+! Variables for making wave speeds and eigenvectors.
+
+      REAL :: va_x, c_s, v_a, v_f, v_s, beta_y, beta_z,
+     1     alpha_f, alpha_s, sgnbx, sq_4pi_rho, va_perp,
+     1     eps_zone, one_by_4pi_rho,
+
+     1     eng,
+     1     gamma_eos, gamma_soundspeed,
+     1     dprs_drho, dprs_deng, deng_drho, deng_dprs,
+
+     1     temparr_01, temparr_02, temparr_03
+
+! Temporary usage of left and right eigenvectors in the primitive variables.
+! Transformation matrices to go from conserved to primitive and back.
+
+      REAL, DIMENSION ( NFIELD + NFLUID + 1, NFIELD + NFLUID + 1) ::
+
+     1     lf_eigenvec1, rt_eigenvec1, dudw, dwdu
+
+! ----------------------------------------------------------------------
+
+! Make some settings.
+
+      fourpi = 4.0 * pi
+
+! If the alfven speeds in the x or ( y, z) directions fall below "small_speed"
+! times the local sound speed, manoeuvers have to be done to prevent the
+! slow and fast eigenvectors from developing pathologies.
+
+      small_speed = 0.000001
+
+! ----------------------------------------------------------------------
+
+      IF ( NFIELD .NE. 7) THEN
+      WRITE ( 6, *)"EIGENVECMHD_PTWISE_8 : NFIELD .NE. 7", NFIELD, 7
+      debug_stop = 1
+      STOP
+      END IF
+
+      IF ( ( iprimitive < 0) .OR. ( iprimitive > 1)) THEN
+      WRITE ( 6, *)"EIGENVECMHD_PTWISE_8 : iprimitive = ", iprimitive
+      debug_stop = 1
+      STOP
+      END IF
+
+      IF ( ( idirection < 0) .OR. ( idirection > 3)) THEN
+      WRITE ( 6, *)"EIGENVECMHD_PTWISE_8 : idirection = ", idirection
+      debug_stop = 1
+      STOP
+      END IF
+
+! ----------------------------------------------------------------------
+
+! Rotate/permute variables for "idirection = 2 or 3".
+
+      IF ( idirection == 2) THEN
+
+      temparr_01 = vlxbar
+      temparr_02 = vlybar
+      temparr_03 = vlzbar
+
+      vlxbar = temparr_02
+      vlybar = temparr_03
+      vlzbar = temparr_01
+
+! -----
+
+      temparr_01 = bfxbar
+      temparr_02 = bfybar
+      temparr_03 = bfzbar
+
+      bfxbar = temparr_02
+      bfybar = temparr_03
+      bfzbar = temparr_01
+
+      END IF
+
+! ----------
+
+      IF ( idirection == 3) THEN
+
+      temparr_01 = vlxbar
+      temparr_02 = vlybar
+      temparr_03 = vlzbar
+
+      vlxbar = temparr_03
+      vlybar = temparr_01
+      vlzbar = temparr_02
+
+! -----
+
+      temparr_01 = bfxbar
+      temparr_02 = bfybar
+      temparr_03 = bfzbar
+
+      bfxbar = temparr_03
+      bfybar = temparr_01
+      bfzbar = temparr_02
+
+      END IF
+
+! ----------------------------------------------------------------------
+
+! Bound the density and pressure variables. Divide "xbar" by 4 * pi.
+! Set "xbar = 0.0" for pure eigenvectors.
+
+      rhobar = AMAX1 ( rhobar, rhofloor)
+      prsbar = AMAX1 ( prsbar, prsfloor)
+
+      xbar = xbar / fourpi
+
+! ----------------------------------------------------------------------
+
+! Fix up "gamma_soundspeed" and partial derivatives of various
+! thermodynamic quantities wrt one another.
+
+      eng = prsbar / (gamma - 1.0)
+      gamma_eos = gamma
+      gamma_soundspeed = gamma
+
+      dprs_drho = 0.0
+      dprs_deng = gamma - 1.0
+      deng_drho = 0.0
+      deng_dprs = 1.0 / ( gamma - 1.0)
+
+! ----------------------------------------------------------------------
+
+! Make eigenvalues:
+
+! ----------
+
+      sgnbx = SIGN ( 1.0, bfxbar )
+
+      sq_4pi_rho = SQRT ( fourpi * rhobar )
+
+! ----------
+
+      one_by_4pi_rho = 1.0 / ( fourpi * rhobar )
+
+      va_x = bfxbar**2 * one_by_4pi_rho
+      va_x = SQRT ( va_x )
+
+      c_s = gamma_soundspeed * prsbar / rhobar
+      c_s = SQRT ( c_s )
+
+      v_a = ( bfxbar**2 + bfybar**2 + bfzbar**2) * one_by_4pi_rho
+      v_a = SQRT ( v_a )
+
+      temparr_01 = v_a**2 + c_s**2
+      temparr_02 = temparr_01**2 - 4.0 * va_x**2 * c_s**2
+      temparr_02 = AMAX1 ( temparr_02, 0.0)
+      temparr_02 = SQRT ( temparr_02)
+
+      v_f = 0.5 * ( temparr_01 + temparr_02 )
+      v_f = SQRT ( v_f )
+
+      v_s = 0.5 * ( temparr_01 - temparr_02 )
+      v_s = AMAX1 ( v_s, 0.0)
+      v_s = SQRT ( v_s )
+
+! ----------
+
+! Now make quantities that are essential for making the eigenvectors ( though
+! inessential for just the eigenvalues).
+
+      eps_zone = small_speed * c_s
+
+
+      va_perp = SQRT ( bfybar**2 + bfzbar**2) / sq_4pi_rho
+
+
+      IF ( va_perp .GT. eps_zone) THEN
+
+      beta_y = bfybar / ( va_perp * sq_4pi_rho )
+      beta_z = bfzbar / ( va_perp * sq_4pi_rho )
+
+      ELSE
+
+      beta_y = 1.0 / SQRT ( 2.0)
+      beta_z = beta_y
+
+      END IF
+
+! ----------
+
+      eigenval ( 1) = vlxbar - v_f
+      eigenval ( 2) = vlxbar - va_x
+      eigenval ( 3) = vlxbar - v_s
+      eigenval ( 4) = vlxbar
+      eigenval ( 5) = vlxbar + v_s
+      eigenval ( 6) = vlxbar + va_x
+      eigenval ( 7) = vlxbar + v_f
+      eigenval ( 8) = 0.0
+
+! ----------
+
+#if ( NFLUID >= 1)
+      eigenval ( NFIELD + 2: NFIELD + NFLUID + 1) = vlxbar
+#endif
+
+! ----------------------------------------------------------------------
+
+! Make a consistent set of "alpha_f/s" for all the cases.
+
+! ----------
+
+      IF ( v_f .GE. v_s + eps_zone ) THEN
+
+! Straightforward evaluation is adequate here. We are far away from
+! the triple umbilic point.
+
+      temparr_01 = 1.0 / ( v_f**2 - v_s**2)
+
+      alpha_f = AMAX1 ( ( c_s**2 - v_s**2), 0.0 )
+      alpha_f = SQRT ( temparr_01 * alpha_f)
+
+      alpha_s = AMAX1 ( ( v_f**2 - c_s**2), 0.0 )
+      alpha_s = SQRT ( temparr_01 * alpha_s)
+
+      ELSE IF ( ABS ( va_x - c_s) .GT. smallnum * c_s ) THEN
+
+! We are very close to the triple umbilic point but not on it.
+
+      temparr_01 = va_perp / ( va_x - c_s)
+      temparr_01 = ATAN ( temparr_01) / 2.0
+
+      alpha_f = ABS ( SIN ( temparr_01))
+      alpha_s = ABS ( COS ( temparr_01))
+
+      ELSE
+
+! We are bang on the triple umbilic point ( indistinguishable
+! upto machine accuracy). Now which way we resolve this could
+! only depend on the structure of the waves in the adjoining zones
+! and we don't address that issue here.
+
+      temparr_01 = 0.25 * pi * SIGN ( 1.0, va_x - c_s)
+
+      alpha_f = ABS ( SIN ( temparr_01))
+      alpha_s = ABS ( COS ( temparr_01))
+
+      END IF
+
+! ----------------------------------------------------------------------
+
+! First zero out the eigenvectors. This is only needed because we can
+! then fill in the species eigenvectors by putting 1's at suitable
+! places on the diagonals.
+
+      rt_eigenvec1 ( :, :) = 0.0
+      lf_eigenvec1 ( :, :) = 0.0
+
+! ----------
+
+! Make right & left eigenvectors for alfven and entropy waves.
+
+! ----------
+
+! Alfven waves
+
+! ----------
+
+!      rt_eigenvec1 ( 1, 2) = 0.0
+!      rt_eigenvec1 ( 1, 6) = 0.0
+
+!      rt_eigenvec1 ( 2, 2) = 0.0
+!      rt_eigenvec1 ( 2, 6) = 0.0
+
+      rt_eigenvec1 ( 3, 2) = - beta_z
+      rt_eigenvec1 ( 3, 6) = - rt_eigenvec1 ( 3, 2)
+
+      rt_eigenvec1 ( 4, 2) = beta_y
+      rt_eigenvec1 ( 4, 6) = - rt_eigenvec1 ( 4, 2)
+
+!      rt_eigenvec1 ( 5, 2) = 0.0
+!      rt_eigenvec1 ( 5, 6) = 0.0
+
+!      rt_eigenvec1 ( 6, 2) = 0.0
+!      rt_eigenvec1 ( 6, 6) = 0.0
+
+      rt_eigenvec1 ( 7, 2) = - sgnbx * sq_4pi_rho * beta_z
+      rt_eigenvec1 ( 7, 6) = rt_eigenvec1 ( 7, 2)
+
+      rt_eigenvec1 ( 8, 2) = sgnbx * sq_4pi_rho * beta_y
+      rt_eigenvec1 ( 8, 6) = rt_eigenvec1 ( 8, 2)
+
+! ----------
+
+!      lf_eigenvec1 ( 2, 1) = 0.0
+!      lf_eigenvec1 ( 6, 1) = 0.0
+
+!      lf_eigenvec1 ( 2, 2) = 0.0
+!      lf_eigenvec1 ( 6, 2) = 0.0
+
+      lf_eigenvec1 ( 2, 3) = - 0.5 * beta_z
+      lf_eigenvec1 ( 6, 3) = - lf_eigenvec1 ( 2, 3)
+
+      lf_eigenvec1 ( 2, 4) = 0.5 * beta_y
+      lf_eigenvec1 ( 6, 4) = - lf_eigenvec1 ( 2, 4)
+
+!      lf_eigenvec1 ( 2, 5) = 0.0
+!      lf_eigenvec1 ( 6, 5) = 0.0
+
+!      lf_eigenvec1 ( 2, 6) = 0.0
+!      lf_eigenvec1 ( 6, 6) = 0.0
+
+      lf_eigenvec1 ( 2, 7) = - 0.5 * sgnbx * beta_z / sq_4pi_rho
+      lf_eigenvec1 ( 6, 7) = lf_eigenvec1 ( 2, 7)
+
+      lf_eigenvec1 ( 2, 8) = 0.5 * sgnbx * beta_y / sq_4pi_rho
+      lf_eigenvec1 ( 6, 8) = lf_eigenvec1 ( 2, 8)
+
+! ----------
+
+! Entropy wave
+
+! ----------
+
+      rt_eigenvec1 ( 1, 4) = 1.0
+!      rt_eigenvec1 ( 2, 4) = 0.0
+!      rt_eigenvec1 ( 3, 4) = 0.0
+!      rt_eigenvec1 ( 4, 4) = 0.0
+      rt_eigenvec1 ( 5, 4) = - xbar
+!      rt_eigenvec1 ( 6, 4) = 0.0
+!      rt_eigenvec1 ( 7, 4) = 0.0
+!      rt_eigenvec1 ( 8, 4) = 0.0
+
+! ----------
+
+      lf_eigenvec1 ( 4, 1) = 1.0 - xbar / c_s**2
+!      lf_eigenvec1 ( 4, 2) = 0.0
+!      lf_eigenvec1 ( 4, 3) = 0.0
+!      lf_eigenvec1 ( 4, 4) = 0.0
+      lf_eigenvec1 ( 4, 5) = - 1.0 / c_s**2
+!      lf_eigenvec1 ( 4, 6) = 0.0
+!      lf_eigenvec1 ( 4, 7) = 0.0
+!      lf_eigenvec1 ( 4, 8) = 0.0
+
+! ----------
+
+! Bx component of field
+
+! ----------
+
+!      rt_eigenvec1 ( 1, 8) = 0.0
+!      rt_eigenvec1 ( 2, 8) = 0.0
+!      rt_eigenvec1 ( 3, 8) = 0.0
+!      rt_eigenvec1 ( 4, 8) = 0.0
+!      rt_eigenvec1 ( 5, 8) = 0.0
+      rt_eigenvec1 ( 6, 8) = 1.0
+!      rt_eigenvec1 ( 7, 8) = 0.0
+!      rt_eigenvec1 ( 8, 8) = 0.0
+
+! ----------
+
+!      lf_eigenvec1 ( 8, 1) = 0.0
+!      lf_eigenvec1 ( 8, 2) = 0.0
+!      lf_eigenvec1 ( 8, 3) = 0.0
+!      lf_eigenvec1 ( 8, 4) = 0.0
+!      lf_eigenvec1 ( 8, 5) = 0.0
+      lf_eigenvec1 ( 8, 6) = 1.0
+!      lf_eigenvec1 ( 8, 7) = 0.0
+!      lf_eigenvec1 ( 8, 8) = 0.0
+
+! ----------------------------------------------------------------------
+
+! Make right & left eigenvectors for slow and fast waves.
+
+! ----------
+
+! Fast waves
+
+! ----------
+
+      rt_eigenvec1 ( 1, 1) = alpha_f * rhobar
+      rt_eigenvec1 ( 1, 7) = rt_eigenvec1 ( 1, 1)
+
+      rt_eigenvec1 ( 2, 1) = - alpha_f * v_f
+      rt_eigenvec1 ( 2, 7) = - rt_eigenvec1 ( 2, 1)
+
+      rt_eigenvec1 ( 3, 1) = alpha_s * v_s * beta_y * sgnbx
+      rt_eigenvec1 ( 3, 7) = - rt_eigenvec1 ( 3, 1)
+
+      rt_eigenvec1 ( 4, 1) = alpha_s * v_s * beta_z * sgnbx
+      rt_eigenvec1 ( 4, 7) = - rt_eigenvec1 ( 4, 1)
+
+      rt_eigenvec1 ( 5, 1) = alpha_f * rhobar * ( c_s**2 - xbar)
+      rt_eigenvec1 ( 5, 7) = rt_eigenvec1 ( 5, 1)
+
+!      rt_eigenvec1 ( 6, 1) = 0.0
+!      rt_eigenvec1 ( 6, 7) = 0.0
+
+      rt_eigenvec1 ( 7, 1) = alpha_s * sq_4pi_rho * c_s * beta_y
+      rt_eigenvec1 ( 7, 7) = rt_eigenvec1 ( 7, 1)
+
+      rt_eigenvec1 ( 8, 1) = alpha_s * sq_4pi_rho * c_s * beta_z
+      rt_eigenvec1 ( 8, 7) = rt_eigenvec1 ( 8, 1)
+
+! ----------
+
+      temparr_01 = 0.5 / c_s**2
+
+      lf_eigenvec1 ( 1, 1) = alpha_f * xbar * temparr_01 / rhobar
+      lf_eigenvec1 ( 7, 1) = lf_eigenvec1 ( 1, 1)
+
+      lf_eigenvec1 ( 1, 2) = temparr_01 * rt_eigenvec1 ( 2, 1)
+      lf_eigenvec1 ( 7, 2) = - lf_eigenvec1 ( 1, 2)
+
+      lf_eigenvec1 ( 1, 3) = temparr_01 * rt_eigenvec1 ( 3, 1)
+      lf_eigenvec1 ( 7, 3) = - lf_eigenvec1 ( 1, 3)
+
+      lf_eigenvec1 ( 1, 4) = temparr_01 * rt_eigenvec1 ( 4, 1)
+      lf_eigenvec1 ( 7, 4) = - lf_eigenvec1 ( 1, 4)
+
+      lf_eigenvec1 ( 1, 5) = temparr_01 * alpha_f / rhobar
+      lf_eigenvec1 ( 7, 5) = lf_eigenvec1 ( 1, 5)
+
+!      lf_eigenvec1 ( 1, 6) = 0.0
+!      lf_eigenvec1 ( 7, 6) = 0.0
+
+      lf_eigenvec1 ( 1, 7) = temparr_01 * rt_eigenvec1 ( 7, 1)
+     1                     * one_by_4pi_rho
+      lf_eigenvec1 ( 7, 7) = lf_eigenvec1 ( 1, 7)
+
+      lf_eigenvec1 ( 1, 8) = temparr_01 * rt_eigenvec1 ( 8, 1)
+     1                     * one_by_4pi_rho
+      lf_eigenvec1 ( 7, 8) = lf_eigenvec1 ( 1, 8)
+
+! ----------
+
+! Slow waves
+
+! ----------
+
+      rt_eigenvec1 ( 1, 3) = alpha_s * rhobar
+      rt_eigenvec1 ( 1, 5) = rt_eigenvec1 ( 1, 3)
+
+      rt_eigenvec1 ( 2, 3) = - alpha_s * v_s
+      rt_eigenvec1 ( 2, 5) = - rt_eigenvec1 ( 2, 3)
+
+      rt_eigenvec1 ( 3, 3) = - alpha_f * v_f * beta_y * sgnbx
+      rt_eigenvec1 ( 3, 5) = - rt_eigenvec1 ( 3, 3)
+
+      rt_eigenvec1 ( 4, 3) = - alpha_f * v_f * beta_z * sgnbx
+      rt_eigenvec1 ( 4, 5) = - rt_eigenvec1 ( 4, 3)
+
+      rt_eigenvec1 ( 5, 3) = alpha_s * rhobar * ( c_s**2 - xbar)
+      rt_eigenvec1 ( 5, 5) = rt_eigenvec1 ( 5, 3)
+
+!      rt_eigenvec1 ( 6, 3) = 0.0
+!      rt_eigenvec1 ( 6, 5) = 0.0
+
+      rt_eigenvec1 ( 7, 3) = - alpha_f * sq_4pi_rho * c_s * beta_y
+      rt_eigenvec1 ( 7, 5) = rt_eigenvec1 ( 7, 3)
+
+      rt_eigenvec1 ( 8, 3) = - alpha_f * sq_4pi_rho * c_s * beta_z
+      rt_eigenvec1 ( 8, 5) = rt_eigenvec1 ( 8, 3)
+
+! ----------
+
+      temparr_01 = 0.5 / c_s**2
+
+      lf_eigenvec1 ( 3, 1) = alpha_s * xbar * temparr_01 / rhobar
+      lf_eigenvec1 ( 5, 1) = lf_eigenvec1 ( 3, 1)
+
+      lf_eigenvec1 ( 3, 2) = temparr_01 * rt_eigenvec1 ( 2, 3)
+      lf_eigenvec1 ( 5, 2) = - lf_eigenvec1 ( 3, 2)
+
+      lf_eigenvec1 ( 3, 3) = temparr_01 * rt_eigenvec1 ( 3, 3)
+      lf_eigenvec1 ( 5, 3) = - lf_eigenvec1 ( 3, 3)
+
+      lf_eigenvec1 ( 3, 4) = temparr_01 * rt_eigenvec1 ( 4, 3)
+      lf_eigenvec1 ( 5, 4) = - lf_eigenvec1 ( 3, 4)
+
+      lf_eigenvec1 ( 3, 5) = temparr_01 * alpha_s / rhobar
+      lf_eigenvec1 ( 5, 5) = lf_eigenvec1 ( 3, 5)
+
+!      lf_eigenvec1 ( 3, 6) = 0.0
+!      lf_eigenvec1 ( 5, 6) = 0.0
+
+      lf_eigenvec1 ( 3, 7) = temparr_01 * rt_eigenvec1 ( 7, 3)
+     1                     * one_by_4pi_rho
+      lf_eigenvec1 ( 5, 7) = lf_eigenvec1 ( 3, 7)
+
+      lf_eigenvec1 ( 3, 8) = temparr_01 * rt_eigenvec1 ( 8, 3)
+     1                     * one_by_4pi_rho
+      lf_eigenvec1 ( 5, 8) = lf_eigenvec1 ( 3, 8)
+
+
+! ----------
+
+! For the multiple species, fix up the eigenvectors that carry the
+! contributions from the species fractions. The zero components of
+! the eigenvectors have already been previously assigned.
+
+#if ( NFLUID >= 1)
+
+      DO j = NFIELD + 2, NFIELD + NFLUID + 1
+
+      rt_eigenvec1 ( j, j) = 1.0
+      lf_eigenvec1 ( j, j) = 1.0
+
+      END DO
+
+#endif
+
+! ----------------------------------------------------------------------
+
+! At this point the eigenvectors in the primitive variables are made
+! and if only that much is desired, we can permute and return at this point.
+
+      IF ( iprimitive .EQ. 1) THEN
+
+! ----------------------------------------------------------------------
+
+      rt_eigenvec ( :, :) = rt_eigenvec1 ( :, :)
+      lf_eigenvec ( :, :) = lf_eigenvec1 ( :, :)
+
+! ----------------------------------------------------------------------
+
+      ELSE  ! End of building eigenvectors in primitive variables.
+
+! ----------------------------------------------------------------------
+
+      dudw ( :, :) = 0.0
+      dwdu ( :, :) = 0.0
+
+! ----------------------------------------------------------------------
+
+! Make transformation matrices to the conserved variables. First for
+! the right eigenvectors. Don't make those matrix elements that are zero.
+
+! Here we have "dwdu * dudw = I" and also "dudw * dwdu = I" where I is the
+! identity matrix. Consequently, if "lf_eigenvec1 * rt_eigenvec1 = I" for
+! the eigenvectors in primitive form then we also have
+! "(lf_eigenvec1 * dwdu) * (dudw * rt_eigenvec1) = I".
+
+! Derivatives of U(1) w.r.t. V(1:8)
+      dudw ( 1, 1) = 1.0
+!      dudw ( 1, 2) = 0.0
+!      dudw ( 1, 3) = 0.0
+!      dudw ( 1, 4) = 0.0
+!      dudw ( 1, 5) = 0.0
+!      dudw ( 1, 6) = 0.0
+!      dudw ( 1, 7) = 0.0
+!      dudw ( 1, 8) = 0.0
+
+
+! Derivatives of U(2) w.r.t. V(1:8)
+      dudw ( 2, 1) = vlxbar
+      dudw ( 2, 2) = rhobar
+!      dudw ( 2, 3) = 0.0
+!      dudw ( 2, 4) = 0.0
+!      dudw ( 2, 5) = 0.0
+!      dudw ( 2, 6) = 0.0
+!      dudw ( 2, 7) = 0.0
+!      dudw ( 2, 8) = 0.0
+
+
+      dudw ( 3, 1) = vlybar
+!      dudw ( 3, 2) = 0.0
+      dudw ( 3, 3) = rhobar
+!      dudw ( 3, 4) = 0.0
+!      dudw ( 3, 5) = 0.0
+!      dudw ( 3, 6) = 0.0
+!      dudw ( 3, 7) = 0.0
+!      dudw ( 3, 8) = 0.0
+
+
+      dudw ( 4, 1) = vlzbar
+!      dudw ( 4, 2) = 0.0
+!      dudw ( 4, 3) = 0.0
+      dudw ( 4, 4) = rhobar
+!      dudw ( 4, 5) = 0.0
+!      dudw ( 4, 6) = 0.0
+!      dudw ( 4, 7) = 0.0
+!      dudw ( 4, 8) = 0.0
+
+
+      dudw ( 5, 1) = 0.5 * ( vlxbar**2 + vlybar**2 + vlzbar**2)
+     1             + xbar + deng_drho
+      dudw ( 5, 2) = rhobar * vlxbar
+      dudw ( 5, 3) = rhobar * vlybar
+      dudw ( 5, 4) = rhobar * vlzbar
+      dudw ( 5, 5) = deng_dprs
+      dudw ( 5, 6) = bfxbar / fourpi
+      dudw ( 5, 7) = bfybar / fourpi
+      dudw ( 5, 8) = bfzbar / fourpi
+
+
+!      dudw ( 6, 1) = 0.0
+!      dudw ( 6, 2) = 0.0
+!      dudw ( 6, 3) = 0.0
+!      dudw ( 6, 4) = 0.0
+!      dudw ( 6, 5) = 0.0
+      dudw ( 6, 6) = 1.0
+!      dudw ( 6, 7) = 0.0
+!      dudw ( 6, 8) = 0.0
+
+
+!      dudw ( 7, 1) = 0.0
+!      dudw ( 7, 2) = 0.0
+!      dudw ( 7, 3) = 0.0
+!      dudw ( 7, 4) = 0.0
+!      dudw ( 7, 5) = 0.0
+!      dudw ( 7, 6) = 0.0
+      dudw ( 7, 7) = 1.0
+!      dudw ( 7, 8) = 0.0
+
+
+!      dudw ( 8, 1) = 0.0
+!      dudw ( 8, 2) = 0.0
+!      dudw ( 8, 3) = 0.0
+!      dudw ( 8, 4) = 0.0
+!      dudw ( 8, 5) = 0.0
+!      dudw ( 8, 6) = 0.0
+!      dudw ( 8, 7) = 0.0
+      dudw ( 8, 8) = 1.0
+
+
+#if ( NFLUID >= 1)
+      DO k = 9, NFIELD + NFLUID + 1
+
+      dudw ( k, 1) = speciebar ( k - 8)
+      dudw ( k, k) = rhobar
+
+      END DO
+#endif
+
+! ----------------------------------------------------------------------
+
+! Make transformation matrices to the conserved variables. Then for
+! the left eigenvectors. Don't make those matrix elements that are zero.
+
+      temparr_01 = 1.0 / rhobar
+
+
+! Derivatives of V(1:8) w.r.t. U(1)
+      dwdu ( 1, 1) = 1.0
+      dwdu ( 2, 1) = - temparr_01 * vlxbar
+      dwdu ( 3, 1) = - temparr_01 * vlybar
+      dwdu ( 4, 1) = - temparr_01 * vlzbar
+      dwdu ( 5, 1) = dprs_drho + dprs_deng * ( 0.5 * ( vlxbar**2
+     1                                 + vlybar**2 + vlzbar**2) - xbar)
+!      dwdu ( 6, 1) = 0.0
+!      dwdu ( 7, 1) = 0.0
+!      dwdu ( 8, 1) = 0.0
+
+
+! Derivatives of V(1:8) w.r.t. U(2)
+!      dwdu ( 1, 2) = 0.0
+      dwdu ( 2, 2) = temparr_01
+!      dwdu ( 3, 2) = 0.0
+!      dwdu ( 4, 2) = 0.0
+      dwdu ( 5, 2) = - dprs_deng * vlxbar
+!      dwdu ( 6, 2) = 0.0
+!      dwdu ( 7, 2) = 0.0
+!      dwdu ( 8, 2) = 0.0
+
+
+!      dwdu ( 1, 3) = 0.0
+!      dwdu ( 2, 3) = 0.0
+      dwdu ( 3, 3) = temparr_01
+!      dwdu ( 4, 3) = 0.0
+      dwdu ( 5, 3) = - dprs_deng * vlybar
+!      dwdu ( 6, 3) = 0.0
+!      dwdu ( 7, 3) = 0.0
+!      dwdu ( 8, 3) = 0.0
+
+
+!      dwdu ( 1, 4) = 0.0
+!      dwdu ( 2, 4) = 0.0
+!      dwdu ( 3, 4) = 0.0
+      dwdu ( 4, 4) = temparr_01
+      dwdu ( 5, 4) = - dprs_deng * vlzbar
+!      dwdu ( 6, 4) = 0.0
+!      dwdu ( 7, 4) = 0.0
+!      dwdu ( 8, 4) = 0.0
+
+
+!      dwdu ( 1, 5) = 0.0
+!      dwdu ( 2, 5) = 0.0
+!      dwdu ( 3, 5) = 0.0
+!      dwdu ( 4, 5) = 0.0
+      dwdu ( 5, 5) = dprs_deng
+!      dwdu ( 6, 5) = 0.0
+!      dwdu ( 7, 5) = 0.0
+!      dwdu ( 8, 5) = 0.0
+
+
+!      dwdu ( 1, 6) = 0.0
+!      dwdu ( 2, 6) = 0.0
+!      dwdu ( 3, 6) = 0.0
+!      dwdu ( 4, 6) = 0.0
+      dwdu ( 5, 6) = - dprs_deng * bfxbar / fourpi
+      dwdu ( 6, 6) = 1.0
+!      dwdu ( 7, 6) = 0.0
+!      dwdu ( 8, 6) = 0.0
+
+
+!      dwdu ( 1, 7) = 0.0
+!      dwdu ( 2, 7) = 0.0
+!      dwdu ( 3, 7) = 0.0
+!      dwdu ( 4, 7) = 0.0
+      dwdu ( 5, 7) = - dprs_deng * bfybar / fourpi
+!      dwdu ( 6, 7) = 0.0
+      dwdu ( 7, 7) = 1.0
+!      dwdu ( 8, 7) = 0.0
+
+
+!      dwdu ( 1, 8) = 0.0
+!      dwdu ( 2, 8) = 0.0
+!      dwdu ( 3, 8) = 0.0
+!      dwdu ( 4, 8) = 0.0
+      dwdu ( 5, 8) = - dprs_deng * bfzbar / fourpi
+!      dwdu ( 6, 8) = 0.0
+!      dwdu ( 7, 8) = 0.0
+      dwdu ( 8, 8) = 1.0
+
+
+#if ( NFLUID >= 1)
+      DO k = 9, NFIELD + NFLUID + 1
+
+      dwdu ( k, 1) = - temparr_01 * speciebar ( k - 8)
+      dwdu ( k, k) = temparr_01
+
+      END DO
+#endif
+
+! ----------------------------------------------------------------------
+
+! Do the matrix multiplications. Then save the eigenvalues. This
+! gives eigenvectors in the conserved variables.
+! Don't multiply those matrix elements that are zero.
+
+      rt_eigenvec ( :, :) = 0.0
+      lf_eigenvec ( :, :) = 0.0
+
+! Loop over k^th right eigenvector or k^th left eigenvector.
+      DO k = 1, NFIELD + NFLUID + 1 
+
+      DO j = 1, NFIELD + NFLUID + 1
+
+      DO l = 1, NFIELD + NFLUID + 1
+
+      rt_eigenvec ( j, k) = rt_eigenvec ( j, k)
+     1                    + dudw ( j, l) * rt_eigenvec1 ( l, k)
+
+      lf_eigenvec ( k, j) = lf_eigenvec ( k, j)
+     1                    + lf_eigenvec1 ( k, l) * dwdu ( l, j)
+
+      END DO
+
+      END DO
+
+      END DO
+
+! ----------------------------------------------------------------------
+
+      END IF  ! End of building eigenvectors in conserved variables.
+
+! ----------------------------------------------------------------------
+! The permutation is reversed in the eigenvector components, velocities
+! and magnetic fields when leaving the subroutine.
+
+      IF ( idirection == 2) THEN
+
+      temparr_01 = vlxbar
+      temparr_02 = vlybar
+      temparr_03 = vlzbar
+
+      vlxbar = temparr_03
+      vlybar = temparr_01
+      vlzbar = temparr_02
+
+! -----
+
+      temparr_01 = bfxbar
+      temparr_02 = bfybar
+      temparr_03 = bfzbar
+
+      bfxbar = temparr_03
+      bfybar = temparr_01
+      bfzbar = temparr_02
+
+! -----
+
+      DO k = 1, NFIELD + NFLUID + 1
+
+! -----
+
+      temparr_01 = rt_eigenvec ( 2, k)
+      temparr_02 = rt_eigenvec ( 3, k)
+      temparr_03 = rt_eigenvec ( 4, k)
+
+      rt_eigenvec ( 2, k) = temparr_03
+      rt_eigenvec ( 3, k) = temparr_01
+      rt_eigenvec ( 4, k) = temparr_02
+
+! -----
+
+      temparr_01 = rt_eigenvec ( 6, k)
+      temparr_02 = rt_eigenvec ( 7, k)
+      temparr_03 = rt_eigenvec ( 8, k)
+
+      rt_eigenvec ( 6, k) = temparr_03
+      rt_eigenvec ( 7, k) = temparr_01
+      rt_eigenvec ( 8, k) = temparr_02
+
+! -----
+
+      temparr_01 = lf_eigenvec ( k, 2)
+      temparr_02 = lf_eigenvec ( k, 3)
+      temparr_03 = lf_eigenvec ( k, 4)
+
+      lf_eigenvec ( k, 2) = temparr_03
+      lf_eigenvec ( k, 3) = temparr_01
+      lf_eigenvec ( k, 4) = temparr_02
+
+! -----
+
+      temparr_01 = lf_eigenvec ( k, 6)
+      temparr_02 = lf_eigenvec ( k, 7)
+      temparr_03 = lf_eigenvec ( k, 8)
+
+      lf_eigenvec ( k, 6) = temparr_03
+      lf_eigenvec ( k, 7) = temparr_01
+      lf_eigenvec ( k, 8) = temparr_02
+
+! -----
+
+      END DO
+
+! -----
+
+      END IF
+
+! ----------
+
+      IF ( idirection == 3) THEN
+
+! -----
+
+      temparr_01 = vlxbar
+      temparr_02 = vlybar
+      temparr_03 = vlzbar
+
+      vlxbar = temparr_02
+      vlybar = temparr_03
+      vlzbar = temparr_01
+
+! -----
+
+      temparr_01 = bfxbar
+      temparr_02 = bfybar
+      temparr_03 = bfzbar
+
+      bfxbar = temparr_02
+      bfybar = temparr_03
+      bfzbar = temparr_01
+
+! -----
+
+      DO k = 1, NFIELD + NFLUID + 1
+
+! -----
+
+      temparr_01 = rt_eigenvec ( 2, k)
+      temparr_02 = rt_eigenvec ( 3, k)
+      temparr_03 = rt_eigenvec ( 4, k)
+
+      rt_eigenvec ( 2, k) = temparr_02
+      rt_eigenvec ( 3, k) = temparr_03
+      rt_eigenvec ( 4, k) = temparr_01
+
+! -----
+
+      temparr_01 = rt_eigenvec ( 6, k)
+      temparr_02 = rt_eigenvec ( 7, k)
+      temparr_03 = rt_eigenvec ( 8, k)
+
+      rt_eigenvec ( 6, k) = temparr_02
+      rt_eigenvec ( 7, k) = temparr_03
+      rt_eigenvec ( 8, k) = temparr_01
+
+! -----
+
+      temparr_01 = lf_eigenvec ( k, 2)
+      temparr_02 = lf_eigenvec ( k, 3)
+      temparr_03 = lf_eigenvec ( k, 4)
+
+      lf_eigenvec ( k, 2) = temparr_02
+      lf_eigenvec ( k, 3) = temparr_03
+      lf_eigenvec ( k, 4) = temparr_01
+
+! -----
+
+      temparr_01 = lf_eigenvec ( k, 6)
+      temparr_02 = lf_eigenvec ( k, 7)
+      temparr_03 = lf_eigenvec ( k, 8)
+
+      lf_eigenvec ( k, 6) = temparr_02
+      lf_eigenvec ( k, 7) = temparr_03
+      lf_eigenvec ( k, 8) = temparr_01
+
+! -----
+
+      END DO
+
+! -----
+
+      END IF
+
+! ----------------------------------------------------------------------
+
+      RETURN
+
+      END SUBROUTINE EIGENVECMHD_PTWISE_8
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------
+
+      SUBROUTINE EIGENVECMHD_PTWISE_LINDEG
+
+     1             ( iprimitive, idirection,
+
+     1               gamma, smallnum, prsfloor, rhofloor, pi, 
+     1               debug_stop,
+
+     1               gasconst,
+
+     1               rhobar, prsbar,
+     1               vlxbar, vlybar, vlzbar,
+     1               bfxbar, bfybar, bfzbar, xbar,
+     1               speciebar,
+
+     1               eigenval,
+     1               lf_eigenvec, rt_eigenvec )
+
+! ----------------------------------------------------------------------
+
+! Written by : Dinshaw S. Balsara
+
+! Returns normalized left and right eigenvectors for a specified set
+! of mean states for adiabatic MHD. Does this only for the linearly degenerate
+! waves. Rest of the eigenvectors are zeroed. This is useful in endowing
+! substructure in multid. Riemann problems.
+
+! When "iprimitive == 1" the eigenvectors expressed in terms of primitive
+! variables are returned.
+
+! When "iprimitive == 0" the eigenvectors in terms of conserved variables
+! are returned.
+
+! When "idirection = 1,2,3" we build eigenvectors in the x,y,z-directions.
+! Velocity and magnetic field directions are permuted going in.
+! The permutation is reversed in the eigenvector components, velocities
+! and magnetic fields when leaving the subroutine.
+
+! When primitive variables are used, the vector of variables inside this
+! subroutine is in the order given by
+! ( rho, vlx,y,z, prs, bfx,y,z, species_fractions)^T.
+
+! When conserved variables are used, the vector of variables inside this
+! subroutine is in the order given by
+! ( rho, momx,y,z, eng, bfx,y,z, species_concentration)^T.
+
+! Suitable permutations of the eigenvector components is done before exit
+! when "idirection = 2, 3".
+
+! Properly normalized eigenvectors as given in Roe and Balsara (1996)
+! are generated.
+
+! Ideal, non-reactive gas is assumed.
+
+! ----------------------------------------------------------------------
+
+      IMPLICIT NONE
+
+! ----------------------------------------------------------------------
+
+      INTEGER, INTENT ( IN) :: iprimitive, idirection
+
+      INTEGER, INTENT ( INOUT) :: debug_stop
+
+      REAL, INTENT ( IN) :: gamma, smallnum, prsfloor, rhofloor,
+     1      pi, gasconst
+
+      REAL, INTENT ( INOUT) ::
+     1     rhobar, prsbar, vlxbar, vlybar, vlzbar,
+     1     bfxbar, bfybar, bfzbar, xbar
+
+      REAL, DIMENSION ( 0: NFLUID), INTENT ( INOUT) :: speciebar
+
+      REAL, DIMENSION ( NFIELD + NFLUID + 1), INTENT ( INOUT) ::
+     1     eigenval
+
+      REAL, DIMENSION ( NFIELD + NFLUID + 1, NFIELD + NFLUID + 1),
+     1      INTENT ( INOUT) ::
+     1     lf_eigenvec, rt_eigenvec
+
+! ----------------------------------------------------------------------
+
+      INTEGER j, k, l
+
+      REAL fourpi, small_speed
+
+
+! Variables for making wave speeds and eigenvectors.
+
+      REAL :: va_x, c_s, v_a, v_f, v_s, beta_y, beta_z,
+     1     alpha_f, alpha_s, sgnbx, sq_4pi_rho, va_perp,
+     1     eps_zone, one_by_4pi_rho,
+
+     1     eng,
+     1     gamma_eos, gamma_soundspeed,
+     1     dprs_drho, dprs_deng, deng_drho, deng_dprs,
+
+     1     temparr_01, temparr_02, temparr_03
+
+! Temporary usage of left and right eigenvectors in the primitive variables.
+! Transformation matrices to go from conserved to primitive and back.
+
+      REAL, DIMENSION ( NFIELD + NFLUID + 1, NFIELD + NFLUID + 1) ::
+
+     1     lf_eigenvec1, rt_eigenvec1, dudw, dwdu
+
+! ----------------------------------------------------------------------
+
+! Make some settings.
+
+      fourpi = 4.0 * pi
+
+! If the alfven speeds in the x or ( y, z) directions fall below "small_speed"
+! times the local sound speed, manoeuvers have to be done to prevent the
+! slow and fast eigenvectors from developing pathologies.
+
+      small_speed = 0.000001
+
+! ----------------------------------------------------------------------
+
+      IF ( NFIELD .NE. 7) THEN
+      WRITE ( 6, *)
+     1      "EIGENVECMHD_PTWISE_LINDEG : NFIELD .NE. 7", NFIELD, 7
+      debug_stop = 1
+      STOP
+      END IF
+
+      IF ( ( iprimitive < 0) .OR. ( iprimitive > 1)) THEN
+      WRITE ( 6, *)
+     1      "EIGENVECMHD_PTWISE_LINDEG : iprimitive = ", iprimitive
+      debug_stop = 1
+      STOP
+      END IF
+
+      IF ( ( idirection < 0) .OR. ( idirection > 3)) THEN
+      WRITE ( 6, *)
+     1      "EIGENVECMHD_PTWISE_LINDEG : idirection = ", idirection
+      debug_stop = 1
+      STOP
+      END IF
+
+! ----------------------------------------------------------------------
+
+! Rotate/permute variables for "idirection = 2 or 3".
+
+      IF ( idirection == 2) THEN
+
+      temparr_01 = vlxbar
+      temparr_02 = vlybar
+      temparr_03 = vlzbar
+
+      vlxbar = temparr_02
+      vlybar = temparr_03
+      vlzbar = temparr_01
+
+! -----
+
+      temparr_01 = bfxbar
+      temparr_02 = bfybar
+      temparr_03 = bfzbar
+
+      bfxbar = temparr_02
+      bfybar = temparr_03
+      bfzbar = temparr_01
+
+      END IF
+
+! ----------
+
+      IF ( idirection == 3) THEN
+
+      temparr_01 = vlxbar
+      temparr_02 = vlybar
+      temparr_03 = vlzbar
+
+      vlxbar = temparr_03
+      vlybar = temparr_01
+      vlzbar = temparr_02
+
+! -----
+
+      temparr_01 = bfxbar
+      temparr_02 = bfybar
+      temparr_03 = bfzbar
+
+      bfxbar = temparr_03
+      bfybar = temparr_01
+      bfzbar = temparr_02
+
+      END IF
+
+! ----------------------------------------------------------------------
+
+! Bound the density and pressure variables. Divide "xbar" by 4 * pi.
+! Set "xbar = 0.0" for pure eigenvectors.
+
+      rhobar = AMAX1 ( rhobar, rhofloor)
+      prsbar = AMAX1 ( prsbar, prsfloor)
+
+      xbar = xbar / fourpi
+
+! ----------------------------------------------------------------------
+
+! Fix up "gamma_soundspeed" and partial derivatives of various
+! thermodynamic quantities wrt one another.
+
+      eng = prsbar / (gamma - 1.0)
+      gamma_eos = gamma
+      gamma_soundspeed = gamma
+
+      dprs_drho = 0.0
+      dprs_deng = gamma - 1.0
+      deng_drho = 0.0
+      deng_dprs = 1.0 / ( gamma - 1.0)
+
+! ----------------------------------------------------------------------
+
+! Make eigenvalues:
+
+! ----------
+
+      sgnbx = SIGN ( 1.0, bfxbar )
+
+      sq_4pi_rho = SQRT ( fourpi * rhobar )
+
+! ----------
+
+      one_by_4pi_rho = 1.0 / ( fourpi * rhobar )
+
+      va_x = bfxbar**2 * one_by_4pi_rho
+      va_x = SQRT ( va_x )
+
+      c_s = gamma_soundspeed * prsbar / rhobar
+      c_s = SQRT ( c_s )
+
+      v_a = ( bfxbar**2 + bfybar**2 + bfzbar**2) * one_by_4pi_rho
+      v_a = SQRT ( v_a )
+
+      temparr_01 = v_a**2 + c_s**2
+      temparr_02 = temparr_01**2 - 4.0 * va_x**2 * c_s**2
+      temparr_02 = AMAX1 ( temparr_02, 0.0)
+      temparr_02 = SQRT ( temparr_02)
+
+      v_f = 0.5 * ( temparr_01 + temparr_02 )
+      v_f = SQRT ( v_f )
+
+      v_s = 0.5 * ( temparr_01 - temparr_02 )
+      v_s = AMAX1 ( v_s, 0.0)
+      v_s = SQRT ( v_s )
+
+! ----------
+
+! Now make quantities that are essential for making the eigenvectors ( though
+! inessential for just the eigenvalues).
+
+      eps_zone = small_speed * c_s
+
+
+      va_perp = SQRT ( bfybar**2 + bfzbar**2) / sq_4pi_rho
+
+
+      IF ( va_perp .GT. eps_zone) THEN
+
+      beta_y = bfybar / ( va_perp * sq_4pi_rho )
+      beta_z = bfzbar / ( va_perp * sq_4pi_rho )
+
+      ELSE
+
+      beta_y = 1.0 / SQRT ( 2.0)
+      beta_z = beta_y
+
+      END IF
+
+! ----------
+
+      eigenval ( 1) = vlxbar - v_f
+      eigenval ( 2) = vlxbar - va_x
+      eigenval ( 3) = vlxbar - v_s
+      eigenval ( 4) = vlxbar
+      eigenval ( 5) = vlxbar + v_s
+      eigenval ( 6) = vlxbar + va_x
+      eigenval ( 7) = vlxbar + v_f
+      eigenval ( 8) = 0.0
+
+! ----------
+
+#if ( NFLUID >= 1)
+      eigenval ( NFIELD + 2: NFIELD + NFLUID + 1) = vlxbar
+#endif
+
+! ----------------------------------------------------------------------
+
+! Make a consistent set of "alpha_f/s" for all the cases.
+
+! ----------
+
+      IF ( v_f .GE. v_s + eps_zone ) THEN
+
+! Straightforward evaluation is adequate here. We are far away from
+! the triple umbilic point.
+
+      temparr_01 = 1.0 / ( v_f**2 - v_s**2)
+
+      alpha_f = AMAX1 ( ( c_s**2 - v_s**2), 0.0 )
+      alpha_f = SQRT ( temparr_01 * alpha_f)
+
+      alpha_s = AMAX1 ( ( v_f**2 - c_s**2), 0.0 )
+      alpha_s = SQRT ( temparr_01 * alpha_s)
+
+      ELSE IF ( ABS ( va_x - c_s) .GT. smallnum * c_s ) THEN
+
+! We are very close to the triple umbilic point but not on it.
+
+      temparr_01 = va_perp / ( va_x - c_s)
+      temparr_01 = ATAN ( temparr_01) / 2.0
+
+      alpha_f = ABS ( SIN ( temparr_01))
+      alpha_s = ABS ( COS ( temparr_01))
+
+      ELSE
+
+! We are bang on the triple umbilic point ( indistinguishable
+! upto machine accuracy). Now which way we resolve this could
+! only depend on the structure of the waves in the adjoining zones
+! and we don't address that issue here.
+
+      temparr_01 = 0.25 * pi * SIGN ( 1.0, va_x - c_s)
+
+      alpha_f = ABS ( SIN ( temparr_01))
+      alpha_s = ABS ( COS ( temparr_01))
+
+      END IF
+
+! ----------------------------------------------------------------------
+
+! First zero out the eigenvectors. This is only needed because we can
+! then fill in the species eigenvectors by putting 1's at suitable
+! places on the diagonals.
+
+      rt_eigenvec1 ( :, :) = 0.0
+      lf_eigenvec1 ( :, :) = 0.0
+
+! ----------
+
+! Make right & left eigenvectors for alfven and entropy waves.
+
+! ----------
+
+! Alfven waves
+
+! If the slow waves are retained alongside with the Alfven waves then
+! they form a complete eigenvector basis into which the full system can
+! be projected even in the limit where the longitudinal magnetic field
+! goes to zero.
+
+! However, that is not what we are doing here. For that reason, when we
+! discover that limit, we just revert to the hydrodynamical shear waves.
+
+! ----------
+
+      IF ( va_x > eps_zone) THEN
+
+! ----------
+
+!      rt_eigenvec1 ( 1, 2) = 0.0
+!      rt_eigenvec1 ( 1, 6) = 0.0
+
+!      rt_eigenvec1 ( 2, 2) = 0.0
+!      rt_eigenvec1 ( 2, 6) = 0.0
+
+      rt_eigenvec1 ( 3, 2) = - beta_z
+      rt_eigenvec1 ( 3, 6) = - rt_eigenvec1 ( 3, 2)
+
+      rt_eigenvec1 ( 4, 2) = beta_y
+      rt_eigenvec1 ( 4, 6) = - rt_eigenvec1 ( 4, 2)
+
+!      rt_eigenvec1 ( 5, 2) = 0.0
+!      rt_eigenvec1 ( 5, 6) = 0.0
+
+!      rt_eigenvec1 ( 6, 2) = 0.0
+!      rt_eigenvec1 ( 6, 6) = 0.0
+
+      rt_eigenvec1 ( 7, 2) = - sgnbx * sq_4pi_rho * beta_z
+      rt_eigenvec1 ( 7, 6) = rt_eigenvec1 ( 7, 2)
+
+      rt_eigenvec1 ( 8, 2) = sgnbx * sq_4pi_rho * beta_y
+      rt_eigenvec1 ( 8, 6) = rt_eigenvec1 ( 8, 2)
+
+! ----------
+
+!      lf_eigenvec1 ( 2, 1) = 0.0
+!      lf_eigenvec1 ( 6, 1) = 0.0
+
+!      lf_eigenvec1 ( 2, 2) = 0.0
+!      lf_eigenvec1 ( 6, 2) = 0.0
+
+      lf_eigenvec1 ( 2, 3) = - 0.5 * beta_z
+      lf_eigenvec1 ( 6, 3) = - lf_eigenvec1 ( 2, 3)
+
+      lf_eigenvec1 ( 2, 4) = 0.5 * beta_y
+      lf_eigenvec1 ( 6, 4) = - lf_eigenvec1 ( 2, 4)
+
+!      lf_eigenvec1 ( 2, 5) = 0.0
+!      lf_eigenvec1 ( 6, 5) = 0.0
+
+!      lf_eigenvec1 ( 2, 6) = 0.0
+!      lf_eigenvec1 ( 6, 6) = 0.0
+
+      lf_eigenvec1 ( 2, 7) = - 0.5 * sgnbx * beta_z / sq_4pi_rho
+      lf_eigenvec1 ( 6, 7) = lf_eigenvec1 ( 2, 7)
+
+      lf_eigenvec1 ( 2, 8) = 0.5 * sgnbx * beta_y / sq_4pi_rho
+      lf_eigenvec1 ( 6, 8) = lf_eigenvec1 ( 2, 8)
+
+! ----------
+
+      ELSE
+
+! ----------
+
+!      rt_eigenvec1 ( 1, 2) = 0.0
+!      rt_eigenvec1 ( 1, 6) = 0.0
+
+!      rt_eigenvec1 ( 2, 2) = 0.0
+!      rt_eigenvec1 ( 2, 6) = 0.0
+
+      rt_eigenvec1 ( 3, 2) = 1.0
+      rt_eigenvec1 ( 3, 6) = 0.0
+
+      rt_eigenvec1 ( 4, 2) = 0.0
+      rt_eigenvec1 ( 4, 6) = 1.0
+
+!      rt_eigenvec1 ( 5, 2) = 0.0
+!      rt_eigenvec1 ( 5, 6) = 0.0
+
+!      rt_eigenvec1 ( 6, 2) = 0.0
+!      rt_eigenvec1 ( 6, 6) = 0.0
+
+!      rt_eigenvec1 ( 7, 2) = 0.0
+!      rt_eigenvec1 ( 7, 6) = 0.0
+
+!      rt_eigenvec1 ( 8, 2) = 0.0
+!      rt_eigenvec1 ( 8, 6) = 0.0
+
+! ----------
+
+!      lf_eigenvec1 ( 2, 1) = 0.0
+!      lf_eigenvec1 ( 6, 1) = 0.0
+
+!      lf_eigenvec1 ( 2, 2) = 0.0
+!      lf_eigenvec1 ( 6, 2) = 0.0
+
+      lf_eigenvec1 ( 2, 3) = 1.0
+      lf_eigenvec1 ( 6, 3) = 0.0
+
+      lf_eigenvec1 ( 2, 4) = 0.0
+      lf_eigenvec1 ( 6, 4) = 1.0
+
+!      lf_eigenvec1 ( 2, 5) = 0.0
+!      lf_eigenvec1 ( 6, 5) = 0.0
+
+!      lf_eigenvec1 ( 2, 6) = 0.0
+!      lf_eigenvec1 ( 6, 6) = 0.0
+
+!      lf_eigenvec1 ( 2, 7) = 0.0
+!      lf_eigenvec1 ( 6, 7) = 0.0
+
+!      lf_eigenvec1 ( 2, 8) = 0.0
+!      lf_eigenvec1 ( 6, 8) = 0.0
+
+! ----------
+
+      END IF
+
+! ----------
+
+! Entropy wave
+
+! ----------
+
+      rt_eigenvec1 ( 1, 4) = 1.0
+!      rt_eigenvec1 ( 2, 4) = 0.0
+!      rt_eigenvec1 ( 3, 4) = 0.0
+!      rt_eigenvec1 ( 4, 4) = 0.0
+      rt_eigenvec1 ( 5, 4) = - xbar
+!      rt_eigenvec1 ( 6, 4) = 0.0
+!      rt_eigenvec1 ( 7, 4) = 0.0
+!      rt_eigenvec1 ( 8, 4) = 0.0
+
+! ----------
+
+      lf_eigenvec1 ( 4, 1) = 1.0 - xbar / c_s**2
+!      lf_eigenvec1 ( 4, 2) = 0.0
+!      lf_eigenvec1 ( 4, 3) = 0.0
+!      lf_eigenvec1 ( 4, 4) = 0.0
+      lf_eigenvec1 ( 4, 5) = - 1.0 / c_s**2
+!      lf_eigenvec1 ( 4, 6) = 0.0
+!      lf_eigenvec1 ( 4, 7) = 0.0
+!      lf_eigenvec1 ( 4, 8) = 0.0
+
+! ----------
+
+! Bx component of field
+
+! ----------
+
+!      rt_eigenvec1 ( 1, 8) = 0.0
+!      rt_eigenvec1 ( 2, 8) = 0.0
+!      rt_eigenvec1 ( 3, 8) = 0.0
+!      rt_eigenvec1 ( 4, 8) = 0.0
+!      rt_eigenvec1 ( 5, 8) = 0.0
+      rt_eigenvec1 ( 6, 8) = 1.0
+!      rt_eigenvec1 ( 7, 8) = 0.0
+!      rt_eigenvec1 ( 8, 8) = 0.0
+
+! ----------
+
+!      lf_eigenvec1 ( 8, 1) = 0.0
+!      lf_eigenvec1 ( 8, 2) = 0.0
+!      lf_eigenvec1 ( 8, 3) = 0.0
+!      lf_eigenvec1 ( 8, 4) = 0.0
+!      lf_eigenvec1 ( 8, 5) = 0.0
+      lf_eigenvec1 ( 8, 6) = 1.0
+!      lf_eigenvec1 ( 8, 7) = 0.0
+!      lf_eigenvec1 ( 8, 8) = 0.0
+
+! ----------------------------------------------------------------------
+
+! For the multiple species, fix up the eigenvectors that carry the
+! contributions from the species fractions. The zero components of
+! the eigenvectors have already been previously assigned.
+
+#if ( NFLUID >= 1)
+
+      DO j = NFIELD + 2, NFIELD + NFLUID + 1
+
+      rt_eigenvec1 ( j, j) = 1.0
+      lf_eigenvec1 ( j, j) = 1.0
+
+      END DO
+
+#endif
+
+! ----------------------------------------------------------------------
+
+! At this point the eigenvectors in the primitive variables are made
+! and if only that much is desired, we can return at this point.
+
+      IF ( iprimitive .EQ. 1) THEN
+
+! ----------------------------------------------------------------------
+
+      rt_eigenvec ( :, :) = rt_eigenvec1 ( :, :)
+      lf_eigenvec ( :, :) = lf_eigenvec1 ( :, :)
+
+! ----------------------------------------------------------------------
+
+      ELSE  ! End of building eigenvectors in primitive variables.
+
+! ----------------------------------------------------------------------
+
+      dudw ( :, :) = 0.0
+      dwdu ( :, :) = 0.0
+
+! ----------------------------------------------------------------------
+
+! Make transformation matrices to the conserved variables. First for
+! the right eigenvectors. Don't make those matrix elements that are zero.
+
+! Here we have "dwdu * dudw = I" and also "dudw * dwdu = I" where I is the
+! identity matrix. Consequently, if "lf_eigenvec1 * rt_eigenvec1 = I" for
+! the eigenvectors in primitive form then we also have
+! "(lf_eigenvec1 * dwdu) * (dudw * rt_eigenvec1) = I".
+
+! Derivatives of U(1) w.r.t. V(1:8)
+      dudw ( 1, 1) = 1.0
+!      dudw ( 1, 2) = 0.0
+!      dudw ( 1, 3) = 0.0
+!      dudw ( 1, 4) = 0.0
+!      dudw ( 1, 5) = 0.0
+!      dudw ( 1, 6) = 0.0
+!      dudw ( 1, 7) = 0.0
+!      dudw ( 1, 8) = 0.0
+
+
+! Derivatives of U(2) w.r.t. V(1:8)
+      dudw ( 2, 1) = vlxbar
+      dudw ( 2, 2) = rhobar
+!      dudw ( 2, 3) = 0.0
+!      dudw ( 2, 4) = 0.0
+!      dudw ( 2, 5) = 0.0
+!      dudw ( 2, 6) = 0.0
+!      dudw ( 2, 7) = 0.0
+!      dudw ( 2, 8) = 0.0
+
+
+      dudw ( 3, 1) = vlybar
+!      dudw ( 3, 2) = 0.0
+      dudw ( 3, 3) = rhobar
+!      dudw ( 3, 4) = 0.0
+!      dudw ( 3, 5) = 0.0
+!      dudw ( 3, 6) = 0.0
+!      dudw ( 3, 7) = 0.0
+!      dudw ( 3, 8) = 0.0
+
+
+      dudw ( 4, 1) = vlzbar
+!      dudw ( 4, 2) = 0.0
+!      dudw ( 4, 3) = 0.0
+      dudw ( 4, 4) = rhobar
+!      dudw ( 4, 5) = 0.0
+!      dudw ( 4, 6) = 0.0
+!      dudw ( 4, 7) = 0.0
+!      dudw ( 4, 8) = 0.0
+
+
+      dudw ( 5, 1) = 0.5 * ( vlxbar**2 + vlybar**2 + vlzbar**2)
+     1             + xbar + deng_drho
+      dudw ( 5, 2) = rhobar * vlxbar
+      dudw ( 5, 3) = rhobar * vlybar
+      dudw ( 5, 4) = rhobar * vlzbar
+      dudw ( 5, 5) = deng_dprs
+      dudw ( 5, 6) = bfxbar / fourpi
+      dudw ( 5, 7) = bfybar / fourpi
+      dudw ( 5, 8) = bfzbar / fourpi
+
+
+!      dudw ( 6, 1) = 0.0
+!      dudw ( 6, 2) = 0.0
+!      dudw ( 6, 3) = 0.0
+!      dudw ( 6, 4) = 0.0
+!      dudw ( 6, 5) = 0.0
+      dudw ( 6, 6) = 1.0
+!      dudw ( 6, 7) = 0.0
+!      dudw ( 6, 8) = 0.0
+
+
+!      dudw ( 7, 1) = 0.0
+!      dudw ( 7, 2) = 0.0
+!      dudw ( 7, 3) = 0.0
+!      dudw ( 7, 4) = 0.0
+!      dudw ( 7, 5) = 0.0
+!      dudw ( 7, 6) = 0.0
+      dudw ( 7, 7) = 1.0
+!      dudw ( 7, 8) = 0.0
+
+
+!      dudw ( 8, 1) = 0.0
+!      dudw ( 8, 2) = 0.0
+!      dudw ( 8, 3) = 0.0
+!      dudw ( 8, 4) = 0.0
+!      dudw ( 8, 5) = 0.0
+!      dudw ( 8, 6) = 0.0
+!      dudw ( 8, 7) = 0.0
+      dudw ( 8, 8) = 1.0
+
+
+#if ( NFLUID >= 1)
+      DO k = 9, NFIELD + NFLUID + 1
+
+      dudw ( k, 1) = speciebar ( k - 8)
+      dudw ( k, k) = rhobar
+
+      END DO
+#endif
+
+! ----------------------------------------------------------------------
+
+! Make transformation matrices to the conserved variables. Then for
+! the left eigenvectors. Don't make those matrix elements that are zero.
+
+      temparr_01 = 1.0 / rhobar
+
+
+! Derivatives of V(1:8) w.r.t. U(1)
+      dwdu ( 1, 1) = 1.0
+      dwdu ( 2, 1) = - temparr_01 * vlxbar
+      dwdu ( 3, 1) = - temparr_01 * vlybar
+      dwdu ( 4, 1) = - temparr_01 * vlzbar
+      dwdu ( 5, 1) = dprs_drho + dprs_deng * ( 0.5 * ( vlxbar**2
+     1                                 + vlybar**2 + vlzbar**2) - xbar)
+!      dwdu ( 6, 1) = 0.0
+!      dwdu ( 7, 1) = 0.0
+!      dwdu ( 8, 1) = 0.0
+
+
+! Derivatives of V(1:8) w.r.t. U(2)
+!      dwdu ( 1, 2) = 0.0
+      dwdu ( 2, 2) = temparr_01
+!      dwdu ( 3, 2) = 0.0
+!      dwdu ( 4, 2) = 0.0
+      dwdu ( 5, 2) = - dprs_deng * vlxbar
+!      dwdu ( 6, 2) = 0.0
+!      dwdu ( 7, 2) = 0.0
+!      dwdu ( 8, 2) = 0.0
+
+
+!      dwdu ( 1, 3) = 0.0
+!      dwdu ( 2, 3) = 0.0
+      dwdu ( 3, 3) = temparr_01
+!      dwdu ( 4, 3) = 0.0
+      dwdu ( 5, 3) = - dprs_deng * vlybar
+!      dwdu ( 6, 3) = 0.0
+!      dwdu ( 7, 3) = 0.0
+!      dwdu ( 8, 3) = 0.0
+
+
+!      dwdu ( 1, 4) = 0.0
+!      dwdu ( 2, 4) = 0.0
+!      dwdu ( 3, 4) = 0.0
+      dwdu ( 4, 4) = temparr_01
+      dwdu ( 5, 4) = - dprs_deng * vlzbar
+!      dwdu ( 6, 4) = 0.0
+!      dwdu ( 7, 4) = 0.0
+!      dwdu ( 8, 4) = 0.0
+
+
+!      dwdu ( 1, 5) = 0.0
+!      dwdu ( 2, 5) = 0.0
+!      dwdu ( 3, 5) = 0.0
+!      dwdu ( 4, 5) = 0.0
+      dwdu ( 5, 5) = dprs_deng
+!      dwdu ( 6, 5) = 0.0
+!      dwdu ( 7, 5) = 0.0
+!      dwdu ( 8, 5) = 0.0
+
+
+!      dwdu ( 1, 6) = 0.0
+!      dwdu ( 2, 6) = 0.0
+!      dwdu ( 3, 6) = 0.0
+!      dwdu ( 4, 6) = 0.0
+      dwdu ( 5, 6) = - dprs_deng * bfxbar / fourpi
+      dwdu ( 6, 6) = 1.0
+!      dwdu ( 7, 6) = 0.0
+!      dwdu ( 8, 6) = 0.0
+
+
+!      dwdu ( 1, 7) = 0.0
+!      dwdu ( 2, 7) = 0.0
+!      dwdu ( 3, 7) = 0.0
+!      dwdu ( 4, 7) = 0.0
+      dwdu ( 5, 7) = - dprs_deng * bfybar / fourpi
+!      dwdu ( 6, 7) = 0.0
+      dwdu ( 7, 7) = 1.0
+!      dwdu ( 8, 7) = 0.0
+
+
+!      dwdu ( 1, 8) = 0.0
+!      dwdu ( 2, 8) = 0.0
+!      dwdu ( 3, 8) = 0.0
+!      dwdu ( 4, 8) = 0.0
+      dwdu ( 5, 8) = - dprs_deng * bfzbar / fourpi
+!      dwdu ( 6, 8) = 0.0
+!      dwdu ( 7, 8) = 0.0
+      dwdu ( 8, 8) = 1.0
+
+
+#if ( NFLUID >= 1)
+      DO k = 9, NFIELD + NFLUID + 1
+
+      dwdu ( k, 1) = - temparr_01 * speciebar ( k - 8)
+      dwdu ( k, k) = temparr_01
+
+      END DO
+#endif
+
+! ----------------------------------------------------------------------
+
+! Do the matrix multiplications. Then save the eigenvalues. This
+! gives eigenvectors in the conserved variables.
+! Don't multiply those matrix elements that are zero.
+
+      rt_eigenvec ( :, :) = 0.0
+      lf_eigenvec ( :, :) = 0.0
+
+! Loop over k^th right eigenvector or k^th left eigenvector.
+      DO k = 1, NFIELD + NFLUID + 1 
+
+      IF ( ( k == 2) .OR. ( k == 4) .OR. ( k == 6) ) THEN
+
+      DO j = 1, NFIELD + NFLUID + 1
+
+      DO l = 1, NFIELD + NFLUID + 1
+
+      rt_eigenvec ( j, k) = rt_eigenvec ( j, k)
+     1                    + dudw ( j, l) * rt_eigenvec1 ( l, k)
+
+      lf_eigenvec ( k, j) = lf_eigenvec ( k, j)
+     1                    + lf_eigenvec1 ( k, l) * dwdu ( l, j)
+
+      END DO
+
+      END DO
+
+      END IF  ! End of evaluating just for the entropy and Alfven waves.
+
+      END DO
+
+! ----------------------------------------------------------------------
+
+      END IF  ! End of building eigenvectors in conserved variables.
+
+! ----------------------------------------------------------------------
+! The permutation is reversed in the eigenvector components, velocities
+! and magnetic fields when leaving the subroutine.
+
+      IF ( idirection == 2) THEN
+
+      temparr_01 = vlxbar
+      temparr_02 = vlybar
+      temparr_03 = vlzbar
+
+      vlxbar = temparr_03
+      vlybar = temparr_01
+      vlzbar = temparr_02
+
+! -----
+
+      temparr_01 = bfxbar
+      temparr_02 = bfybar
+      temparr_03 = bfzbar
+
+      bfxbar = temparr_03
+      bfybar = temparr_01
+      bfzbar = temparr_02
+
+! -----
+
+      DO k = 1, NFIELD + NFLUID + 1
+
+! -----
+
+      temparr_01 = rt_eigenvec ( 2, k)
+      temparr_02 = rt_eigenvec ( 3, k)
+      temparr_03 = rt_eigenvec ( 4, k)
+
+      rt_eigenvec ( 2, k) = temparr_03
+      rt_eigenvec ( 3, k) = temparr_01
+      rt_eigenvec ( 4, k) = temparr_02
+
+! -----
+
+      temparr_01 = rt_eigenvec ( 6, k)
+      temparr_02 = rt_eigenvec ( 7, k)
+      temparr_03 = rt_eigenvec ( 8, k)
+
+      rt_eigenvec ( 6, k) = temparr_03
+      rt_eigenvec ( 7, k) = temparr_01
+      rt_eigenvec ( 8, k) = temparr_02
+
+! -----
+
+      temparr_01 = lf_eigenvec ( k, 2)
+      temparr_02 = lf_eigenvec ( k, 3)
+      temparr_03 = lf_eigenvec ( k, 4)
+
+      lf_eigenvec ( k, 2) = temparr_03
+      lf_eigenvec ( k, 3) = temparr_01
+      lf_eigenvec ( k, 4) = temparr_02
+
+! -----
+
+      temparr_01 = lf_eigenvec ( k, 6)
+      temparr_02 = lf_eigenvec ( k, 7)
+      temparr_03 = lf_eigenvec ( k, 8)
+
+      lf_eigenvec ( k, 6) = temparr_03
+      lf_eigenvec ( k, 7) = temparr_01
+      lf_eigenvec ( k, 8) = temparr_02
+
+! -----
+
+      END DO
+
+! -----
+
+      END IF
+
+! ----------
+
+      IF ( idirection == 3) THEN
+
+! -----
+
+      temparr_01 = vlxbar
+      temparr_02 = vlybar
+      temparr_03 = vlzbar
+
+      vlxbar = temparr_02
+      vlybar = temparr_03
+      vlzbar = temparr_01
+
+! -----
+
+      temparr_01 = bfxbar
+      temparr_02 = bfybar
+      temparr_03 = bfzbar
+
+      bfxbar = temparr_02
+      bfybar = temparr_03
+      bfzbar = temparr_01
+
+! -----
+
+      DO k = 1, NFIELD + NFLUID + 1
+
+! -----
+
+      temparr_01 = rt_eigenvec ( 2, k)
+      temparr_02 = rt_eigenvec ( 3, k)
+      temparr_03 = rt_eigenvec ( 4, k)
+
+      rt_eigenvec ( 2, k) = temparr_02
+      rt_eigenvec ( 3, k) = temparr_03
+      rt_eigenvec ( 4, k) = temparr_01
+
+! -----
+
+      temparr_01 = rt_eigenvec ( 6, k)
+      temparr_02 = rt_eigenvec ( 7, k)
+      temparr_03 = rt_eigenvec ( 8, k)
+
+      rt_eigenvec ( 6, k) = temparr_02
+      rt_eigenvec ( 7, k) = temparr_03
+      rt_eigenvec ( 8, k) = temparr_01
+
+! -----
+
+      temparr_01 = lf_eigenvec ( k, 2)
+      temparr_02 = lf_eigenvec ( k, 3)
+      temparr_03 = lf_eigenvec ( k, 4)
+
+      lf_eigenvec ( k, 2) = temparr_02
+      lf_eigenvec ( k, 3) = temparr_03
+      lf_eigenvec ( k, 4) = temparr_01
+
+! -----
+
+      temparr_01 = lf_eigenvec ( k, 6)
+      temparr_02 = lf_eigenvec ( k, 7)
+      temparr_03 = lf_eigenvec ( k, 8)
+
+      lf_eigenvec ( k, 6) = temparr_02
+      lf_eigenvec ( k, 7) = temparr_03
+      lf_eigenvec ( k, 8) = temparr_01
+
+! -----
+
+      END DO
+
+! -----
+
+      END IF
+
+! ----------------------------------------------------------------------
+
+      RETURN
+
+      END SUBROUTINE EIGENVECMHD_PTWISE_LINDEG
+
+! ----------------------------------------------------------------------
+! ----------------------------------------------------------------------

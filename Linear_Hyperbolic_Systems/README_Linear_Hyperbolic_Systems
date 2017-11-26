@@ -1,0 +1,53 @@
+
+                   README_Linear_Hyperbolic_Systems
+
+      The short codes in this set correspond to our study of
+linear hyperbolic systems. We study scalar advection, showing that
+it can me made oscillation-free by the use of limiters. We also study
+systems of linear hyperbolic PDEs, which showcases our understanding
+of the Riemann solver for systems of linear hyperbolic PDEs.
+
+      The distribution already provides all the worked examples. We have also 
+provided the final images for all the worked examples, so you know what the 
+final answer looks like. If you wish, you may (optionally) go into the individual 
+folders and see how we have modified the codes for each of the examples. You may 
+use our modifications to guide you in making your own modifications.
+
+      The folder "Scalar_Advection_with_Limiters" contains four
+sub-directories. Each of them has the code "slope_limiter_scheme.src"
+with different settings. Within each folder, copy this file to
+"slope_limiter_scheme.F" if such a file does not exist. "mu"
+is the CFL number. "tstop" is the stopping time and it is favorable
+to stop different problems at different times. A Gaussian pulse
+can be set up with "iproblem = 1" and a square pulse (top hat pulse)
+with "iproblem = 2". The advection speed is unity and the boundaries
+are periodic. "islope = 1, 2, 3, 4" controls how the slopes
+are built. "islope = 1, 2" may not be very interesting because they
+produce oscillations. "islope = 3" uses MinMod limiter. "islope = 4"
+uses MC limiter.
+
+Verify that the Gaussian is propagated reasonably well, but with substantial
+clipping of its extremum (i.e. its top). The MC limiter functions
+better in this regard than the MinMod limiter. Both limiters show some
+amount of clipping.
+
+Verify that the top hat pulse (square pulse) is now advected without
+spurious oscillations. Again the MC limiter does a better job than
+the MinMod limiter.
+
+Observe the way in which the limiter is efficiently implemented so
+that it works with a minimum number of float point operations.
+
+      The folder "Linear_Systems" contains two directories. They
+both evolve the same linearized hyperbolic system. 
+
+1) The sub-directory "Predictor_Corrector" contains "lin_sys_PC_charlim.src".
+It uses a predictor corrector formulation where the limiters are only
+called once per timestep.
+
+2) The sub-directory "Runge_Kutta" contains "lin_sys_RK_charlim.src".
+It uses a two-stage Runge-Kutta method.
+
+
+
+

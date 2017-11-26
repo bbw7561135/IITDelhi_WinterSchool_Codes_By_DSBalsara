@@ -1,0 +1,45 @@
+
+                  README_Euler_MHD_Riemann_Problems_1D
+
+      The goal of this suite of codes is to introduce you to the full range of 
+one-dimensional Riemann solvers for Euler and classical MHD flow. (All these 
+Riemann solvers also seamlessly extend to relativistic hydro and relativistic MHD.
+But we have to present a manageable set to the student.) Two codes are
+presented. There is "euler_RK_approxRS.src" which does 1D Riemann problems for 
+Euler flow and "MHD_RK_approxRS.src" which does 1D Riemann problems for MHD flow.
+These codes are available in the directories "EULER_RP_Tests_1D" and
+"MHD_RP_Tests_1D" respectively. Plotting support is provided by a GnuPlot
+script called "onedplot.sh" and its ancillary supporting codes.
+
+      Algorithmically, both codes are very simple and very similar. They
+are both also self-documenting. They are based on piecewise-linear (second
+order) reconstruction that can be done either in the primitive variables or
+in the characteristic variables. This choice is made with the variable
+"icharlim". The kind of slope limiter is controlled by the variable "islope".
+The second order spatial reconstruction is matched with a second order in 
+time Runge-Kutta scheme. A range of Riemann solvers is included. Specifically,
+we provide Roe-type Riemann solvers, HLL Riemann solvers, HLLC/D Riemann solvers
+and HLLEM Riemann solvers. One can toggle between the Riemann solvers by
+using "iriem_solvr".
+
+      Let us describe parameters. "mu" is the CFL number. An entire range of
+1D Riemann problems can be done with each of the codes. The choice of Riemann problem
+is controlled by "iproblem". In the case of MHD there are too many different flow
+structures that can form. For each choice of "iproblem" (and only in the MHD case),
+the subroutine "SET_RP" describes a little about some of the test problems. Most importantly,
+we can toggle between different Riemann solvers with "iriem_solvr". Linearized
+Roe-type Riemann solvers, HLL Riemann solvers, HLLC/D Riemann solvers and 
+HLLEM Riemann solvers are all included. All the parameters that can be set are 
+described where they first occur in the codes. All of the important parameters
+have their first occurance within the first two hundred lines of the codes so that
+the user does not need to read too much of the codes to change the settings.
+
+      The distribution already provides all the worked examples. We have also
+provided the final images for all the worked examples, so you know what the
+final answer looks like. If you wish, you may (optionally) go into the individual 
+folders and see how we have modified the codes for each of the examples. You may 
+use our modifications to guide you in making your own modifications.
+
+
+
+

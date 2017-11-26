@@ -1,0 +1,86 @@
+
+! Make these range over the problem size in any direction.
+! Code stops if they are given bad values.
+#define ONEDFLUIDEND 414
+#define ONEDFLUIDBEGIN -14
+
+! "NFIELD_EULER = 5" keep it fixed for adiabatic Euler; 4 for isothermal.
+! "NFLUID_EULER" is the number of Euler fluid species.
+! "NTRACERS_EULER" is the number of fluid species that are pure tracers of
+! the gas.
+#define NFIELD_EULER 5
+#define NFLUID_EULER 000000
+#define NTRACERS_EULER 0
+
+! Choose between MC_beta limiter (1), and WENO limiter (2,default).
+! The MC_beta limiter can span MinMod to MC van Leer limiters.
+#define SLOPE_LIMITER 2
+
+! Decide whether to limit once on the conserved variables (0, default) or 
+! whether to aditionally limit on the characteristic variables (1).
+#define LIMIT_TWICE 0
+
+! Choose between linearized RS (1), HLLC (2), HLL (3), HLLI (4,default).
+#define USE_RIEMANN_SOLVER 4
+
+! If RESTART is 0 we initialize the problem & then run. Otherwise, we
+! assume a restart file has been specified in "multid_mhd.in".
+#define RESTART 0
+
+! If PREDICT_WITH_RS is 1 then the code will use the Riemann solvers
+! in the ADER predictor step, otherwise it won't. While using Riemann solvers
+! in the ADER predictor step is more costly, it also makes the code
+! more stable.
+#define PREDICT_WITH_RS 0
+
+#if ( 0 == 1)
+! If MULTID_LIMITING is 1 then invokes a multidimensional limiter. This
+! helps in restoring positivity in a multidimensional sense.
+! The better limiters can, on rare occasions, produce -ve densities at the
+! edges/vertices. This can become a problem if limiters are invoked at those
+! edges/vertices. Multidimensional limiting is designed to cure this.
+! It is switched on by setting "MULTID_LIMITING" to unity (0, default).
+#endif
+#define MULTID_LIMITING 0
+
+#if ( 0 == 1)
+! For problems with very strong shocks and large magnetic fields, one
+! may have a loss of pressure positivity. The entropy formulation cures
+! that and it is invoked by switching on the pressure positivity switch.
+! It does cause a local loss of conservation in the zone where it is invoked.
+! It is switched on by setting "PRESSURE_POSITIVITY" to unity (0, default).
+#endif
+#define PRESSURE_POSITIVITY 1
+
+! If WRITE_DIAGNOSTICS is set to 1, the code writes out min and max of all
+! variables at each timestep. Can be used with OpenMP, but not with MPI
+! versions of code. Setting it to 0 turns off the writing of diagnostics. The
+! diagnostics are evaluated and written out in subroutine
+! "LIMIT_ALL_SLOPES_EULER".
+#define WRITE_DIAGNOSTICS 1
+
+! If NUM_FLD_BINS is >= 1 then the multigroup FLD formulation is turned on.
+! The timestepping of the radiation is via an explicit super-timestepping
+! approach.
+#define NUM_FLD_BINS 0
+
+#if ( 0 == 1)
+! Reduction in serial or OMP situations is never a problem. MPI reduction is.
+! For that reason we provide the facility for global MPI reduction of
+! "NVARS_REDUCTION_MPI" variables. If set to 0, there is no reduction.
+! If non-zero, it will produce global sum, min and max of that many variables
+! and write these three sets of data to a file called "reduce.out".
+! As it stands, such data is written to file every 100th timestep.
+#endif
+#define NVARS_REDUCTION_MPI 0
+
+#if ( 0 == 1)
+! Sets the number of variables that we want to build that will be used to
+! set flags for AMR refinement.
+#endif
+#define NUM_AMR_FLAG 2
+
+
+
+
+
